@@ -1,0 +1,71 @@
+# =============================================================================
+# Dockerfile.sdg – SDG Hub data generation container
+# =============================================================================
+# Built for NVIDIA GB10 (Blackwell, CUDA 13.0)
+# This container handles all data preparation and synthetic data generation.
+# =============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="text2sql-finetune-pipeline"
+LABEL description="SDG Hub synthetic data generation for Text-to-SQL"
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Install uv (fast Python package manager, recommended by SDG Hub)
+# ---------------------------------------------------------------------------
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------------------------
+WORKDIR /app
+
+# Copy requirements first (Docker layer caching)
+COPY docker/requirements_sdg.txt .
+
+# Install SDG Hub + dependencies
+RUN uv pip install --system \
+    sdg-hub \
+    datasets \
+    huggingface-hub \
+    pyyaml \
+    litellm \
+    anthropic \
+    openai \
+    tqdm \
+    -r requirements_sdg.txt
+
+# ---------------------------------------------------------------------------
+# Copy project code
+# ---------------------------------------------------------------------------
+COPY . .
+RUN pip install -e . --no-deps   # editable 'slm-finetuning' pkg; --no-deps keeps the pinned stack untouched
+
+# ---------------------------------------------------------------------------
+# Data directories (will be mounted as volumes in docker-compose)
+# ---------------------------------------------------------------------------
+RUN mkdir -p /app/data/raw /app/data/generated /app/data/final /app/logs
+
+# ---------------------------------------------------------------------------
+# HuggingFace cache (mounted as volume for persistence)
+# ---------------------------------------------------------------------------
+ENV HF_HOME=/data/hf_cache
+ENV TRANSFORMERS_CACHE=/data/hf_cache
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "sdg_pipeline/run_sdg.py", "--config", "config/pipeline_config.local.yaml"]

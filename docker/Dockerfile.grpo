@@ -1,0 +1,96 @@
+# docker/Dockerfile.grpo
+# =============================================================================
+# RLVR / GRPO vehicle = verl (LoRA, async server-mode) on the GB10 (sm_121).
+# This file DOCUMENTS the exact, VALIDATED stack that runs in the live `grpo_gate`
+# container (verl generate + non-stale ParameterSynchronizer weight-sync + LoRA-async
+# proven on sm_121 with a dense Qwen3-4B; ~404 tok/s, no OOM). It exists so the stack
+# is reproducible and NOT hostage to one running container.
+#
+# STATUS: documentation / reproduction recipe. NOT built yet. Build when the running
+#         `grpo_gate` container is gone or a clean image is needed:
+#           docker build -f docker/Dockerfile.grpo -t text2sql-grpo:verl .
+#
+# WHY a separate image (isolation doctrine, like /opt/guidellm, /opt/llmcompressor):
+#   verl pulls vLLM-0.23-nightly + torch 2.11.0+cu130, which REPLACE the pinned SFT
+#   stack (peft 0.13.2 --no-deps / transformers 5.6.2 / torch 2.10nv). Keep it OUT of
+#   the SFT/training image.
+#
+# KEY FACTS baked into the recipe:
+#   * sm_121 (GB10) needs vLLM >= 0.23.x cu130 aarch64 NIGHTLY (native sm_121 landed
+#     after 0.21.0). The nightly wheel is torch-ABI-locked -> install via uv
+#     --torch-backend=auto so it pulls its MATCHED torch 2.11.0+cu130.
+#   * The NGC torch-2.10 preview is NOT required here (dense models, no Gated-DeltaNet).
+#   * Build is finicky/bleeding-edge; the run-time CONFIG (not the image) carries the
+#     load-bearing flags — see experiments-verl_RL_lora-grpo.md.
+# =============================================================================
+FROM nvcr.io/nvidia/pytorch:25.11-py3
+
+ENV PYTHONUNBUFFERED=1 HF_HOME=/data/hf_cache
+WORKDIR /app
+# PYTHONPATH so verl can import evaluation/reward.py by path (frozen image has no editable install)
+ENV PYTHONPATH=/app
+
+# 1) uv (the nightly vLLM index is not pip --extra-index-url friendly)
+RUN pip install --no-cache-dir uv
+
+# 2) vLLM cu130 aarch64 NIGHTLY + its matched torch (2.11.0+cu130). This sets the
+#    torch ABI everything else links against. (Exact wheel that validated:
+#    vllm==0.23.1rc1.dev377+g70749fdcc — pin a digest in prod; nightly rolls.)
+RUN UV_SYSTEM_PYTHON=1 UV_BREAK_SYSTEM_PACKAGES=1 \
+    uv pip install --system --break-system-packages --prerelease=allow \
+      vllm --torch-backend=auto \
+      --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
+      --index-strategy unsafe-best-match
+
+# 3) verl + Red Hat training_hub GRPO orchestration (pulls verl 0.8.0, ray, tensordict,
+#    hydra-core, codetiming; does NOT pull vLLM -> step 2 owns it).
+RUN pip install --no-cache-dir "training_hub[grpo]"
+
+# 4) torchao >=0.16 (verl/vLLM require it; NGC ships 0.14 which is rejected)
+RUN pip install --no-cache-dir "torchao>=0.16.0"
+
+# 5) REP-PEN SOURCE PATCH (local). Stock verl 0.8.0 HARD-CODES `repetition_penalty=1.0` in the rollout
+#    sampling dict — async path experimental/agent_loop/agent_loop.py:~500, sync path
+#    trainer/main_ppo_sync.py:~313 — so `actor_rollout_ref.rollout.repetition_penalty` is silently dropped.
+#    rep-pen is the lever that terminates the SQL-thinking student's rollouts (standalone-proven: rep-pen
+#    alone -> 100% close); without it verl's rollout LOOPS to cap (EngineCore death-dump: all rollouts
+#    ~1578 tok, finished_req_ids=[]). Patch both dicts to honor the config value.
+#    => stack provenance is now "verl 0.8.0 + local rep-pen patch". See experiments-verl_RL_lora-grpo.md.
+RUN V=$(python3 -c "import verl,os;print(os.path.dirname(verl.__file__))") && \
+    sed -i 's/repetition_penalty=1\.0,/repetition_penalty=config.repetition_penalty,/g' \
+      "$V/experimental/agent_loop/agent_loop.py" "$V/trainer/main_ppo_sync.py" && \
+    grep -q "repetition_penalty=config.repetition_penalty," "$V/experimental/agent_loop/agent_loop.py" && \
+    grep -q "repetition_penalty=config.repetition_penalty," "$V/trainer/main_ppo_sync.py" && \
+    python3 -m py_compile "$V/experimental/agent_loop/agent_loop.py" "$V/trainer/main_ppo_sync.py" && \
+    echo "rep-pen patch applied + verified"
+
+# 6) VAL-ON-RESUME SOURCE PATCH (local). Stock verl runs `val_before_train` UNCONDITIONALLY at fit() start
+#    (trainer/ppo/ray_trainer.py:~1393), so resume_mode=auto re-runs the full 240-prompt held-out val
+#    (~6 min) on EVERY supervisor restart. Bind it to `global_steps == 0` (set by _load_checkpoint just
+#    above) -> baseline val only on the TRUE first start, SKIPPED on every resume (global_steps>0).
+#    test_freq vals stay (step-bound, resume-safe). Cheaper restarts + less wedge exposure per attempt.
+#    => stack provenance: "verl 0.8.0 + local rep-pen patch + val-resume-skip patch".
+RUN V=$(python3 -c "import verl,os;print(os.path.dirname(verl.__file__))") && \
+    sed -i 's/get("val_before_train", True):/get("val_before_train", True) and self.global_steps == 0:/' \
+      "$V/trainer/ppo/ray_trainer.py" && \
+    grep -q 'val_before_train", True) and self.global_steps == 0:' "$V/trainer/ppo/ray_trainer.py" && \
+    python3 -m py_compile "$V/trainer/ppo/ray_trainer.py" && \
+    echo "val-resume-skip patch applied + verified"
+
+# ---- VALIDATED PINS (verify after build; this is the working set) -----------
+# vllm==0.23.1rc1.dev377+g70749fdcc   torch==2.11.0+cu130   torchvision==0.26.0+cu130
+# torchaudio==2.11.0+cu130            verl==0.8.0           training-hub==0.8.1
+# transformers==5.12.1   ray==2.55.1  torchao==0.17.0  tensordict==0.10.0
+# peft==0.19.1           flash-attn==2.7.4.post1   numpy==2.3.5  hydra-core==1.3.3
+RUN python3 - <<'PY'
+import verl, vllm, torch, transformers, ray, torchao
+print("verl", verl.__version__, "| vllm", vllm.__version__, "| torch", torch.__version__,
+      "| transformers", transformers.__version__, "| ray", ray.__version__, "| torchao", torchao.__version__)
+PY
+
+# Pilot infra (reward + data builders) lives in the mounted repo (/app); reward is
+# fed to verl as reward.custom_reward_function (see the experiments doc for the
+# load-bearing run config: model_dtype=bfloat16, attn_implementation=sdpa,
+# rollout TP=1, mode=async, ref-skip; GB10 WEDGE FIX = VLLM_USE_FLASHINFER_SAMPLER=0 (FlashInfer
+# top-k/top-p sampler race, vLLM #43885; enforce_eager was a red herring, cudagraph stays ON)
+# + the rep-pen patch above).

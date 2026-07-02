@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slm-finetuning"
+version = "0.0.0"
+description = "Text-to-SQL SLM finetuning pipeline (SDG -> SFT -> eval -> GRPO)"
+requires-python = ">=3.10"
+
+# Intentionally NO dependencies here: the container images pin the full
+# torch / transformers / vllm / verl stack. Install with `pip install -e . --no-deps`
+# so this editable package never touches that pinned stack. Imports also work at
+# runtime via PYTHONPATH=/app (baked into the sdg/training images + set in compose).
+
+[tool.setuptools]
+# Importable stage packages (flat layout). serving/ops/tools are script dirs (run by path), not packages.
+packages = ["data_pipeline", "training_pipeline", "evaluation", "sdg_pipeline"]

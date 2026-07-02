@@ -1,0 +1,117 @@
+# =============================================================================
+# Dockerfile.training – Training container für GB10 (ARM64 + CUDA 13 + SM_121)
+# =============================================================================
+# Getestete funktionierende Versionskombination (Stand 24.04.2026):
+#
+#   Base:          nvcr.io/nvidia/pytorch:25.11-py3
+#                  → einzige Quelle für SM_121-kompatibles PyTorch (2.10 nv25.11)
+#   peft:          0.13.2 (--no-deps!) → letzte Version OHNE torchao-Abhängigkeit
+#   accelerate:    >=1.3.0 → braucht keep_torch_compile API für transformers 5.6
+#   transformers:  5.6.2 → explizit installiert (nicht im NGC Image enthalten)
+#   trl:           0.12.0 → explizit installiert (nicht im NGC Image enthalten)
+#   datasets:      explizit installiert
+#
+# WICHTIG: peft MUSS mit --no-deps installiert werden, sonst zieht pip
+#          torchao rein, das mit PyTorch 2.10/SM_121 inkompatibel ist.
+# =============================================================================
+
+FROM nvcr.io/nvidia/pytorch:25.11-py3
+
+LABEL maintainer="text2sql-finetune-pipeline"
+LABEL description="Training Hub LoRA Finetuning für Text-to-SQL (ARM64/GB10/SM_121)"
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies – getestete Versionen, in dieser Reihenfolge!
+# ---------------------------------------------------------------------------
+WORKDIR /app
+
+# 1. peft 0.13.2 ohne Dependencies (KEIN torchao!)
+RUN pip install --no-deps 'peft==0.13.2'
+
+# 2. accelerate upgraden (NGC hat 1.2.0, wir brauchen >=1.3.0 für transformers 5.6)
+RUN pip install 'accelerate>=1.3.0'
+
+# 3. transformers + trl + datasets (nicht im NGC Image enthalten)
+RUN pip install \
+    'transformers==5.6.2' \
+    'trl==0.12.0' \
+    'datasets>=2.0.0'
+
+# 4. Weitere Hilfspakete
+RUN pip install \
+    pyyaml \
+    tensorboard \
+    sentencepiece \
+    mlflow
+
+# 4b. Gated-DeltaNet Fast-Path-Kernels für Qwen3.5 Linear-Attention.
+#     Ohne diese laufen die 24/32 linear_attention-Layer im langsamen
+#     torch_chunk_gated_delta_rule-Fallback. Mit beiden flippt
+#     is_fast_path_available -> True: ~4x schnelleres Long-Seq-Training,
+#     numerisch identisch zum Fallback (gemessen auf GB10/sm_121:
+#     2355 -> 601 ms/step, Loss-Delta <= bf16-Rauschen).
+#     BEIDE --no-deps -> der gepinnte torch2.10/peft0.13.2/transformers5.6.2-Stack
+#     bleibt unberührt (verifiziert). Details:
+#       - fla: GitHub, NICHT PyPI (das PyPI-Paket liefert kein fla.ops).
+#       - causal_conv1d: kein aarch64/cu13-Wheel -> Source-Build für Blackwell
+#         (FORCE_BUILD + TORCH_CUDA_ARCH_LIST=12.0; nvcc kommt aus dem NGC-Image,
+#         GPU beim Build nicht nötig).
+RUN pip install --no-deps "git+https://github.com/fla-org/flash-linear-attention"
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="12.0" \
+    pip install --no-deps --no-build-isolation causal-conv1d
+
+# 5. GuideLLM (Effizienz-Benchmarking) – ISOLIERTES venv, NICHT die Trainings-Env!
+#    guidellm zieht eigenes torch/transformers/datasets nach. In die Haupt-Env
+#    installiert würde es den fein gepinnten Trainings-Stack zerschießen (peft
+#    0.13.2 --no-deps, transformers 5.6.2, torch 2.10 nv25.11). Daher landet es in
+#    einem dedizierten venv unter /opt/guidellm; evaluation/efficiency_benchmark.py
+#    ruft das isolierte Binary /opt/guidellm/bin/guidellm per subprocess auf.
+#    Verifiziert: torch/transformers der Haupt-Env bleiben durch diese Installation
+#    unverändert. Version gepinnt, weil das benchmarks.json-Schema versionsabhängig ist.
+RUN python3 -m venv /opt/guidellm \
+    && /opt/guidellm/bin/pip install --no-cache-dir "guidellm[recommended]==0.6.0" \
+    && /opt/guidellm/bin/guidellm --version
+
+# 5b. llm-compressor (FP8-Quantisierung) – ISOLIERTES venv, wie GuideLLM. KEIN torch-Pin:
+#     llmcompressor verlangt torch>=2.10.0, der NGC-torch 2.10.0a0 ist per PEP-440 < 2.10.0
+#     -> ein Pin braeche den Build. Bare venv zieht eigenes torch (2.12) + transformers (5.10);
+#     Quant laeuft CPU-only (CUDA_VISIBLE_DEVICES="") -> sm_121-torch nicht noetig. Haupt-Env
+#     (torch 2.10 nv / transformers 5.6.2) bleibt unberuehrt. quantize_fp8.py ruft
+#     /opt/llmcompressor/bin/python per subprocess auf.
+RUN python3 -m venv /opt/llmcompressor \
+    && /opt/llmcompressor/bin/pip install --no-cache-dir "llmcompressor==0.12.*" \
+    && /opt/llmcompressor/bin/python -c "import torch,transformers,llmcompressor as l;print('llmcompressor venv:',torch.__version__,transformers.__version__,l.__version__)"
+
+# ---------------------------------------------------------------------------
+# Copy project code
+# ---------------------------------------------------------------------------
+COPY . .
+RUN pip install -e . --no-deps   # editable 'slm-finetuning' pkg; --no-deps keeps the pinned stack untouched
+
+# ---------------------------------------------------------------------------
+# Verzeichnisse
+# ---------------------------------------------------------------------------
+RUN mkdir -p /app/data/final/checkpoints /app/logs
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+ENV HF_HOME=/root/.cache/huggingface
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+CMD ["python3", "training_pipeline/train.py", "--config", "config/pipeline_config.local.yaml", "--algorithm", "lora_sft"]

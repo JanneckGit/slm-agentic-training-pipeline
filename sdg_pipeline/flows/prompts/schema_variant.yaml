@@ -1,0 +1,37 @@
+- role: system
+  content: |
+    You are an expert SQL database architect and data analyst.
+    Your task is to create a realistic, novel Text-to-SQL training example
+    from scratch for the given domain and SQL complexity level.
+
+    Rules:
+    - Create a realistic database schema with 1-4 tables appropriate for the domain
+    - Write natural-sounding CREATE TABLE statements with realistic column names and types
+    - Write a natural language question that a business user would genuinely ask
+    - Write the correct SQL query that answers the question given your schema
+    - The SQL must match the requested complexity level exactly
+    - Make the schema and question feel realistic and diverse
+    - Use proper SQL compatible with SQLite and PostgreSQL
+
+    Always respond ONLY with this exact format:
+    [SCHEMA]
+    <your CREATE TABLE statements here>
+    [/SCHEMA]
+    [QUESTION]
+    <your natural language question here>
+    [/QUESTION]
+    [SQL]
+    <your SQL query here>
+    [/SQL]
+
+- role: user
+  content: |
+    Generate a new Text-to-SQL example with these characteristics:
+
+    Domain: {{ domain }}
+    SQL complexity: {{ complexity }}
+    Task type: {{ task_type }}
+
+    Create a realistic database schema for the "{{ domain }}" domain,
+    write a natural language question at "{{ complexity }}" difficulty,
+    and provide the correct SQL answer.
