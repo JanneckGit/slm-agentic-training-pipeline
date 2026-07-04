@@ -114,4 +114,4 @@ ENV TORCH_CUDA_ARCH_LIST="12.0"
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
-CMD ["python3", "training_pipeline/train.py", "--config", "config/pipeline_config.local.yaml", "--algorithm", "lora_sft"]
+CMD ["python3", "training_pipeline/train_traj.py", "--config", "config/pipeline_config.local.yaml"]

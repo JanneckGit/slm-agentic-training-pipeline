@@ -1,5 +1,5 @@
 # =============================================================================
-# .gitignore – Text-to-SQL Finetuning Pipeline
+# .gitignore – Agentic SLM Training Pipeline
 # =============================================================================
 
 # NEVER commit secrets or local configs
@@ -12,6 +12,9 @@ data/raw/
 data/generated/
 data/final/
 data/evaluation/
+data/input_marius
+nohup.out
+
 
 # Model checkpoints (very large)
 checkpoints/
@@ -44,6 +47,7 @@ dist/
 build/
 .eggs/
 .venv/
+.venv-tau2/
 venv/
 env/
 

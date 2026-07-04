@@ -68,4 +68,4 @@ ENV TRANSFORMERS_CACHE=/data/hf_cache
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "sdg_pipeline/run_sdg.py", "--config", "config/pipeline_config.local.yaml"]
+CMD ["python", "data_pipeline/prepare_agentic_data.py", "--config", "config/pipeline_config.local.yaml"]

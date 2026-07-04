@@ -1,31 +1,12 @@
 # =============================================================================
-# Text-to-SQL Finetuning Pipeline – Central Configuration
+# Agentic SLM Training Pipeline – Central Configuration
 # =============================================================================
 # Copy this file to pipeline_config.local.yaml and fill in your secrets.
 # pipeline_config.local.yaml is gitignored – never commit secrets.
 # =============================================================================
 
-# Global pipeline seed – shared von mix_datasets / train / evaluate, damit
-# Splits, LoRA-Init und Eval-Subsample über Runs hinweg reproduzierbar sind.
+# Global pipeline seed – shared by world-state seeding, task-gen, rollouts and traj_sft.
 seed: 42
-
-# -----------------------------------------------------------------------------
-# COMPLEXITY CLASSES – Single Source of Truth
-# -----------------------------------------------------------------------------
-# Die gültige Arbeitsmenge der SQL-Komplexitätsklassen für die GESAMTE Pipeline
-# (prepare_data-Seedfilter, mix-Gate, Eval-Anzeige). CTEs sind bewusst
-# ausgeschlossen: alle CTE-Golds im Seed-Datensatz sind PostgreSQL-DML-CTEs
-# (WITH ... AS (UPDATE/DELETE/INSERT ...)), in SQLite nicht ausführbar und für
-# Text-to-SQL off-task. Wieder-Aufnahme später möglich, indem hier ergänzt wird
-# (z.B. saubere Lese-CTEs aus Spider/BIRD).
-complexity_classes:
-  - basic SQL
-  - single join
-  - aggregation
-  - subqueries
-  - set operations
-  - window functions
-  - multiple_joins
 
 # -----------------------------------------------------------------------------
 # TEACHER MODEL (for SDG / synthetic data generation)
@@ -93,46 +74,21 @@ data:
   generated_dir: "./data/generated"
   final_dir: "./data/final"
 
-  # Finales Eval-Test-Set: ausführbarkeits-gefiltert, 7 Klassen, keine CTEs.
-  # Die mix-produzierte test.jsonl ist NICHT ausführbarkeits-gefiltert und wird
-  # fürs finale Eval ignoriert. Pfad relativ zu final_dir.
-  eval_test_file: "test_clean.jsonl"
-
-  # Seed dataset from HuggingFace
-  seed_dataset: "gretelai/synthetic_text_to_sql"
-  seed_split: "train"
-  # How many seed examples to sample for SDG enrichment
-  seed_sample_size: 2000 #2000
-
-  # How many synthetic examples to generate
-  sdg_seed_input_size: 750 # 5000
-
-  max_concurrency: 5
-  min_seconds_between_batches: 10
-
-  # Final dataset mix ratio: seed vs synthetic
-  mix_ratio:
-    seed: 0.4        # % of original seed data
-    synthetic: 0.6   # % of newly generated data
-
-# -----------------------------------------------------------------------------
-# SDG PIPELINE (SDG Hub)
-# -----------------------------------------------------------------------------
-sdg:
-  # Which flows to run (defined in sdg_pipeline/flows/)
-  flows:
-    - complexity_upgrade      # Upgrade simple SQL to harder variants
-    - schema_variant          # Generate new schema+query combos
-    - reasoning_trace         # Add chain-of-thought SQL reasoning
-
-  # Async batch size for LLM calls
-  async_batch_size: 32
-
-  # Quality filter: minimum "complexity score" to keep a generated example
-  min_quality_score: 0.7
-
-  # Output format for generated data
-  output_format: "jsonl"
+  # ---------------------------------------------------------------------------
+  # AGENTIC SFT data basis (Stage-1 mix) — public tool-calling / planning sets.
+  # Fetched by data_pipeline/prepare_agentic_data.py into data/raw/{toolace,taskbench}/.
+  # Both are public (not gated) — no HF token needed. Script has built-in defaults,
+  # so this block is optional / for documentation + overrides.
+  # ---------------------------------------------------------------------------
+  agentic:
+    toolace:                                    # tool-call basics
+      dataset: "Team-ACE/ToolACE"               # Apache-2.0
+      split: "train"                            # 11,300 ShareGPT rows
+    taskbench:                                  # planning / decomposition (tool-graph)
+      dataset: "microsoft/Taskbench"            # MIT
+      split: "test"                             # TaskBench ships data under `test`
+      configs: ["huggingface", "multimedia", "dailylifeapis"]   # 7458 / 5555 / 4318
+      sidecars: ["tool_desc.json", "graph_desc.json"]           # tool inventory + dep-graph
 
 # -----------------------------------------------------------------------------
 # TRAINING (Training Hub)
@@ -176,6 +132,8 @@ training:
 
 # -----------------------------------------------------------------------------
 # GRPO (RLVR / LoRA) — verl backend, async server-mode on GB10/sm_121.
+# STAGE-2 TEMPLATE: structurally the verl recipe for agentic GRPO; VALUES still SQL-wired
+# (base_model/train_files point at old text2sql artifacts) — re-wire to db_bahn + trajectory_reward.
 # Run via training_pipeline/grpo_verl_runner.py (in the grpo container; Dockerfile.grpo).
 # Load-bearing recipe + metric mapping: docs/experiments-verl_RL_lora-grpo.md.
 # -----------------------------------------------------------------------------
@@ -237,14 +195,37 @@ grpo:
     n_val: 2
 
 # -----------------------------------------------------------------------------
-# INFRASTRUCTURE
+# DB_BAHN — grounded synthetic DB tool-calling traces (Stage-1 leg 3, Plan B)
+# World-state seeded from gtfs.de de_fv (CC-BY-4.0) + sha256-seeded synthetic tables.
+# Domain code: sdg_pipeline/db_bahn/ (tau2 runtime-registration; needs the Py3.12 tau2 venv).
+# Docs: docs/agentic-sft-db-synthesis.md · docs/agentic-db-synthesis-log.md
 # -----------------------------------------------------------------------------
-infra:
-  gpu_memory_utilization: 0.85
+db_bahn:  # NOTE: documentation-only — seed_worldstate.py/gen_tasks.py take these as CLI args
+  seed_source: "data/raw/db_sandbox"     # gtfs zip + db.json + tasks/splits/answer_keys (gitignored)
+  seed: 42
+  sim_date: "2026-06-29"                 # frozen sim-clock (inside the de_fv 7-day window)
+  fault_injection_rate: 0.35             # share of injectable tasks seeded into a surprising state
 
-  # Logging
-  log_level: "INFO"
-  log_dir: "./logs"
+# Rollout / synthesis knobs (sdg_pipeline/db_bahn/rollout.py + the teacher bake-off)
+trajectory:
+  concurrency: 4                         # GB10 vLLM guidance: small batch (--max-num-seqs 4)
+  k_bakeoff: 3                           # rollouts per task on the 25-task comparison set
+  max_turns: 10
+  max_regen: 1                           # re-sample a failed rollout once before keeping the 0-score
+  rollout_timeout_s: 300
+  max_tokens_per_turn: 2048              # per-turn cap (anti-loop, base lesson)
+  temperature: 0.7
+  enable_thinking: false                 # concise <plan> instead of raw <think> (loop hygiene)
+  min_turns_keep: 5                      # SFT keep-filter (OpenThoughts >=5-turn lever)
+  target_verified: 400                   # pilot yield budget (achieved: 446 verified @ 92%)
+  # Bake-off candidates (results: docs/teacher-bakeoff.md; winner marked). serve = extra vLLM flags.
+  teacher_candidates:
+    - {name: "Qwen/Qwen3.6-35B-A3B",                 quant: "bf16",  maxtok: 2048, serve: "--gdn-prefill-backend triton"}  # WINNER: 92% yield, 16s/rollout
+    - {name: "Qwen/Qwen3.6-27B",                     quant: "bf16",  maxtok: 2048, serve: "--gdn-prefill-backend triton"}  # 92%, dense control
+    - {name: "Qwen/Qwen3-30B-A3B-Thinking-2507",     quant: "bf16",  maxtok: 3072, serve: ""}                              # 92% (bare-JSON calls)
+    - {name: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-NVFP4", quant: "nvfp4", maxtok: 2048, serve: "--trust-remote-code"} # 92%, slow (189s)
+    - {name: "ByteDance-Seed/Seed-OSS-36B-Instruct", quant: "bf16",  maxtok: 3072, serve: ""}                              # 83%, strong replan, slow
+    - {name: "Qwen/Qwen3-Next-80B-A3B-Thinking-FP8", quant: "fp8",   maxtok: 3072, serve: "--gdn-prefill-backend triton"}  # 75%
+    - {name: "zai-org/GLM-4.5-Air-FP8",              quant: "fp8",   maxtok: 1024, serve: "--max-num-seqs 2"}              # 58% (6144 ctx tight)
+    - {name: "mistralai/Magistral-Small-2509",       quant: "bf16",  maxtok: 2048, serve: "--tokenizer-mode mistral --config-format mistral --load-format mistral"}  # 33%
 
-  # HuggingFace cache (important on remote machines to avoid re-downloads)
-  hf_cache_dir: "/data/hf_cache"   # map this in docker-compose volume

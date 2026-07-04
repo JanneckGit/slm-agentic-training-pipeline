@@ -6,12 +6,11 @@
 #   training   – Training Hub finetuning (GPU required)
 #   vllm       – Optional: local vLLM server as teacher model (GPU)
 #
-# Usage:
-#   docker compose run --rm sdg python data_pipeline/prepare_data.py
-#   docker compose run --rm sdg python sdg_pipeline/run_sdg.py --config config/pipeline_config.local.yaml
-#   docker compose run --rm sdg python data_pipeline/mix_datasets.py
-#   docker compose run --rm training python training_pipeline/train.py --config config/pipeline_config.local.yaml
-#   docker compose run --rm training python evaluation/evaluate.py --model-path /app/data/final/checkpoints/lora
+# Usage (agentic pipeline):
+#   docker compose run --rm sdg python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.local.yaml
+#   docker compose run --rm training python3 training_pipeline/train_traj.py --config config/pipeline_config.local.yaml
+#   bash ops/teacher_bakeoff.sh          # teacher bake-off (serves candidates via the vllm service)
+#   bash ops/traj_sft_pipeline.sh        # before-eval -> traj_sft -> merge -> after-eval
 #
 # Optional teacher model (local vLLM):
 #   docker compose up -d vllm
