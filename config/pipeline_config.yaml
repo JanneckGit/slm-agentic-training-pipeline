@@ -89,6 +89,13 @@ data:
       split: "test"                             # TaskBench ships data under `test`
       configs: ["huggingface", "multimedia", "dailylifeapis"]   # 7458 / 5555 / 4318
       sidecars: ["tool_desc.json", "graph_desc.json"]           # tool inventory + dep-graph
+    areal:                                      # tau2-bench flows (AReaL) — per-turn SFT + RL tasks
+      dataset: "inclusionAI/AReaL-tau2-data"    # Apache-2.0, public
+      expected:                                 # from HF card 2026-07-08 — validate_areal.py hard-fails on mismatch
+        sft_rows: 33531
+        rl_rows: 1982
+        sft_domains: {airline: 12842, retail: 11395, telecom: 9294}
+        rl_domains:  {airline: 1148,  retail: 563,   telecom: 271}
 
 # -----------------------------------------------------------------------------
 # TRAINING (Training Hub)
