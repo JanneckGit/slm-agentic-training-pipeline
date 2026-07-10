@@ -16,15 +16,17 @@ N_TASKS=12; K=1; MAX_TURNS=8; MAXTOK=2048; EVAL_TIMEOUT=1500; HEALTH_TIMEOUT=900
 mkdir -p logs data/generated
 
 # short|model|extra vllm args (incl. --max-num-seqs)|gpu_util|max_len|omit_thinking_kwarg(0/1)|maxtok_per_turn
+# max_len=12288 uniform (2026-07-09) to match the gen/eval window (11-tool prompt ~3.8k tok needs headroom).
+# NOTE if re-run: the largest models (Nemotron-49B, Qwen3-Next-80B, GLM-Air) may need a lower window for memory.
 CANDIDATES=(
-  "q36-35b-a3b|Qwen/Qwen3.6-35B-A3B|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|8192|0|2048"
-  "q36-27b|Qwen/Qwen3.6-27B|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|8192|0|2048"
-  "q3-30b-a3b-think|Qwen/Qwen3-30B-A3B-Thinking-2507|--max-num-seqs 4|0.85|8192|0|3072"
-  "magistral-24b|mistralai/Magistral-Small-2509|--max-num-seqs 4 --tokenizer-mode mistral --config-format mistral --load-format mistral|0.85|8192|1|2048"
-  "seed-oss-36b|ByteDance-Seed/Seed-OSS-36B-Instruct|--max-num-seqs 4|0.85|8192|0|3072"
-  "nemotron-49b-nvfp4|nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-NVFP4|--max-num-seqs 4 --trust-remote-code|0.85|8192|0|2048"
-  "q3-next-80b-fp8|Qwen/Qwen3-Next-80B-A3B-Thinking-FP8|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|8192|0|3072"
-  "glm45-air-fp8|zai-org/GLM-4.5-Air-FP8|--max-num-seqs 2|0.90|6144|0|1024"
+  "q36-35b-a3b|Qwen/Qwen3.6-35B-A3B|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|12288|0|2048"
+  "q36-27b|Qwen/Qwen3.6-27B|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|12288|0|2048"
+  "q3-30b-a3b-think|Qwen/Qwen3-30B-A3B-Thinking-2507|--max-num-seqs 4|0.85|12288|0|3072"
+  "magistral-24b|mistralai/Magistral-Small-2509|--max-num-seqs 4 --tokenizer-mode mistral --config-format mistral --load-format mistral|0.85|12288|1|2048"
+  "seed-oss-36b|ByteDance-Seed/Seed-OSS-36B-Instruct|--max-num-seqs 4|0.85|12288|0|3072"
+  "nemotron-49b-nvfp4|nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-NVFP4|--max-num-seqs 4 --trust-remote-code|0.85|12288|0|2048"
+  "q3-next-80b-fp8|Qwen/Qwen3-Next-80B-A3B-Thinking-FP8|--max-num-seqs 4 --gdn-prefill-backend triton|0.85|12288|0|3072"
+  "glm45-air-fp8|zai-org/GLM-4.5-Air-FP8|--max-num-seqs 2|0.90|12288|0|1024"
 )
 
 dl() {  # download via sdg container (hf_cache hub/ is root-owned)

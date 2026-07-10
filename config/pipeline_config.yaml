@@ -220,7 +220,8 @@ trajectory:
   max_turns: 10
   max_regen: 1                           # re-sample a failed rollout once before keeping the 0-score
   rollout_timeout_s: 300
-  max_tokens_per_turn: 2048              # per-turn cap (anti-loop, base lesson)
+  max_tokens_per_turn: 1536              # per-turn cap; lowered from 2048 so 11-tool system prompt
+                                         # (~3.8k tok) + multi-turn fits max_model_len 12288 (2026-07-09)
   temperature: 0.7
   enable_thinking: false                 # concise <plan> instead of raw <think> (loop hygiene)
   min_turns_keep: 5                      # SFT keep-filter (OpenThoughts >=5-turn lever)

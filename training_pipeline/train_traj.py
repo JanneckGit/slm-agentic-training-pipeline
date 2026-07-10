@@ -17,6 +17,7 @@ Usage (training container):
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -40,7 +41,17 @@ def main():
     ap.add_argument("--max-seq-len", type=int, default=4096)
     ap.add_argument("--max-samples", type=int, default=None, help="smoke: cap #examples")
     ap.add_argument("--max-steps", type=int, default=-1, help="smoke: cap steps")
+    ap.add_argument("--run-name", default=None, help="MLflow run name (default: traj_sft_<model>_<epochs>ep)")
+    ap.add_argument("--no-mlflow", action="store_true", help="disable MLflow tracking (report_to=[])")
     args = ap.parse_args()
+
+    # MLflow (HF-native via report_to): the training container sets MLFLOW_TRACKING_URI=file:///app/mlruns;
+    # default the experiment here so it also works outside compose. Metrics/params are auto-logged by HF's
+    # MLflowCallback every logging_steps. File-based logs (console/logs/*.log) stay the source of truth.
+    os.environ.setdefault("MLFLOW_EXPERIMENT_NAME", "db_bahn_traj_sft")
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")  # mlflow>=3.14 gates the file backend
+    report_to = [] if args.no_mlflow else ["mlflow"]
+    run_name = args.run_name or f"traj_sft_{Path(args.model).name}_{args.epochs:g}ep"
 
     config = yaml.safe_load(open(args.config)) if Path(args.config).exists() else {}
     t_cfg = config.get("training", {})
@@ -95,7 +106,7 @@ def main():
         learning_rate=float(t_cfg.get("learning_rate", 2.0e-4)),
         lr_scheduler_type=t_cfg.get("lr_scheduler", "cosine"), warmup_ratio=0.03,
         bf16=True, gradient_checkpointing=True, logging_steps=5, save_strategy="no",
-        report_to=[], seed=seed)
+        report_to=report_to, run_name=run_name, seed=seed)
     trainer = Trainer(model=model, args=ta, train_dataset=ds, data_collator=TrajSFTCollator(tok))
     logger.info(f"Training: {len(feats)} traces, {args.epochs} epochs, "
                 f"eff.batch {ta.per_device_train_batch_size * ta.gradient_accumulation_steps}")

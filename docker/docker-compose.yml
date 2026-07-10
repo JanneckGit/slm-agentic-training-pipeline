@@ -77,6 +77,10 @@ services:
       - PYTHONPATH=/app
       # TensorBoard logs
       - TENSORBOARD_LOGDIR=/app/logs/tensorboard
+      # MLflow: same store as the eval + GRPO runs (mounted ../mlruns -> /app/mlruns above)
+      - MLFLOW_TRACKING_URI=file:///app/mlruns
+      - MLFLOW_EXPERIMENT_NAME=db_bahn_traj_sft
+      - MLFLOW_ALLOW_FILE_STORE=true          # mlflow>=3.14 gates the plain file backend behind this
 
     # GPU access for training
     deploy:
@@ -205,6 +209,9 @@ services:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: text2sql_mlflow
     profiles: ["mlflow"]
+
+    environment:
+      - MLFLOW_ALLOW_FILE_STORE=true          # mlflow>=3.14 gates the plain file backend behind this
 
     command: >
       mlflow ui
