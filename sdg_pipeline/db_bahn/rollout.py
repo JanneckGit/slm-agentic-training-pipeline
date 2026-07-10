@@ -25,13 +25,20 @@ and --dry-run-broken (hallucinating oracle; must score 0.0).
 
 import argparse
 import json
+import os
 import re
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
+
+try:  # soft dep: eval-metric tracking is opt-in (--mlflow); absence must never break a rollout
+    import mlflow
+except ImportError:
+    mlflow = None
 
 from sdg_pipeline.db_bahn.tau2_domain import get_environment
 from sdg_pipeline.db_bahn.tau2_domain.environment import DATA_DIR
@@ -196,20 +203,12 @@ def openai_tools(env) -> list[dict]:
 
 # --- oracle teachers for GPU-free smoke ------------------------------------------------------
 def make_oracle(task: dict, key: dict, broken: bool = False):
-    """Scripted teacher: emits <tool_call> TEXT (exercises the parser), then a grounded final answer."""
+    """Scripted teacher: replays the answer key's `oracle_calls` (the exact valid path) as
+    <tool_call> TEXT (exercises the parser), then a grounded final answer."""
     crit = task.get("evaluation_criteria") or {}
     m = ZUG_RE.search(task.get("ticket") or "")
     zugnummer = m.group(0) if m else ""
-    plan = []
-    if key["kind"] == "action":
-        for name in key["expected_tools"]:
-            ref = next((a for a in (crit.get("actions") or []) if a["name"] == name), None)
-            args = ref["arguments"] if ref else (
-                {"kennung": zugnummer} if name == "wartung_status" else {"zugnummer": zugnummer})
-            plan.append((name, args))
-    else:
-        for name in key["expected_tools"]:
-            plan.append((name, {"kennung": zugnummer} if name == "wartung_status" else {"zugnummer": zugnummer}))
+    plan = [(c["name"], c["arguments"]) for c in (key.get("oracle_calls") or [])]
     comm = crit.get("communicate_info") or []
     state = {"i": 0}
 
@@ -231,7 +230,14 @@ def make_oracle(task: dict, key: dict, broken: bool = False):
 
 
 # --- the multi-turn rollout ------------------------------------------------------------------
-def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_timeout_s: float) -> dict:
+def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_timeout_s: float,
+                resume_messages: list | None = None) -> dict:
+    """One multi-turn rollout, scored by the verifier.
+
+    resume_messages (A1 branch-on-failure): if given, the env state is reconstructed by replaying the
+    prefix's assistant tool calls (mirrors trajectory_reward's replay), messages start from a copy of the
+    prefix, and the teacher continues the tail. Default (None) = today's from-scratch behavior, untouched.
+    """
     from tau2.data_model.tasks import EnvFunctionCall
 
     env = get_environment(solo_mode=True)  # fresh env per rollout (thread-safe by isolation)
@@ -239,17 +245,33 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
     if inits:
         env.run_env_function_calls([EnvFunctionCall.model_validate(a) for a in inits])
     tools = openai_tools(env)
-    tools_block = "\n".join(json.dumps(t, ensure_ascii=False) for t in tools)
-    sys_prompt = SYSTEM_TEMPLATE.format(policy=env.get_policy(), tools_block=tools_block)
-    messages = [{"role": "system", "content": sys_prompt},
-                {"role": "user", "content": task["ticket"]}]
+    if resume_messages is None:
+        tools_block = "\n".join(json.dumps(t, ensure_ascii=False) for t in tools)
+        sys_prompt = SYSTEM_TEMPLATE.format(policy=env.get_policy(), tools_block=tools_block)
+        messages = [{"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": task["ticket"]}]
+    else:
+        messages = [dict(m) for m in resume_messages]  # continue from the verified prefix
+        for m in messages:  # reconstruct env state: replay the prefix's tool calls (order-faithful)
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                try:
+                    env.use_tool(fn.get("name", ""), **json.loads(fn.get("arguments") or "{}"))
+                except Exception:
+                    pass  # a rejected/failed prefix call mutated nothing; re-raise is harmless
     t0 = time.time()
     finish = "max_turns"
     for _ in range(max_turns):
         if time.time() - t0 > rollout_timeout_s:
             finish = "timeout"
             break
-        content, native, fr = teacher_call(messages, tools)
+        try:
+            content, native, fr = teacher_call(messages, tools)
+        except Exception as e:  # HTTP 4xx/5xx, context overflow, transient server error — end this
+            finish = f"teacher_error:{type(e).__name__}: {str(e)[:120]}"  # rollout gracefully (score 0,
+            break                                                        # keep partial trace, don't abort)
         clean, calls = parse_tool_calls(content, native)
         assistant = {"role": "assistant", "content": clean}
         if calls:
@@ -272,10 +294,153 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             "wall_s": round(time.time() - t0, 2)}
 
 
+# --- A1: branch-on-failure (answer-key-guided prefix reuse) -----------------------------------
+def _agent_calls(messages: list) -> list:
+    """(name, args_dict, obs_msg_index) for each assistant tool call, in order."""
+    out = []
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            # observation for this call is the next tool message after this assistant turn
+            obs_idx = next((j for j in range(i + 1, len(messages))
+                            if messages[j].get("role") == "tool"), i)
+            out.append((fn.get("name", ""), args, obs_idx))
+    return out
+
+
+def _matches(name: str, args: dict, ref: dict) -> bool:
+    """Agent call matches a reference oracle_calls entry: same tool + args agree on the reference keys."""
+    if name != ref.get("name"):
+        return False
+    return all(args.get(k) == v for k, v in (ref.get("arguments") or {}).items())
+
+
+def choose_branch_point(messages: list, key: dict) -> list | None:
+    """Longest prefix of the rollout that still tracks the gold path (key['oracle_calls']); cut BEFORE the
+    first deviation (safe even for a clean-but-wrong WRITE, which has no error observation). Returns the
+    message prefix to resume from, or None if there is no matching progress (→ full restart)."""
+    oracle = key.get("oracle_calls") or []
+    if not oracle:
+        return None
+    calls = _agent_calls(messages)
+    j, last_obs = 0, None
+    for name, args, obs_idx in calls:
+        if j < len(oracle) and _matches(name, args, oracle[j]):
+            j += 1
+            last_obs = obs_idx
+        else:
+            break  # first deviation from the gold path
+    if j == 0 or last_obs is None:
+        return None
+    return messages[:last_obs + 1]
+
+
+_WRITE_TOOLS = {"crew_zuweisen", "wartung_einplanen", "wartung_status_setzen"}
+
+
+def choose_harvest_point(messages: list, key: dict) -> list | None:
+    """B2 recovery-harvest (opposite cut to choose_branch_point): keep the prefix UP TO AND INCLUDING the
+    first divergent step + its observation, so the resampled continuation must RECOVER from the mistake
+    → a self-correction trace ("tried X, wrong, replanned, tried Y"). Only valid if the mistake is
+    NON-MUTATING (a READ, or a WRITE that was rejected/errored) — a mutating WRITE cannot be undone to reach
+    the gold state. Returns the prefix (incl. the mistake), or None → fall back to yield-mode. Unlike
+    choose_branch_point this also fires on a step-1 divergence (the hard search tails yield-mode can't reuse)."""
+    oracle = key.get("oracle_calls") or []
+    if not oracle:
+        return None
+    calls = _agent_calls(messages)
+    j = 0
+    for name, args, obs_idx in calls:
+        if j < len(oracle) and _matches(name, args, oracle[j]):
+            j += 1
+            continue
+        # calls[this] is the first divergence = the mistake
+        obs = messages[obs_idx] if 0 <= obs_idx < len(messages) else {}
+        obs_content = obs.get("content", "") if obs.get("role") == "tool" else ""
+        rejected = '"error"' in obs_content
+        if name in _WRITE_TOOLS and not rejected:
+            return None  # mutating write executed → no undo → cannot harvest to gold
+        return messages[:obs_idx + 1]  # keep prefix + mistake + its observation
+    return None  # no divergence (everything matched) → nothing to harvest
+
+
+def _graded(res: dict) -> float:
+    """Fraction of passed verifier components — ranks failed attempts to pick the best branch base."""
+    comp = (res.get("score") or {}).get("components") or {}
+    return sum(1 for v in comp.values() if v) / len(comp) if comp else 0.0
+
+
+def _try_recovery(base: dict, task: dict, key: dict, make_call, args) -> tuple:
+    """One B2-priority recovery attempt on a failed rollout: harvest (keep the mistake) first, then
+    yield-mode (clean) fallback. Returns (candidate, mode|None, n_resamples). `candidate` is the best
+    result seen (verified if recovered, else the most-progressed)."""
+    bump = getattr(args, "branch_temp_bump", 0.0)
+    n = 0
+    best = base
+    for point_fn, mode in ((choose_harvest_point, "harvest"), (choose_branch_point, "clean")):
+        prefix = point_fn(best["messages"], key)
+        if prefix is None:
+            continue
+        cand = run_rollout(task, key, make_call(temp_bump=bump), args.max_turns,
+                           args.rollout_timeout_s, resume_messages=prefix)
+        n += 1
+        if cand["score"]["score"] == 1.0:
+            return cand, mode, n
+        if _graded(cand) > _graded(best):
+            best = cand
+    return best, None, n
+
+
+def solve_task(task: dict, key: dict, make_call, args, teacher_cfg) -> dict:
+    """Per-item rollout policy. Without --branch-on-fail: plain best-of-N (--max-regen), unchanged.
+    With --branch-on-fail: BRANCH-FIRST + B2-priority — on a failure try recovery (harvest self-correction
+    first, then yield-mode clean) BEFORE a full restart; restarts are the fallback. Bounded by branch_attempts
+    (recovery resamples) + max_regen (full restarts). Adds 'n_branch_attempts' and 'recovery_mode'
+    (direct|harvest|clean|restart|failed). Module-level so it is unit-testable without a GPU."""
+    is_oracle = args.dry_run or args.dry_run_broken
+    branch_on = getattr(args, "branch_on_fail", False)
+
+    best = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
+    n_branch = 0
+    mode = "direct" if best["score"]["score"] == 1.0 else None
+
+    if not is_oracle:
+        for _ in range(args.max_regen + 1):
+            if best["score"]["score"] == 1.0:
+                break
+            if branch_on and n_branch < args.branch_attempts:  # branch-first: recovery before restart
+                cand, m, n = _try_recovery(best, task, key, make_call, args)
+                n_branch += n
+                best = cand
+                if best["score"]["score"] == 1.0:
+                    mode = m
+                    break
+            # recovery didn't verify (or no reusable prefix / budget spent) → fresh full sample
+            fresh = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
+            if fresh["score"]["score"] == 1.0:
+                best, mode = fresh, "restart"
+                break
+            if _graded(fresh) > _graded(best):
+                best = fresh
+
+    best["n_branch_attempts"] = n_branch
+    best["recovery_mode"] = mode or ("direct" if best["score"]["score"] == 1.0 else "failed")
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser(description="Multi-turn teacher rollouts against the db_bahn sandbox")
     ap.add_argument("--config", default="config/pipeline_config.yaml")
-    ap.add_argument("--split", default="bakeoff_dev", choices=["bakeoff_dev", "heldout_eval", "sft_train"])
+    ap.add_argument("--split", default="bakeoff_dev",
+                    help="split name from split_tasks.json (validated after loading)")
+    ap.add_argument("--task-ids-file", default=None,
+                    help="restrict to these task ids (one per line); for k=2 top-up on a failed subset")
     ap.add_argument("--k", type=int, default=1, help="rollouts per task")
     ap.add_argument("--n-tasks", type=int, default=None, help="cap number of tasks (debug)")
     ap.add_argument("--stratify", action="store_true",
@@ -287,6 +452,12 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=10)
     ap.add_argument("--max-regen", type=int, default=1, help="re-sample a failed rollout up to N times")
+    ap.add_argument("--branch-on-fail", action="store_true",
+                    help="A1: on a failed rollout, keep the gold-path prefix and resample only the tail")
+    ap.add_argument("--branch-attempts", type=int, default=2,
+                    help="rewind+resample attempts after a full-rollout failure (only with --branch-on-fail)")
+    ap.add_argument("--branch-temp-bump", type=float, default=0.2,
+                    help="temperature increase for resampled tails (diversity, avoid repeating the mistake)")
     ap.add_argument("--rollout-timeout-s", type=float, default=300.0)
     ap.add_argument("--teacher-name", default=None, help="label written into records (bake-off table)")
     ap.add_argument("--api-base", default=None)
@@ -294,12 +465,29 @@ def main():
     ap.add_argument("--output", default=None)
     ap.add_argument("--dry-run", action="store_true", help="scripted oracle teacher (CPU smoke)")
     ap.add_argument("--dry-run-broken", action="store_true", help="hallucinating oracle (must score 0)")
+    ap.add_argument("--mlflow", action="store_true", help="log summary eval metrics to MLflow (opt-in)")
+    ap.add_argument("--mlflow-experiment", default="db_bahn_traj_eval")
+    ap.add_argument("--mlflow-run-name", default=None, help="default: the teacher label")
+    ap.add_argument("--mlflow-tracking-uri", default=None,
+                    help="default: $MLFLOW_TRACKING_URI, else the repo-local mlruns/ dir")
     args = ap.parse_args()
 
     config = load_config(args.config) if Path(args.config).exists() else {}
     tasks = {t["id"]: t for t in json.load(open(DATA_DIR / "tasks.json"))}
     keys = json.load(open(DATA_DIR / "answer_keys.json"))
-    split_ids = json.load(open(DATA_DIR / "split_tasks.json"))[args.split]
+    splits = json.load(open(DATA_DIR / "split_tasks.json"))
+    if args.split not in splits:
+        ap.error(f"unknown split '{args.split}'; available: {sorted(splits)}")
+    split_ids = splits[args.split]
+    if args.task_ids_file:  # k=2 top-up: restrict to a subset (e.g. tasks that failed pass 1)
+        wanted = [ln.strip() for ln in open(args.task_ids_file) if ln.strip()]
+        split_ids = [t for t in wanted if t in tasks]
+        missing = [t for t in wanted if t not in tasks]
+        if missing:
+            print(f"warning: {len(missing)} task-ids from {args.task_ids_file} not in tasks.json (skipped)")
+        if not split_ids:
+            ap.error(f"no valid task ids in {args.task_ids_file}")
+        print(f"task-ids-file: {len(split_ids)} tasks selected (subset of --split {args.split})")
     if args.n_tasks and args.stratify:
         by_tpl = {}
         for tid in split_ids:
@@ -347,42 +535,56 @@ def main():
             teacher_cfg["temperature"] = args.temperature
         teacher_cfg["omit_thinking_kwarg"] = args.omit_thinking_kwarg
     lock = threading.Lock()
-    stats = {"n": 0, "verified": 0, "replan": 0, "turns": 0.0}
+    stats = {"n": 0, "verified": 0, "replan": 0, "turns": 0.0,
+             "branched": 0, "emergent_rec": 0, "scripted_rec": 0}
+    tmpl_n, tmpl_verified = Counter(), Counter()  # per-template yield (eval breakdown)
     out_f = open(out_path, "a")
+
+    def make_call_for(task, key):
+        """Factory: make_call(temp_bump=0.0) -> a teacher_call closure (oracle ignores temp)."""
+        if args.dry_run or args.dry_run_broken:
+            return lambda temp_bump=0.0: make_oracle(task, key, broken=args.dry_run_broken)
+        def factory(temp_bump=0.0):
+            cfg = teacher_cfg if not temp_bump else {**teacher_cfg,
+                                                     "temperature": teacher_cfg["temperature"] + temp_bump}
+            return make_teacher_call(cfg)
+        return factory
 
     def work(item):
         tid, s = item
         task, key = tasks[tid], keys[tid]
-        if args.dry_run or args.dry_run_broken:
-            call = make_oracle(task, key, broken=args.dry_run_broken)
-        else:
-            call = make_teacher_call(teacher_cfg)
-        res = None
         try:
-            for _ in range(args.max_regen + 1):
-                res = run_rollout(task, key, call, args.max_turns, args.rollout_timeout_s)
-                if res["score"]["score"] == 1.0:
-                    break
-                if args.dry_run or args.dry_run_broken:
-                    break  # oracles are deterministic; regen is pointless
-                call = make_teacher_call(teacher_cfg)  # fresh sample
+            res = solve_task(task, key, make_call_for(task, key), args, teacher_cfg)
         except Exception as e:  # per-request isolation (trace_capture lesson): never kill the pool
             res = {"messages": [], "finish_reason": f"error:{type(e).__name__}: {str(e)[:200]}",
-                   "wall_s": 0.0,
+                   "wall_s": 0.0, "n_branch_attempts": 0, "recovery_mode": "failed",
                    "score": {"score": 0.0, "task_solved": 0.0, "turns_used": 0, "n_tool_calls": 0,
                              "n_tool_errors": 0, "tool_calls_valid": 0.0, "n_plan_turns": 0,
-                             "replan_occurred": 0.0, "components": {}, "error": "rollout_exception"}}
+                             "replan_occurred": 0.0, "self_recovery": 0.0, "components": {},
+                             "error": "rollout_exception"}}
+        sc, fault = res["score"], key.get("fault", "none")
         rec = {"task_id": tid, "sample_idx": s, "split": args.split, "teacher": teacher_label,
-               "template": key["template"], "injected": key["injected"],
-               "score": res["score"], "finish_reason": res["finish_reason"],
+               "template": key["template"], "injected": key["injected"], "fault": fault,
+               "n_branch_attempts": res.get("n_branch_attempts", 0),
+               "recovery_mode": res.get("recovery_mode", "direct"),
+               "score": sc, "finish_reason": res["finish_reason"],
                "wall_s": res["wall_s"], "messages": res["messages"]}
         with lock:
             out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out_f.flush()
             stats["n"] += 1
-            stats["verified"] += res["score"]["score"] == 1.0
-            stats["replan"] += res["score"]["replan_occurred"]
-            stats["turns"] += res["score"]["turns_used"]
+            verified = sc["score"] == 1.0
+            stats["verified"] += verified
+            stats["replan"] += sc["replan_occurred"]
+            stats["turns"] += sc["turns_used"]
+            stats["branched"] += res.get("n_branch_attempts", 0)
+            tmpl_n[key["template"]] += 1
+            tmpl_verified[key["template"]] += verified
+            if verified and sc.get("self_recovery"):  # B0: split emergent vs scripted self-recovery
+                if fault in ("runtime", "state+runtime"):
+                    stats["scripted_rec"] += 1
+                else:
+                    stats["emergent_rec"] += 1
             if stats["n"] % 10 == 0 or stats["n"] == len(todo):
                 print(f"  {stats['n']}/{len(todo)}  verified-yield={stats['verified'] / stats['n']:.0%}")
 
@@ -393,11 +595,53 @@ def main():
         out_f.close()
 
     n = max(1, stats["n"])
+    v = max(1, stats["verified"])
     print(f"\nDONE -> {out_path}")
-    print(f"  rollouts        : {stats['n']}")
-    print(f"  verified-yield  : {stats['verified'] / n:.1%}")
-    print(f"  replan-rate     : {stats['replan'] / n:.1%}")
-    print(f"  avg turns       : {stats['turns'] / n:.1f}")
+    print(f"  rollouts          : {stats['n']}")
+    print(f"  verified-yield    : {stats['verified'] / n:.1%}")
+    print(f"  replan-rate       : {stats['replan'] / n:.1%}")
+    print(f"  avg turns         : {stats['turns'] / n:.1f}")
+    if args.branch_on_fail:
+        print(f"  branch-attempts   : {stats['branched']} total")
+    # B0 self-recovery detector (share of VERIFIED traces that recovered from >=1 tool error)
+    print(f"  self-recovery     : emergent {stats['emergent_rec']}/{stats['verified']} "
+          f"({stats['emergent_rec'] / v:.1%}), scripted {stats['scripted_rec']}/{stats['verified']} "
+          f"({stats['scripted_rec'] / v:.1%})")
+
+    # MLflow summary tracking (opt-in --mlflow; mirrors evaluation/evaluate.py's soft pattern — never
+    # breaks the run). File-based logs/JSONL stay the source of truth; this is the cross-run dashboard.
+    if args.mlflow:
+        if mlflow is None:
+            print("  [mlflow] --mlflow set but mlflow not importable — skipping (install mlflow-skinny)")
+        else:
+            try:
+                # our store is a plain file dir (shared with GRPO + the UI service); mlflow>=3.14 gates
+                # the file backend behind this opt-out flag — set it rather than migrate to sqlite.
+                os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+                uri = args.mlflow_tracking_uri or os.environ.get("MLFLOW_TRACKING_URI") \
+                    or Path("mlruns").resolve().as_uri()
+                mlflow.set_tracking_uri(uri)
+                mlflow.set_experiment(args.mlflow_experiment)
+                mlflow.start_run(run_name=args.mlflow_run_name or teacher_label)
+                mlflow.log_params({"split": args.split, "teacher": teacher_label, "model": args.model,
+                                   "k": args.k, "n_tasks": len(split_ids),
+                                   "branch_on_fail": args.branch_on_fail, "max_turns": args.max_turns})
+                mlflow.log_metrics({
+                    "verified_yield": stats["verified"] / n, "replan_rate": stats["replan"] / n,
+                    "avg_turns": stats["turns"] / n, "n_rollouts": stats["n"],
+                    "emergent_recovery_rate": stats["emergent_rec"] / v,
+                    "scripted_recovery_rate": stats["scripted_rec"] / v})
+                for tpl in sorted(tmpl_n):  # per-template yield = the eval breakdown (before/after)
+                    mlflow.log_metric(f"yield_{tpl}", tmpl_verified[tpl] / max(1, tmpl_n[tpl]))
+                print(f"  [mlflow] logged run '{args.mlflow_run_name or teacher_label}' "
+                      f"-> {args.mlflow_experiment} @ {uri}")
+            except Exception as e:  # noqa: BLE001 — tracking must never fail the run
+                print(f"  [mlflow] logging failed ({type(e).__name__}: {e}) — continuing")
+            finally:
+                try:
+                    mlflow.end_run()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

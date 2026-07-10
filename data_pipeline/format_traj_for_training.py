@@ -63,9 +63,16 @@ def convert(rec: dict) -> dict | None:
         "messages": out,
         "_meta": {
             "task_id": rec["task_id"], "template": rec["template"],
-            "injected": rec["injected"], "teacher": rec["teacher"],
+            "injected": rec["injected"], "fault": rec.get("fault", "none"), "teacher": rec["teacher"],
             "turns": rec["score"]["turns_used"], "n_tool_calls": rec["score"]["n_tool_calls"],
             "replan": bool(rec["score"].get("replan_occurred")),
+            # B0/B2: self-correction. A B2-harvested trace ("recovery_mode":"harvest") kept the mistake +
+            # its recovery — count it even when the mistake was a wrong-but-clean search (n_tool_errors==0,
+            # which the verifier's self_recovery misses).
+            "recovery_mode": rec.get("recovery_mode", "direct"),
+            "self_recovery": bool(rec["score"].get("self_recovery")) or rec.get("recovery_mode") == "harvest",
+            "emergent_recovery": (bool(rec["score"].get("self_recovery")) or rec.get("recovery_mode") == "harvest")
+                                 and rec.get("fault", "none") in ("none", "state"),
             "source": "db_bahn_verified_trace", "lang": "de",
         },
     }
@@ -75,16 +82,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default="data/generated/db_traces_sft_train_q36-35b-a3b.jsonl")
     ap.add_argument("--output", default="data/final/db_traces_chat.jsonl")
+    ap.add_argument("--split-file", default=None,
+                    help="split_tasks.json; if set, keep only records whose task_id is in --split")
+    ap.add_argument("--split", default="sft_train",
+                    help="split name to filter to (only with --split-file) — guards against leaking "
+                         "tasks that moved to rl/heldout after a split regen")
     args = ap.parse_args()
 
+    keep_ids = None
+    if args.split_file:
+        keep_ids = set(json.load(open(args.split_file))[args.split])
+
     n_in = n_out = 0
-    drops = {"unverified": 0, "structure": 0}
+    drops = {"unverified": 0, "structure": 0, "off_split": 0}
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         for line in open(args.input):
             n_in += 1
             rec = json.loads(line)
+            if keep_ids is not None and rec.get("task_id") not in keep_ids:
+                drops["off_split"] += 1
+                continue
             if rec.get("score", {}).get("score") != 1.0:
                 drops["unverified"] += 1
                 continue

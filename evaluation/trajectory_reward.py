@@ -19,7 +19,8 @@ Scoring (all deterministic — the P0-1/P0-2 fixes; do NOT trust tau2's read-onl
                       → hallucinated ids/times score 0.
 
 score = 1.0 iff every applicable component passes. Aux: turns_used, n_tool_calls, n_tool_errors,
-tool_calls_valid, n_plan_turns, replan_occurred (injected & ≥2 planning turns), components dict.
+tool_calls_valid, n_plan_turns, replan_occurred (injected & ≥2 planning turns; for runtime-fault
+tasks: ≥1 rejected tool call & ≥2 planning turns), components dict.
 
 Trajectory format (produced by sdg_pipeline/db_bahn/rollout.py): OpenAI-style messages —
 assistant turns may carry tool_calls=[{id,type,function:{name,arguments:<json str>}}], observations are
@@ -121,7 +122,7 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
     """
     out = {"score": 0.0, "task_solved": 0.0, "turns_used": 0, "n_tool_calls": 0,
            "n_tool_errors": 0, "tool_calls_valid": 0.0, "n_plan_turns": 0,
-           "replan_occurred": 0.0, "components": {}, "error": None}
+           "replan_occurred": 0.0, "self_recovery": 0.0, "components": {}, "error": None}
     try:
         if get_env is None:
             from sdg_pipeline.db_bahn.tau2_domain import get_environment as get_env  # tau2 venv only
@@ -208,7 +209,16 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         solved = all(comp.values())
         out["task_solved"] = out["score"] = 1.0 if solved else 0.0
         injected = bool(key.get("injected")) or bool(init_actions)
-        out["replan_occurred"] = 1.0 if (injected and out["n_plan_turns"] >= 2) else 0.0
+        # runtime-fault tasks (wave 2): the surprise is a REJECTED tool call, not a state injection
+        runtime_fault = key.get("fault") in ("runtime", "state+runtime")
+        out["replan_occurred"] = 1.0 if (
+            (injected and out["n_plan_turns"] >= 2)
+            or (runtime_fault and out["n_tool_errors"] >= 1 and out["n_plan_turns"] >= 2)
+        ) else 0.0
+        # self-recovery (B0 detector): a verified trace that hit >=1 tool error mid-way and still
+        # reached 1.0 — i.e. the agent recovered from a failed call. Emergent-vs-scripted is split
+        # downstream by `fault` (fault∈{none,state} = emergent; {runtime,state+runtime} = scripted).
+        out["self_recovery"] = 1.0 if (solved and out["n_tool_errors"] >= 1) else 0.0
         return out
     except Exception as e:
         out["error"] = f"verifier_exception: {type(e).__name__}: {e}"
@@ -259,6 +269,7 @@ def _selftest():
     ]
     r = score_trajectory(task, msgs, key)
     assert r["score"] == 1.0, f"good ACTION should pass: {r}"
+    assert r["self_recovery"] == 0.0, f"clean trace must not flag self_recovery: {r}"
 
     # 2) ACTION trace with the WRONG write -> 0.0 (db hash mismatch)
     bad = json.loads(json.dumps(msgs))
@@ -318,8 +329,77 @@ def _selftest():
     r5 = score_trajectory(task5, msgs5, key5)
     assert r5["score"] == 1.0 and r5["replan_occurred"] == 1.0, f"injected ACTION should pass with replan: {r5}"
 
+    # 6) runtime-fault roundtrip (wave 2): invalid crew_zuweisen -> error observation -> search ->
+    #    valid assignment -> grounded final. Must pass with n_tool_errors==1 and replan_occurred==1.
+    tid6 = next(i for i, k in keys.items() if k["template"] == "t_action_ersatz_quali")
+    task6, key6 = tasks[tid6], keys[tid6]
+    ref6 = task6["evaluation_criteria"]["actions"][0]
+    zn6 = ref6["arguments"]["zugnummer"]
+    proposed6 = key6["facts"]["vorschlag_ungueltig"]
+    env6 = dom.get_environment(solo_mode=True)
+    env6.run_env_function_calls([EnvFunctionCall.model_validate(a)
+                                 for a in task6["initial_state"]["initialization_actions"]])
+    obs6a = env6.use_tool("mitarbeiter_info", zugnummer=zn6)
+    try:
+        env6.use_tool("crew_zuweisen", zugnummer=zn6, mitarbeiter_id=proposed6, rolle="Lokführer")
+        raise AssertionError("invalid assignment must be rejected by the qualification/role gate")
+    except ValueError as e:
+        err6 = json.dumps({"error": f"ValueError: {e}"}, ensure_ascii=False)
+    obs6b = env6.use_tool("mitarbeiter_suchen", **key6["oracle_calls"][1]["arguments"])
+    obs6c = env6.use_tool(ref6["name"], **ref6["arguments"])
+    msgs6 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task6["ticket"]},
+        {"role": "assistant", "content": "<plan>Besatzung prüfen, dann Vorschlag zuteilen.</plan>",
+         "tool_calls": [_mk_call(1, "mitarbeiter_info", zugnummer=zn6),
+                        _mk_call(2, "crew_zuweisen", zugnummer=zn6,
+                                 mitarbeiter_id=proposed6, rolle="Lokführer")]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(obs6a, ensure_ascii=False)},
+        {"role": "tool", "tool_call_id": "call_2", "content": err6},
+        {"role": "assistant", "content": "<plan>Abgelehnt – qualifizierten Ersatz suchen und den "
+                                         "ersten Treffer zuteilen.</plan>",
+         "tool_calls": [_mk_call(3, "mitarbeiter_suchen", **key6["oracle_calls"][1]["arguments"]),
+                        _mk_call(4, ref6["name"], **ref6["arguments"])]},
+        {"role": "tool", "tool_call_id": "call_3", "content": json.dumps(obs6b, ensure_ascii=False)},
+        {"role": "tool", "tool_call_id": "call_4", "content": json.dumps(obs6c, ensure_ascii=False, default=str)},
+        {"role": "assistant", "content": f"{proposed6} wurde abgelehnt (fehlende Qualifikation); "
+                                         f"{key6['facts']['ersatz_id']} ist jetzt als Lokführer zugeteilt."},
+    ]
+    r6 = score_trajectory(task6, msgs6, key6)
+    assert r6["score"] == 1.0 and r6["n_tool_errors"] == 1 and r6["replan_occurred"] == 1.0, \
+        f"runtime-fault roundtrip should pass with replan: {r6}"
+    assert r6["self_recovery"] == 1.0, f"recovered-from-error trace must flag self_recovery: {r6}"
+
+    # 7) rejection IGNORED (only the invalid attempt, then a confident claim) -> 0.0
+    msgs7 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task6["ticket"]},
+        {"role": "assistant", "content": "<plan>Vorschlag direkt zuteilen.</plan>",
+         "tool_calls": [_mk_call(1, "crew_zuweisen", zugnummer=zn6,
+                                 mitarbeiter_id=proposed6, rolle="Lokführer")]},
+        {"role": "tool", "tool_call_id": "call_1", "content": err6},
+        {"role": "assistant", "content": f"Erledigt: {proposed6} ist {zn6} als Lokführer zugeteilt."},
+    ]
+    r7 = score_trajectory(task6, msgs7, key6)
+    assert r7["score"] == 0.0 and not r7["components"]["db_match"], f"ignored rejection must fail: {r7}"
+
+    # 8) search-INFO trace via the key's oracle_calls (wave-2 search tool) -> 1.0
+    tid8 = next(i for i, k in keys.items() if k["template"] == "t_info_mitarbeiter_suche")
+    task8, key8 = tasks[tid8], keys[tid8]
+    env8 = dom.get_environment(solo_mode=True)
+    call8 = key8["oracle_calls"][0]
+    obs8 = env8.use_tool(call8["name"], **call8["arguments"])
+    msgs8 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task8["ticket"]},
+        {"role": "assistant", "content": "<plan>Mitarbeitersuche mit den Filtern aus dem Ticket.</plan>",
+         "tool_calls": [_mk_call(1, call8["name"], **call8["arguments"])]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(obs8, ensure_ascii=False)},
+        {"role": "assistant", "content": "Im Dienst: " + ", ".join(key8["facts"]["emp_ids"]) + "."},
+    ]
+    r8 = score_trajectory(task8, msgs8, key8)
+    assert r8["score"] == 1.0, f"good search-INFO should pass: {r8}"
+
     print("trajectory_reward.py self-test OK "
-          f"(good-action 1.0 | wrong-write 0.0 | good-info 1.0 | hallucination 0.0 | injected+replan 1.0)")
+          "(good-action 1.0 | wrong-write 0.0 | good-info 1.0 | hallucination 0.0 | injected+replan 1.0 | "
+          "runtime-fault roundtrip 1.0 +self_recovery | ignored rejection 0.0 | search-info 1.0)")
 
 
 if __name__ == "__main__":

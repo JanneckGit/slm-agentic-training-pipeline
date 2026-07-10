@@ -298,7 +298,7 @@ def main():
     for k, v in counts.items():
         print(f"  {k:20s}: {v}")
     (out.parent / "world_manifest.json").write_text(
-        json.dumps({"sha256_16": digest, "counts": counts, "meta": db["_meta"]}, ensure_ascii=False, indent=2))
+        json.dumps({"sha256_16": digest, "counts": counts, "meta": db["meta"]}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
