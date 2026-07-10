@@ -4,6 +4,10 @@
 > **Executed 2026-07-03** with the SHORTENED protocol (user request): **12 stratified bakeoff_dev tasks × k=1**,
 > max 8 turns, hard 25-min cap/candidate, **identical final harness for all** (fair pass 2 after the format-zoo
 > fixes — see `agentic-db-synthesis-log.md`). Rank metric: verified-yield × German per GPU-hour ("score").
+>
+> **Note (dated result).** This describes the **Welle-1 domain** (10 templates, 8 tools); the domain has since
+> grown to **25 templates / 12 tools**, but the selected teacher **Qwen3.6-35B-A3B** remains the production
+> trace generator. Numbers below are historical by design.
 
 ## Comparison set
 

@@ -1,10 +1,80 @@
 # Agentic DB-synthesis — build & decision log
 
-> Running ADR-style log for **Plan (B): grounded synthetic DB tool-calling traces** (Stage-1 leg 3).
-> Plan: `/home/jaroeckelein/.claude/plans/ne-readme-noch-nciht-cheeky-mango.md`. Design: [`agentic-sft-db-synthesis.md`](agentic-sft-db-synthesis.md).
-> Convention: newest entry on top. Each entry = date · decision/event · why · alternatives/bugs. **No commits/pushes without approval.**
+> Newest entry on top. Baubegleitendes Entscheidungs- + Bug-Log. Design-Kontext:
+> [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
+> [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
----
+## 2026-07-10 — ✅ Regen 2 (Split-Redesign + 1.601 Traces) + A1-Lookup-Tool (12.)
+
+- **Split-Redesign (per-Template proportional):** Round-Robin ließ kleine Pools verhungern — `wartung_depot`
+  15→0 in sft, d. h. `wartung_liste` wäre **nie** trainiert worden. Jetzt landet **jedes der 25 Templates in
+  jedem disjunkten Split** (`heldout_eval`/`rl_train`/`sft_train`), `bakeoff_dev` ist ein **nicht-disjunkter**
+  stratifizierter ⊆-sft-Sample. Neue Splits (HARD-FAIL-geprüft): **bakeoff_dev 25 / heldout_eval 59 /
+  rl_train 295 / sft_train 1.610** (Pool weiter 1.964 unique).
+- **`format_traj` split-aware:** `--split-file/--split` filtert Records, deren `task_id` nach einem Split-Regen
+  in rl/heldout gewandert ist → **kein Leakage** ins SFT-Set.
+- **`solve_task`-Rework — branch-first + B2-Priorität:** bei einem gescheiterten Rollout zuerst **Recovery**
+  (harvest → yield-mode) statt Neustart. `choose_harvest_point` behält den Fehler **plus** seine Korrektur
+  (= Selbstkorrektur-Trace), aber nur bei **nicht-mutierenden** Fehlern (READ oder abgelehnter WRITE).
+  `recovery_mode ∈ {direct, harvest, clean, restart, failed}`.
+- **Ergebnis:** **1.601 verifizierte Traces (99,4 % Yield), alle 25 Templates** (Coverage-Loch zu),
+  **55 % Multi-Tool** (≥3 Calls), **41 % Fault/Replan**, **emergente Selbstkorrektur 0,7 %→3,1 %** (49 Traces,
+  davon 33 via B2-Harvest), kein Leakage, kein `teacher_error`. Alt nach `archive/data/wave2_gen1_20260709/`.
+  MLflow-Run in `db_bahn_traj_gen`.
+- **Zwei dauerhafte Fixes:** (1) **Context-Overflow** — der 11-Tool-System-Prompt (~3.800 Token) sprengte das
+  8192-Fenster (HTTP 400) → `max_model_len` **8192→12288**, `max_tokens_per_turn` **2048→1536**, `rollout.py`
+  fängt Teacher-HTTP-Fehler graceful ab (`teacher_error`, kein Abort). Propagiert nach `gen_traces.sh` +
+  `traj_sft_pipeline.sh` + `teacher_bakeoff.sh` + Config. (2) **`mlruns/` root-owned** → Host-mlflow-Schreiben
+  scheiterte → via Container auf Host-User gechownt (Host + Container schreiben jetzt beide); mlflow ≥ 3.14
+  braucht zusätzlich `MLFLOW_ALLOW_FILE_STORE=true`.
+- **A1 — 12. Tool `mitarbeiter_details` (READ, Lookup-by-ID):** Root-Cause-Fix gegen den Über-Such-„Flail"
+  (~1,5 % Traces): der Agent hatte **kein Werkzeug, eine BEKANNTE Person zu prüfen** — nur `mitarbeiter_suchen`
+  (Kategorie-Filter, bei 10 Treffern abgeschnitten); stand die ID im Ticket, „verifizierte" der Teacher blind
+  und schloss aus einer gekürzten Trefferliste falsch auf „nicht qualifiziert". Das neue Tool gibt Stammdaten
+  per ID (`ValueError` bei unbekannter ID). `policy.md` 11→12 Tools + Verifikations-Regel (bekannte ID →
+  `mitarbeiter_details`, nie aus abgeschnittener Liste auf Abwesenheit schließen). **Rein additiv** (Gold-Pfade
+  unverändert, `expected_tools ⊆ called`), **READ** → Verifier/rollout unberührt. CPU-Gates grün: Env-Smoke
+  **12 Tools**, Tool funktional (ID→Stammdaten, unbekannt→`ValueError`, whitespace-tolerant), Verifier-Selftest
+  8/8, Oracle-Dry-Run `bakeoff_dev` 100 %.
+- **Datenlage / Nuance:** die 1.601 Traces entstanden auf der **11-Tool**-Domäne (`mitarbeiter_details` in
+  keiner Trace) → ein **einheitlicher 12-Tool-Regen** ist geplant (User, Wochenende).
+- **Offen:** Training (`traj_sft_pipeline.sh`) + **Re-Baseline** auf `heldout_eval` (59), danach Stage-2 GRPO
+  re-wire (Config-GRPO-Block zeigt noch auf alte Text2SQL-Artefakte).
+
+## 2026-07-08 — ✅ WELLE 2: Clean Rebuild der Domäne + Task-Pool (1.964 Tasks, alle Gates grün)
+
+- **Decision — clean rebuild statt Welle-1-Schonung (User-Vorgabe):** kein Byte-Identitäts-Gefrickel, um die
+  446 alten Traces zu retten — Domäne/Templates/Splits sauber nach Merit neu gebaut; **Welle-1-Artefakte
+  archiviert** nach `data/archive/wave1_20260708/` (tasks/splits/keys + alle db_traces + db_traces_chat).
+  Why: synthetische Daten sind billig reproduzierbar (deterministischer Generator + eigene GPU), alte Traces
+  wären mit dem neuen 11-Tool-Prompt eh inhomogen. Welt (`db.json`) unverändert — kein Re-Seed.
+- **Domäne erweitert (tools.py, 8 → 11 Tools):** 3 Such-READ-Tools (`zuege_suchen`, `mitarbeiter_suchen`,
+  `wartung_liste`; ≥1 Filter Pflicht, Cap 10 Zeilen, deterministische Sortierung — „erster Treffer = kleinste
+  ID" ist der Tiebreak, den Tickets referenzieren) + **Business-Regeln in den WRITE-Tools** (Laufzeit-Fehler
+  per deutscher ValueError → Error-Observation → Replan): Rollen-Gate, Produkt-Qualifikations-Gate (nur
+  ICE/IC/EC), Duplikat-Gate, Endstatus „abgeschlossen", `faellig_am`-Format, Depot-Whitelist. Brachliegende
+  Weltdaten (qualifications, shifts) damit erstmals agentisch erreichbar. policy.md auf 11 Tools + Regeln 4/5
+  (Zuteilung/Wartung) + „abgelehnte Aufrufe nie wiederholen" erweitert.
+- **gen_tasks.py neu:** EINE Registry `Spec(fn, pool, n, injectable, fault_rate)`, 25 Templates (9 polierte
+  Welle-1-Formen, `info_wartung_machbar` ersatzlos raus [15/49-Freiform-Schwäche]; 16 neue: Suche ohne
+  vorgekaute IDs, 3–4-Tool-Ketten, bedingte Writes, Multi-Write, 3 Laufzeit-Fehler-Replan-Formen). Einheitliches
+  Key-Schema für ALLE Tasks: `fault/expected_calls/oracle_calls` — `make_oracle` läuft nur noch über
+  `oracle_calls` (Zugnummer-Heuristik gelöscht). Neue Pools inkl. „ein Trip pro Fahrzeug" (Dedup gegen
+  Beinahe-Duplikate) und deterministische Filter-Kombo-Pools mit 1–3 Treffern.
+- **Ergebnis (seed 42, Gate-d-kalibriert):** **1.964 Tasks** — Multi-Tool (expected_calls ≥3) **52 %**
+  (Ziel ≥50), Fault **41 %** (Ziel ~40; 538 state / 128 runtime / 140 state+runtime), Single-Tool 27 %
+  (Welle 1: 64 %). Splits frisch + disjunkt (HARD-FAIL-geprüft): bakeoff_dev 25 / heldout_eval 60 /
+  **rl_train 300 (GRPO-Reserve, wird nie für SFT gerollt)** / sft_train 1.579.
+- **Gates:** (a) Oracle-Dry-Run 100 % verified, 0× gold_replay_failed (validiert Keys + neue WRITE-Regeln,
+  bakeoff 25/25; große Splits s. validation_w2/); (c) Verifier-Selftest 8/8 inkl. Runtime-Fault-Roundtrip
+  (Rejection→Suche→valide Zuweisung→1,0 mit `replan_occurred`; ignorierte Rejection→0,0); (d) Stats-Gate s. o.;
+  (e) Env-Smoke 11 Tools + alle 6 Ablehnungs-Gates funktional. **Determinismus: zweiter Lauf byte-identisch.**
+- **Eval-Bruch beabsichtigt:** 11-Tool-Prompt + neues 60er-Heldout → alte 72,5 %/70 % nur noch historisch;
+  Re-Baseline des Basis-Modells gehört in den Rollout-Abend. `replan_occurred` zählt jetzt auch
+  Laufzeit-Fehler-Replans (`fault∈{runtime,state+runtime}` + ≥1 Tool-Error + ≥2 Planungs-Turns).
+- **Offen (Etappe 3, GPU auf Zuruf):** Rollout-Abend mit Qwen3.6-35B-A3B über sft_train (1.579; k=2-Top-up
+  auf Multi/Fault-Teilmenge für das 1.500–2.000-Band), Re-Baseline auf heldout_eval.
+  Drive-by gefixt: `seed_worldstate.py` Manifest-KeyError (`db["_meta"]`→`db["meta"]`).
 
 ## 2026-07-03 — Implementation started
 

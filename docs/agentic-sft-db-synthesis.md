@@ -1,18 +1,24 @@
-# Agentic SFT — Leg 3: Synthetic DB Traces (literature map + build recipe)
+# Agentic SFT — Synthetic DB Traces (literature map + build recipe)
 
-> **Status:** design note (literature triaged, nothing built) · **Date:** 2026-07-03 · **Scope:** how to synthesize the German Deutsche-Bahn tool-calling trajectories — the **third leg** of the Stage-1 SFT mix (after ToolACE + TaskBench, see [`agentic-sft-data-basis.md`](agentic-sft-data-basis.md)).
+> **Status:** ✅ **SUPERSEDED — now built** (this pre-build design note is kept for its literature rationale).
+> **Date:** 2026-07-03 · **Scope:** how to synthesize the German Deutsche-Bahn tool-calling trajectories — the
+> **self-synthesized DB leg** of the Stage-1 SFT mix (now **leg 4** of 4, alongside ToolACE + TaskBench +
+> AReaL/τ²-bench; see [`agentic-sft-data-basis.md`](agentic-sft-data-basis.md)). The synthesis is implemented
+> and run — **1,601 verified traces**, see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md).
 >
 > **Decisions locked in:** approach = **(B) grounded synthesis** (teacher drives tool calls against a *real executable* DB sandbox + verifier gate + fault-injection for replan); **teacher = local GB10 model** (a strong API teacher like GPT-5 is not guaranteed). This note sorts the literature levers **before** building, so we don't reinvent what papers already provide. Source: Notion *"Agentic LLM / Orchestrator"* → chapter *"🧪 Hebel aus der Literatur (nach Pipeline-Stufe)"* (9 papers), cross-read against the arXiv originals.
 
 ## Where this fits
 
-Stage-1 SFT mixes three legs, shuffled in one pass, DB up-weighted → then Stage-2 GRPO/verl on τ²-bench.
+Stage-1 SFT mixes **four legs**, shuffled in one pass, the German DB leg up-weighted → then Stage-2 GRPO/verl
+on new, disjoint τ²-bench + db_bahn tasks.
 
 | Leg | Source | Status |
 |---|---|---|
 | 1. tool-call basics | ToolACE (downloaded) | done |
 | 2. planning/decomposition | TaskBench (downloaded) | done |
-| **3. DB-specific + German + replan** | **synthesized (this note)** | **design** |
+| 3. multi-turn dialogue/policy | AReaL / τ²-bench (downloaded) | done |
+| **4. DB-specific + German + replan** | **synthesized (this note)** | **✅ built — 1,601 traces** |
 
 ## How it works — a plain-English walkthrough
 
@@ -40,7 +46,7 @@ Stage-1 SFT mixes three legs, shuffled in one pass, DB up-weighted → then Stag
 
 **Legend:** 🟢 use now for Stage-1 DB synthesis · 🟡 Stage-2 RL (later) · 🔵 deploy gate · ⚪ context/motivation
 
-### Stage 1 — SFT method & data recipe (the 3-dataset mix)
+### Stage 1 — SFT method & data recipe (the 4-leg mix)
 
 | Paper | arXiv | Verdict | Actionable takeaway for us |
 |---|---|---|---|
@@ -78,7 +84,7 @@ The 9 levers jointly prescribe this Stage-1 pipeline (each step cites the paper 
 2. **Rollout — grounded.** Local teacher(s) act against the **real executable DB sandbox** → full-history trajectories; **inject faults** (tool error / surprise / seeded bad state) to force plan → observe → **replan**. *(DuoMem full-history + our fault-injection; plan-commit shape from When-in-Doubt)*
 3. **Gate hard.** **Execution-based correctness filter first** *(NebulaExp #1 lever)*, then an **atomic yes/no BINEVAL checklist** for the un-checkable parts; keep **only verified (score = 1)** trajectories. *(DuoMem "successful trajectories")*
 4. **Mix for diversity.** Maximize DB task-surface diversity, keep **≥5-turn replan traces** *(OpenThoughts)*; keep the SFT set **disjoint** from the Stage-2 RL combinations *(Reusable Modules)*.
-5. **Train.** LoRA on the verified full-history trajectories *(DuoMem 4B blueprint)*; optionally add teacher procedural-memos in context-space. Reuse the base's harness ([`sdg_pipeline/trace_capture.py`](../sdg_pipeline/trace_capture.py) concurrency/resume/regenerate/MLflow) + [`TeacherModelConnector`](../sdg_pipeline/run_sdg.py); build the new tool-sandbox + verifier + multi-turn loop on top (none exist yet — see [`agentic-pivot-overview.md`](agentic-pivot-overview.md)).
+5. **Train.** LoRA on the verified full-history trajectories *(DuoMem 4B blueprint)*; optionally add teacher procedural-memos in context-space. **Built:** the tool-sandbox + verifier + multi-turn loop now live in [`sdg_pipeline/db_bahn/rollout.py`](../sdg_pipeline/db_bahn/rollout.py) (concurrency / resume / branch-on-fail / MLflow) + [`evaluation/trajectory_reward.py`](../evaluation/trajectory_reward.py) + [`training_pipeline/train_traj.py`](../training_pipeline/train_traj.py). *(The base's old `trace_capture.py` / `run_sdg.py` harness was removed in the 2026-07-03 cleanup and rebuilt fresh.)*
 
 ## Teacher question — resolved
 

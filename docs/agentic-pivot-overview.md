@@ -2,6 +2,10 @@
 
 > **Status:** design / transition note · **Date:** 2026-07-02 · **Scope:** read-only analysis, no code changed.
 >
+> **⚠️ Superseded (2026-07-10).** The agentic build this note forecasts (§6, *"not started"*) is now implemented —
+> see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md); several base files cited in §1/§3 were removed
+> in the 2026-07-03 cleanup. Kept as a dated pivot-point record; the §5 carryover map still applies.
+>
 > **Purpose.** This document records what the finished **Text-to-SQL SLM pipeline** (this repo's base)
 > actually is at the code level, and maps — subsystem by subsystem — what carries over to the target
 > **agentic SLM orchestrator** (multi-step planning, tool-calling, self-reflection/replan) vs. what is

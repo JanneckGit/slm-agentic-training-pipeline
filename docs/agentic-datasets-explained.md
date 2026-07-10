@@ -44,7 +44,7 @@ Jeder Datensatz „kann" andere Dinge. Diese Eigenschaften unterscheiden sie:
 |---|---|---|---|---|
 | **Domäne** | 26.507 zufällige APIs (Krypto, Finanzen, Wetter…) | KI-Modelle / Multimedia / Alltags-APIs | Kundenservice: Airline, Retail, Telecom | **Deutsche Bahn** (intern) |
 | **Sprache** | Englisch | Englisch | Englisch | **Deutsch** |
-| **Tools (Werkzeuge)** | sehr viele, wechselnd | pro Domäne ein fester Tool-Katalog | fester Domänen-Katalog (buchen, stornieren…) | 8 feste (fahrplan, wartung, crew…) |
+| **Tools (Werkzeuge)** | sehr viele, wechselnd | pro Domäne ein fester Tool-Katalog | fester Domänen-Katalog (buchen, stornieren…) | 12 feste (6 Lookup + 3 **Suche** + 3 Write mit Ablehnungs-Regeln) |
 | **Planung (Zerlegung)** | einfach (1–wenige Calls) | **Kern**: Tool-Graph, Reihenfolge, Parameter | mehrstufig, regelbasiert | mehrstufig (1–4 Tools) |
 | **Fehler / injected mismatches** | nein (nur saubere Calls) | nein (nur der Soll-Graph) | **ja** — Überraschungen aus der Umgebung | **ja** — bewusst injiziert (Ausfall, Verspätung) |
 | **Rationales (Denk-Schritte)** | teils | nein (nur Struktur) | ja (Teacher denkt) | **ja** — `<plan>…</plan>` pro Schritt |
@@ -52,9 +52,9 @@ Jeder Datensatz „kann" andere Dinge. Diese Eigenschaften unterscheiden sie:
 | **Echte Tool-Antworten?** | erfunden (im Datensatz) | keine (nur Graph) | **echt** (Framework führt aus) | **echt** (unser Sandbox führt aus) |
 | **Format** | ShareGPT (`conversations`) | Parquet (Instruktion + Graph als JSON-Strings) | per-turn: `messages`-Vorkontext + `answer` (thinking + flache `tool_calls`) | OpenAI-Messages (`messages` + `tool_calls`) |
 | **Herkunft** | Download (fertig) | Download (fertig) | **Download (AReaL-Shortcut)** statt selbst erzeugen | **selbst erzeugt** ✅ |
-| **Menge** | 11.300 | 17.331 | 33.531 per-turn (**74,5 % correct**) | 446 verifiziert |
+| **Menge** | 11.300 | 17.331 | 33.531 per-turn (**74,5 % correct**) | Pool: **1.964 Tasks**; **1.601 verifizierte Traces** (99,4 %) |
 | **Rolle** | SFT | SFT | SFT (+ 1.982 RL-Tasks) | SFT (+ Domäne für RL/Eval) |
-| **Status bei uns** | ✅ gezogen | ✅ gezogen | ✅ **gezogen + validiert** | ✅ fertig |
+| **Status bei uns** | ✅ gezogen | ✅ gezogen | ✅ **gezogen + validiert** | ✅ **1.601 Traces fertig** (12-Tool-Regen queued) |
 
 Kurz: Nur die **rechten zwei** (τ²-bench, db_bahn) haben echte Umgebungen mit *Fehlern* und *Umplanen* — das
 ist genau die „Variante C"-Fähigkeit, um die es uns geht. Die linken zwei sind statische Bausteine (Grundlagen).
@@ -174,20 +174,29 @@ assistant: "Paul Schmidt (MA-4551) wurde als Lokführer für EC 290 zugewiesen (
   **Überraschung** (Ausfall) ist bewusst **injiziert** — so entsteht ein echtes „Plan A → beobachten → Plan B".
   Echte Tool-Antworten aus unserem Sandbox. Jede Trace wurde vom Verifier auf 1,0 geprüft.
 
-> **📌 Finding — Welle 1 (446) reicht als Pilot, nicht als Ziel.** Ist-Zustand: 10 Templates, **64% Ein-Tool**,
-> nur 19% injiziert — zu einfach (erklärt den flachen 72,5%→70%-Eval; die Basis kann Ein-Tool-Aufgaben schon).
-> Der Engpass ist **Template-Vielfalt, nicht Menge** (Dedup deckelt bei ~55/Template; OpenThoughts: *Diversität
-> ≫ Volumen*, Referenz-4B-Runs lagen bei 200–1.500 Episodes). **Welle-2-Ziel:**
+> **📌 Update (2026-07-08 → 07-10) — Welle 2 umgesetzt: Clean Rebuild ✅ (Task-Pool + 1.601 Traces fertig).**
+> Welle 1 (446 Traces, 64 % Ein-Tool, flacher Eval) war zu einfach; statt sie zu schonen wurde sauber neu
+> gebaut und **Welle 1 komplett archiviert** (`data/archive/wave1_20260708/`). Dafür wuchs die **Domäne
+> selbst**: 8 → **12 Tools** (3 Such-Tools `zuege_suchen`/`mitarbeiter_suchen`/`wartung_liste` für Aufgaben
+> **ohne vorgekaute IDs**, + Lookup-by-ID `mitarbeiter_details` als 12.) und die WRITE-Tools **lehnen jetzt
+> regelwidrige Aufrufe ab** (Rolle/Qualifikation/Duplikat/Endstatus → echte **Laufzeit-Fehler-Replans**, z. B.
+> „Zuweisung abgelehnt: … fehlt die Qualifikation ICE"). 25 Templates (9 poliert übernommen,
+> `info_wartung_machbar` gestrichen, 16 neue).
 
-| | Welle 1 (ist) | Welle 2 (Ziel) |
+| | Welle 1 (archiviert) | Welle 2 (ist, validiert) |
 |---|---|---|
-| Templates | 10 | **+15–20 härtere** (Mehr-Tool-Ketten, Such-/Entscheidungsaufgaben ohne vorgekaute IDs) |
-| Verifizierte Traces | 446 | **~1.500–2.000** gesamt |
-| Multi-Tool (≥3 Calls) | 13% | **≥50%** |
-| Replan/Fault | 19% | **~40%** (inkl. **Laufzeit**-Fehler, z. B. „Zuweisung abgelehnt: nicht qualifiziert") |
+| Templates | 10 | **25** (Suche ohne IDs, 3–4-Tool-Ketten, bedingte/Multi-Writes, Laufzeit-Fehler) |
+| Task-Pool | 550 | **1.964** — Splits: bakeoff 25 / heldout 59 / **rl_train 295 (GRPO)** / sft 1.610 |
+| Multi-Tool (≥3 Calls, Pool) | 20% | **52%** |
+| Fault/Replan (Pool) | 22% | **41%** (538 state, 128 runtime, 140 state+runtime) |
+| Verifizierte Traces | 446 (archiviert) | **1.601** (99,4 %; 55% Multi-Tool, 41% Fault, 3,1% Selbstkorrektur; branch-on-fail + k=2-Top-up + B2-Harvest) |
 
-> Generator/Verifier/Harness können das schon — nur neue Template-Funktionen in `gen_tasks.py`. Kosten:
-> ~1.100 neue Rollouts × ~16 s ≈ **ein Abend GPU**.
+> Alle CPU-Gates grün: Oracle-Replay 100 % / 0× gold_replay_failed, Verifier-Selftest 8/8 (inkl.
+> Rejection→Suche→Replan-Roundtrip), Generator byte-deterministisch. **Achtung Eval-Bruch (beabsichtigt):**
+> neuer 12-Tool-Prompt + neues 59er-Heldout → alte 72,5 %/70 %-Zahlen nur noch historisch; Re-Baseline steht
+> aus. **Nachtrag:** die 1.601 Traces entstanden auf der 11-Tool-Domäne — `mitarbeiter_details` (12.) kam
+> danach dazu → ein einheitlicher **12-Tool-Regen** ist geplant. Details:
+> [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md) (Einträge 2026-07-08 + 2026-07-10).
 
 ---
 
@@ -318,7 +327,7 @@ aufgeschlagenem Buch schreibt — die Antwort wird nachgeschlagen, nicht erinner
   Hebel #1). Ein kleiner **Ja/Nein-Judge** (BinEval-Stil) ist nur als *Zusatz* für Weiches sinnvoll
   (Stil, Plan-Qualität, Relevanz) — als Berichts-Schicht, nie als Ersatz des harten Gates.
 - **Und die finale Evaluation?** Dieselbe Prüf-Maschine, drei Einsätze: Daten-Filter (✅ läuft) →
-  Held-out-Messung auf 40 ungesehenen Aufgaben (✅ läuft) → **offizielle** τ²-bench-Testsplits + BFCL-V3
+  Held-out-Messung auf 59 ungesehenen Aufgaben (✅ läuft) → **offizielle** τ²-bench-Testsplits + BFCL-V3
   (❌ steht noch aus — das ist die papervergleichbare Endmessung).
 
 ## 5. Die sinnvolle Aufteilung (SFT / RL / Eval)
@@ -347,10 +356,11 @@ STATISCH (nur SFT)          AUSFÜHRBAR (Task-Pool in 3 disjunkte Teile splitten
                                                  │    τ²-test + db_bahn-heldout + BFCL-V3
 ```
 
-**Wo wir stehen:** Alle vier SFT-Legs liegen roh vor — ToolACE ✅, TaskBench ✅, db_bahn ✅, τ²-bench-Abläufe ✅
-(via AReaL-Shortcut gezogen + validiert, §2.3; beim Mischen auf `correct==1` filtern). Für RL liefert AReaL
-zusätzlich 1.982 fertige Tasks inkl. DB-Snapshots; auf db_bahn-Seite bräuchten wir dafür **neue, disjunkte**
-Aufgaben (neue Templates), getrennt von den SFT-Aufgaben.
+**Wo wir stehen:** ToolACE ✅, TaskBench ✅, τ²-bench-Abläufe ✅ (via AReaL-Shortcut gezogen + validiert, §2.3;
+beim Mischen auf `correct==1` filtern). db_bahn: **Welle-2-Task-Pool ✅** (1.964 Tasks, validiert; Welle 1
+archiviert) und **1.601 verifizierte Traces ✅** (99,4 %, Sieger-Teacher; 12-Tool-Regen queued). Für RL ist
+beides da: AReaL liefert 1.982 fertige Tasks inkl. DB-Snapshots, db_bahn hat jetzt einen eigenen disjunkten
+**`rl_train`-Split (295 Aufgaben)**, der nie für SFT gerollt wird.
 
 ---
 
@@ -363,7 +373,7 @@ Aufgaben (neue Templates), getrennt von den SFT-Aufgaben.
 | `<plan>`-Rationales | teils | – | ✅ | ✅ |
 | echtes Env | – | – | ✅ | ✅ |
 | Sprache | EN | EN | EN | **DE** |
-| bei uns | ✅ | ✅ | ✅ (AReaL, `correct==1` filtern) | ✅ |
+| bei uns | ✅ | ✅ | ✅ (AReaL, `correct==1` filtern) | ✅ Pool W2 · 1.601 Traces ✅ |
 
 **In einem Satz:** ToolACE + TaskBench liefern die Bausteine (statisch, nur SFT); τ²-bench und db_bahn liefern
 *echte* Umgebungen mit Fehlern und Umplanen — und dieselbe Umgebung dient, auf **getrennten** Aufgaben-Splits,

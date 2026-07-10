@@ -1,18 +1,21 @@
 # Agentic SFT — Data Basis (Stage 1: mixed SFT)
 
-> **Status:** raw data pulled ✅ · **Date:** 2026-07-02 · **Scope:** acquisition only (faithful copy + source tags).
+> **Status:** raw data pulled ✅ · **Date:** 2026-07-02 (AReaL leg added 2026-07-08) · **Scope:** acquisition
+> record (faithful copy + source tags).
 >
-> This document shows **what the Stage-1 SFT data basis is** for the agentic orchestrator. The raw sets
+> This document shows **what the public Stage-1 SFT data basis is** for the agentic orchestrator. The raw sets
 > live under `data/raw/` (gitignored → not committed), so **this doc is the shareable artifact.**
 
 ## Where this fits — the two-stage training plan
 
-1. **SFT (LoRA first)** — mixed on **ToolACE + TaskBench + synthetic DB flows** (one shuffled pass, DB up-weighted).
-2. **RL / GRPO (LoRA)** — on **τ²-bench**.
+1. **Stage 1 — SFT (LoRA)** — mixed on a **4-leg** basis: **ToolACE + TaskBench + τ²-bench flows (AReaL) +
+   self-synthesized German DB trajectories** (one shuffled pass, the DB leg up-weighted).
+2. **Stage 2 — RL / GRPO (LoRA)** — on **new, disjoint** τ²-bench + db_bahn tasks (reward = trajectory verifier).
 
-This doc covers the **raw basis for Stage 1, legs 1 & 2** (the two public sets). Leg 3 (synthetic DB flows)
-and Stage 2 (τ²-bench) are separate, later workstreams. Converting these raw records into the unified
-chat/training format is the **next** step (see the last section).
+This doc is the **acquisition record for the three public sets** (legs 1–3: ToolACE, TaskBench, AReaL). The
+self-synthesized DB leg (leg 4) has its own docs → [agentic-datasets-explained.md](agentic-datasets-explained.md)
++ [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md). Note: τ²-bench enters as an **SFT leg** (via the
+AReaL per-turn data), **not** RL-only.
 
 ## What was pulled
 
@@ -20,10 +23,12 @@ chat/training format is the **next** step (see the last section).
 |---|---|---|---:|---|---:|---|
 | **ToolACE** | `Team-ACE/ToolACE` | Apache-2.0 | **11,300** | `train` | ~35 MB | tool-call **basics** |
 | **TaskBench** | `microsoft/Taskbench` | MIT | **17,331** | `test` | ~29 MB | **planning** / decomposition |
-| **— total** | | | **28,631** | | ~64 MB | |
+| **AReaL (τ²-bench)** | `inclusionAI/AReaL-tau2-data` | Apache-2.0 | **33,531** SFT (+1,982 RL) | — | ~926 MB | **dialogue / policy** (multi-turn) |
+| **— total** | | | **62,162** SFT | | ~990 MB | |
 
-Both are **public (not gated)** → no HF token needed. Pulled by
-[`data_pipeline/prepare_agentic_data.py`](../data_pipeline/prepare_agentic_data.py); counts verified on disk.
+All three are **public (not gated)** → no HF token needed. Pulled by
+[`data_pipeline/prepare_agentic_data.py`](../data_pipeline/prepare_agentic_data.py) and validated by
+[`data_pipeline/validate_areal.py`](../data_pipeline/validate_areal.py); counts verified on disk.
 
 ---
 
@@ -86,11 +91,22 @@ strings** (`json.loads` them). Two **sidecar files** per domain carry what's *no
 
 ---
 
-## Leg 3 — synthetic DB flows (later, not in this pull)
+## Leg 3 — AReaL (τ²-bench flows)
 
-Domain adaptation for the Deutsche-Bahn assistant: German + DB-specific flows generated **against the
-real DB tools** (Fahrplan, Zugstandort, Wartung, …). **Up-weighted** in the mix (only German + only
-DB-specific leg). Separate synthesis workstream — not part of this acquisition.
+τ²-bench customer-service dialogues (airline / retail / telecom), pulled via the **AReaL shortcut**
+([`inclusionAI/AReaL-tau2-data`](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data), Apache-2.0)
+instead of self-generated: **33,531 per-turn SFT rows** (12,842 airline / 11,395 retail / 9,294 telecom) +
+**1,982 RL tasks** with DB snapshots. Per-turn format (`messages` context + `answer`). Teaches **multi-turn
+dialogue + policy adherence**. **Caveat:** only ~74.5 % of SFT turns carry `metadata.correct==1` — the mix
+step **must filter on `correct==1`**. Validated by [`validate_areal.py`](../data_pipeline/validate_areal.py)
+(streaming schema / integrity / referential checks → `data/raw/areal/validation_report.json`).
+
+## Leg 4 — synthetic DB flows (own workstream)
+
+Domain adaptation for the Deutsche-Bahn assistant: German + DB-specific trajectories generated **against the
+real DB tools** (Fahrplan, Zugstandort, Wartung, …), verifier-gated. **Up-weighted** in the mix (only German +
+only DB-specific leg). **Done** — 1,601 verified traces; details in
+[agentic-datasets-explained.md](agentic-datasets-explained.md) + [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md).
 
 ---
 
@@ -105,7 +121,8 @@ docker compose -f docker/docker-compose.yml run --rm sdg \
 Or on any host with `datasets` + `huggingface_hub`:
 ```bash
 python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
-# --dataset toolace|taskbench to pull one; --n-samples N for a quick subset
+# --dataset toolace|taskbench|areal to pull one; --n-samples N for a quick subset
+# areal is a ~970 MB snapshot — validate afterwards with data_pipeline/validate_areal.py --deep
 ```
 Dataset IDs/configs are in `config/pipeline_config.yaml` under `data.agentic` (the script also has
 built-in defaults, so it runs without config edits).
@@ -118,6 +135,8 @@ data/raw/
 ├── taskbench/{huggingface,multimedia,dailylifeapis}/
 │   ├── data.jsonl                                          # 7,458 / 5,555 / 4,318
 │   ├── tool_desc.json  graph_desc.json                     # tool inventory + dep-graph
+├── areal/  (per-turn SFT + RL tasks + DB snapshots)        # 33,531 SFT + 1,982 RL
+│   └── validation_report.json                              # validate_areal.py output
 └── agentic_manifest.json                                   # counts/paths/columns
 ```
 `data/raw/` is **gitignored** — the pulled data is never committed; this doc + the fetch script are the
@@ -125,9 +144,11 @@ committed, shareable artifacts.
 
 ## Toward the unified training format (for the next step)
 
-The mix step must reconcile the two into **one chat `messages` format** (system with a tool registry;
+The mix step must reconcile all legs into **one chat `messages` format** (system with a tool registry;
 assistant turns with tool calls; `role:"tool"` result turns; multi-turn loss masking on assistant turns):
 - **ToolACE:** convert bracket-DSL calls → the target tool-call format; lift tool defs out of `system`.
 - **TaskBench:** `json.loads` the graph columns; render the plan/graph into the target format (no
   execution turns to mask).
-- **Mixing:** one shuffled SFT pass (not sequential blocks); **DB flows up-weighted** once added.
+- **AReaL (τ²):** per-turn rows → assemble into multi-turn chats; **filter on `metadata.correct==1`**.
+- **db_bahn:** already emitted in the target chat format by `format_traj_for_training.py` (verified traces only).
+- **Mixing:** one shuffled SFT pass (not sequential blocks); **the German DB leg up-weighted**.
