@@ -4,7 +4,7 @@
 > **Date:** 2026-07-03 · **Scope:** how to synthesize the German Deutsche-Bahn tool-calling trajectories — the
 > **self-synthesized DB leg** of the Stage-1 SFT mix (now **leg 4** of 4, alongside ToolACE + TaskBench +
 > AReaL/τ²-bench; see [`agentic-sft-data-basis.md`](agentic-sft-data-basis.md)). The synthesis is implemented
-> and run — **1,601 verified traces**, see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md).
+> and run — **9,146 verified traces**, see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md).
 >
 > **Decisions locked in:** approach = **(B) grounded synthesis** (teacher drives tool calls against a *real executable* DB sandbox + verifier gate + fault-injection for replan); **teacher = local GB10 model** (a strong API teacher like GPT-5 is not guaranteed). This note sorts the literature levers **before** building, so we don't reinvent what papers already provide. Source: Notion *"Agentic LLM / Orchestrator"* → chapter *"🧪 Hebel aus der Literatur (nach Pipeline-Stufe)"* (9 papers), cross-read against the arXiv originals.
 
@@ -18,7 +18,7 @@ on new, disjoint τ²-bench + db_bahn tasks.
 | 1. tool-call basics | ToolACE (downloaded) | done |
 | 2. planning/decomposition | TaskBench (downloaded) | done |
 | 3. multi-turn dialogue/policy | AReaL / τ²-bench (downloaded) | done |
-| **4. DB-specific + German + replan** | **synthesized (this note)** | **✅ built — 1,601 traces** |
+| **4. DB-specific + German + replan** | **synthesized (this note)** | **✅ built — 9,146 traces** |
 
 ## How it works — a plain-English walkthrough
 

@@ -6,7 +6,7 @@
 > fixes — see `agentic-db-synthesis-log.md`). Rank metric: verified-yield × German per GPU-hour ("score").
 >
 > **Note (dated result).** This describes the **Welle-1 domain** (10 templates, 8 tools); the domain has since
-> grown to **25 templates / 12 tools**, but the selected teacher **Qwen3.6-35B-A3B** remains the production
+> grown to **26 templates / 12 tools**, but the selected teacher **Qwen3.6-35B-A3B** remains the production
 > trace generator. Numbers below are historical by design.
 
 ## Comparison set

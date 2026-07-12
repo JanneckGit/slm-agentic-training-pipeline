@@ -105,7 +105,7 @@ step **must filter on `correct==1`**. Validated by [`validate_areal.py`](../data
 
 Domain adaptation for the Deutsche-Bahn assistant: German + DB-specific trajectories generated **against the
 real DB tools** (Fahrplan, Zugstandort, Wartung, …), verifier-gated. **Up-weighted** in the mix (only German +
-only DB-specific leg). **Done** — 1,601 verified traces; details in
+only DB-specific leg). **Done** — 9,146 verified 12-tool traces; details in
 [agentic-datasets-explained.md](agentic-datasets-explained.md) + [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md).
 
 ---

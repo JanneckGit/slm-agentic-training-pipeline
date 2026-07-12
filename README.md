@@ -32,10 +32,10 @@ them against the *real* tools, and keep only trajectories a deterministic verifi
 flowchart TD
     A["gtfs.de timetables, CC-BY-4.0<br/>+ sha256-seeded synthetic tables"] -->|seed_worldstate.py| B["frozen BahnDB world-state<br/>db.json, seed 42"]
     B --> C["tau2-bench domain 'db_bahn'<br/>12 German tools READ+WRITE, policy.md<br/>runtime-registered — tau2 source untouched"]
-    C -->|gen_tasks.py| D["1964 German tasks, 25 templates<br/>by-construction answer keys<br/>INFO + ACTION, fault-injected replan"]
+    C -->|gen_tasks.py| D["10473 German tasks, 26 templates<br/>by-construction answer keys<br/>INFO + ACTION, fault-injected replan"]
     D -->|rollout.py| E["teacher solves vs REAL tools<br/>vLLM, branch-on-fail, k=2 top-up, B2 harvest"]
     E -->|trajectory_reward.py| F{"deterministic verifier<br/>DB-hash + grounding + anti-hallucination"}
-    F -->|keep score == 1.0| G["1601 verified chat trajectories<br/>format_traj_for_training.py"]
+    F -->|keep score == 1.0| G["9146 verified chat trajectories<br/>format_traj_for_training.py"]
     G -->|train_traj.py + collator_multiturn.py| H["LoRA student — Qwen3.5-4B<br/>assistant-only loss mask"]
 ```
 
@@ -46,7 +46,7 @@ flowchart TD
 | 1 | ToolACE | [`Team-ACE/ToolACE`](https://huggingface.co/datasets/Team-ACE/ToolACE) | tool-call basics | 11,300 rows |
 | 2 | TaskBench | [`microsoft/Taskbench`](https://huggingface.co/datasets/microsoft/Taskbench) | planning / decomposition (tool-graph) | 17,331 rows |
 | 3 | AReaL (τ²-bench flows) | [`inclusionAI/AReaL-tau2-data`](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data) | multi-turn dialogue / policy adherence | 33,531 SFT (+1,982 RL tasks) |
-| 4 | **db_bahn** ⭐ | self-synthesized (this repo) | verifier-gated German DB trajectories | **1,601 verified** |
+| 4 | **db_bahn** ⭐ | self-synthesized (this repo) | verifier-gated German DB trajectories | **9,146 verified** |
 
 Legs 1–3 are public sets pulled and validated locally; **leg 4 is the heart of this repo** — see below.
 
@@ -57,7 +57,8 @@ Legs 1–3 are public sets pulled and validated locally; **leg 4 is the heart of
 - **A τ²-bench domain, `db_bahn`.** **12 German tools** (READ + WRITE) with a German `policy.md`, *runtime-registered*
   so the upstream tau2 source stays untouched. WRITE tools enforce real rules (role-gate, product qualification,
   duplicate-gate, terminal status) → rejected actions force the agent to **replan**.
-- **25 task templates** with **by-construction answer keys** (INFO + ACTION; ~41 % carry an injected fault).
+- **26 task templates** with **by-construction answer keys** (INFO + ACTION; ~40 % carry an injected fault —
+  incl. a dedicated lookup-by-ID template that guarantees clean demonstrations of `mitarbeiter_details`).
 - **A deterministic outcome-verifier** ([evaluation/trajectory_reward.py](evaluation/trajectory_reward.py)):
   DB-state hash + tool-grounding + anti-hallucination → only `score == 1.0` trajectories survive.
 - **Robust rollout** ([sdg_pipeline/db_bahn/rollout.py](sdg_pipeline/db_bahn/rollout.py)): `branch-on-fail`
@@ -76,12 +77,12 @@ Legs 1–3 are public sets pulled and validated locally; **leg 4 is the heart of
 
 | Split | Tasks | Purpose |
 |-------|-------|---------|
-| `sft_train` | 1,610 | teacher rollouts → SFT traces |
-| `rl_train` | 295 | Stage-2 GRPO |
-| `heldout_eval` | 59 | before/after held-out eval |
-| `bakeoff_dev` | 25 | teacher bake-off + CPU smoke (⊆ `sft_train`, non-disjoint) |
+| `sft_train` | 9,199 | teacher rollouts → SFT traces |
+| `rl_train` | 998 | Stage-2 GRPO |
+| `heldout_eval` | 276 | before/after held-out eval |
+| `bakeoff_dev` | 26 | teacher bake-off + CPU smoke (⊆ `sft_train`, non-disjoint) |
 
-Pool: **1,964 unique tasks** (`sft`/`rl`/`heldout` disjoint; `bakeoff_dev` is a stratified subset of `sft_train`).
+Pool: **10,473 unique tasks** (`sft`/`rl`/`heldout` disjoint; `bakeoff_dev` is a stratified subset of `sft_train`).
 
 ## Setup
 
@@ -139,15 +140,19 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
 
 - **Teacher bake-off** over 8 local models → winner **Qwen3.6-35B-A3B** (92 % verified yield, ~16 s/rollout) —
   [docs/teacher-bakeoff.md](docs/teacher-bakeoff.md).
-- **Latest generation run → 1,601 verified German trajectories** (99.4 % yield, all 25 templates): **55 %
-  multi-tool** (≥ 3 calls), **41 % fault/replan**, **3.1 % emergent self-correction**, zero loops/dupes.
+- **Latest generation run → 9,146 verified German 12-tool trajectories** (99.4 % yield, all 26 templates):
+  **57 % multi-tool** (≥ 3 calls), **40 % fault/replan**, 10.6 % self-recovery. **A1 outcome:** the teacher uses
+  `mitarbeiter_details` in **16.8 %** of traces — **1,271 of them organically** (verifying a person before a
+  write, outside the dedicated lookup template) — and the over-search "flail" dropped to **0.11 %** (was ~1.5 %).
+  One ops incident: the 12 h `roll()` timeout silently killed pass 1 at 48 % → raised to 24 h, resume-safe rerun
+  completed cleanly.
 - **Held-out (honest):** wave-1 before/after was flat (72.5 % → 70 %, n = 40 — the base already solves the easy
-  set; see the analysis in [docs/agentic-db-synthesis-log.md](docs/agentic-db-synthesis-log.md)). The wave-2
-  train + re-baseline on `heldout_eval` (59) is the next step.
+  set; see the analysis in [docs/agentic-db-synthesis-log.md](docs/agentic-db-synthesis-log.md)). The wave-2.5
+  train + re-baseline on `heldout_eval` (276) is the next step.
 
-> **Next:** the domain now has a 12th tool (`mitarbeiter_details`, lookup-by-ID) that the 1,601-trace set predates.
-> A single unified **12-tool regeneration** is queued, followed by SFT training, a fresh held-out re-baseline, and
-> the Stage-2 GRPO re-wire.
+> **Next:** build the 4-leg SFT mix (convert ToolACE/TaskBench/AReaL into the unified chat format, filter AReaL
+> on `correct==1`, up-weight db_bahn) → SFT training → fresh held-out re-baseline (n = 276) → Stage-2 GRPO
+> re-wire (the `rl_train` reserve now holds 998 tasks).
 
 ## Repo layout
 

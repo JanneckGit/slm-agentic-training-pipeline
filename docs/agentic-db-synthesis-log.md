@@ -4,6 +4,45 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
+## 2026-07-12/13 — ✅ WELLE 2.5: Weltvergrößerung → 10.473er-Pool → 9.146 verifizierte 12-Tool-Traces
+
+- **Decision — Weg B (Welt vergrößern) statt nur n hochdrehen (User-Vorgabe: „wesentlich mehr, Qualität
+  extrem wichtig"):** Der Pool-Deckel war die Welt, nicht die Zeit. **Design vorab replikations-validiert:**
+  ein Prüf-Agent baute Seeder + Generator exakt nach (byte-Match gegen die echten Artefakte) und rechnete
+  jede Stellschraube durch → Befund: **12k ist bei Multi-Tool ≥50 % NICHT erreichbar** (≥3-Call-Angebot
+  deckelt bei 5.383 wegen MAX_TREFFER=10 + Positions-Cap 245); belegtes Optimum **T = 10.473**. Alle
+  nachfolgenden Ist-Zahlen trafen die Vorhersage mit **±0**.
+- **Welt-Knobs (`seed_worldstate.py`):** Vehicle-Mint-Prob 0,5→**1,0** (1.070 gemintet, ~½ trip-los =
+  Reserve-Flotte in Depots), Orders/Fahrzeug [0,0,1,1,2]→**[1,1,2,2,3]** (450→**1.949**), Depots 10→**20**
+  (paarweise non-substring — Pflicht für die Substring-Filter). Employees bewusst bei 2.140 (mehr würde die
+  Combo-Fenster überlaufen), Positions-Cap 245 akzeptiert.
+- **Combo-Grids verbreitert (`gen_tasks.py`) — der Anti-Schrumpf-Fix:** größere Welt SCHRUMPFT die
+  1–3-Treffer-Fenster. `_wo_combos`: 12 halbtägige Cutoffs (echter due_at-Bereich; alter 06-25-Cutoff war
+  tot, 07-13 Duplikat) + **Schweregrad als 4. Dimension** → **15 → 946 Combos**; `_ma_combos`: 12 Zeiten in
+  echter Schicht-Abdeckung (das alte „23:30" war tot — Schichten enden ≤23:00) → **~100 → 2.966 Combos**.
+- **Neues Template `t_info_mitarbeiter` (26.) — A1-Gold-Pfad:** Ticket nennt die emp_id, korrekte Lösung =
+  `mitarbeiter_details` (300 Tasks). Dazu Employee-Pool + emp_id-Fallback im Dedup (sonst AttributeError).
+  n-Tabelle auf 26 Zeilen kalibriert (pool-capped Templates mit großzügigem n = Vollernte); Split-Defaults
+  `--n-bakeoff 26 --n-heldout 275 --n-rl 1000` → Splits **26 / 276 / 998 / 9.199** (bakeoff MUSS 26 sein,
+  sonst fällt das alphabetisch letzte Template still raus).
+- **Gates (alle grün, CPU):** Seeder 2× byte-identisch; **Pool-Probe 14/14 exakt** wie vorhergesagt;
+  gen_tasks 2× byte-identisch; Stats-Gate T=10.473 (±0!), Multi 51,4 %, Fault 40,5 %;
+  **Oracle-Dry-Run über ALLE 10.473 Tasks = 100 % verified** (~55 min CPU — die Versicherung vor 12 h GPU).
+  Alt-Artefakte → `archive/data/wave2_11tool_20260711/`.
+- **Gen-Lauf (Sa 23:59 → So 23:44, q36-35b-a3b):** **9.146 verifizierte Traces (99,4 %), alle 26 Templates**;
+  57,1 % Multi-Tool, 40,3 % Fault (2.569 state / 905 state+runtime / 209 runtime), 10,6 % self_recovery,
+  99 B2-Harvests, 0 teacher_errors.
+- **⚠️ Vorfall + Fix:** `roll()`s `timeout 43200` (12 h) killte Pass 1 **still** bei 48 % (4.427/9.199) — der
+  Exit-Code wird nicht geprüft, die Pipeline lief „sauber" bis DONE (nur 12/26 Templates!). Erkannt am
+  Coverage-Check, nicht am Log. Fix: **Timeout 24 h** + Neustart → Resume setzte exakt auf
+  (`todo=4772, resumed 4434`), Rest fehlerfrei. **Lehre (im Watcher verankert): DONE-Marker ≠ Coverage —
+  immer distinct task_ids gegen den Split prüfen.**
+- **A1-Befund (der eigentliche Payoff):** `mitarbeiter_details` in **1.534 Traces (16,8 %)** — davon
+  **1.271 organisch** außerhalb des Lookup-Templates (Teacher prüft Personen VOR der Zuweisung). Der
+  Über-Such-„Flail" fiel von ~1,5 % auf **0,11 %** (10 Traces). Runtime-Ablehnungs-Demos blieben erhalten
+  (209 + 905) — die „verify→avoid killt das Replan-Signal"-Sorge trat nicht ein.
+- **Offen:** 4-Leg-Mix bauen → SFT-Training → Re-Baseline auf heldout_eval (276) → Stage-2 GRPO re-wire.
+
 ## 2026-07-10 — ✅ Regen 2 (Split-Redesign + 1.601 Traces) + A1-Lookup-Tool (12.)
 
 - **Split-Redesign (per-Template proportional):** Round-Robin ließ kleine Pools verhungern — `wartung_depot`

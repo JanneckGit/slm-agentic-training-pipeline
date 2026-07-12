@@ -52,9 +52,9 @@ Jeder Datensatz „kann" andere Dinge. Diese Eigenschaften unterscheiden sie:
 | **Echte Tool-Antworten?** | erfunden (im Datensatz) | keine (nur Graph) | **echt** (Framework führt aus) | **echt** (unser Sandbox führt aus) |
 | **Format** | ShareGPT (`conversations`) | Parquet (Instruktion + Graph als JSON-Strings) | per-turn: `messages`-Vorkontext + `answer` (thinking + flache `tool_calls`) | OpenAI-Messages (`messages` + `tool_calls`) |
 | **Herkunft** | Download (fertig) | Download (fertig) | **Download (AReaL-Shortcut)** statt selbst erzeugen | **selbst erzeugt** ✅ |
-| **Menge** | 11.300 | 17.331 | 33.531 per-turn (**74,5 % correct**) | Pool: **1.964 Tasks**; **1.601 verifizierte Traces** (99,4 %) |
+| **Menge** | 11.300 | 17.331 | 33.531 per-turn (**74,5 % correct**) | Pool: **10.473 Tasks**; **9.146 verifizierte Traces** (99,4 %) |
 | **Rolle** | SFT | SFT | SFT (+ 1.982 RL-Tasks) | SFT (+ Domäne für RL/Eval) |
-| **Status bei uns** | ✅ gezogen | ✅ gezogen | ✅ **gezogen + validiert** | ✅ **1.601 Traces fertig** (12-Tool-Regen queued) |
+| **Status bei uns** | ✅ gezogen | ✅ gezogen | ✅ **gezogen + validiert** | ✅ **9.146 12-Tool-Traces fertig** (W2.5) |
 
 Kurz: Nur die **rechten zwei** (τ²-bench, db_bahn) haben echte Umgebungen mit *Fehlern* und *Umplanen* — das
 ist genau die „Variante C"-Fähigkeit, um die es uns geht. Die linken zwei sind statische Bausteine (Grundlagen).
@@ -174,7 +174,7 @@ assistant: "Paul Schmidt (MA-4551) wurde als Lokführer für EC 290 zugewiesen (
   **Überraschung** (Ausfall) ist bewusst **injiziert** — so entsteht ein echtes „Plan A → beobachten → Plan B".
   Echte Tool-Antworten aus unserem Sandbox. Jede Trace wurde vom Verifier auf 1,0 geprüft.
 
-> **📌 Update (2026-07-08 → 07-10) — Welle 2 umgesetzt: Clean Rebuild ✅ (Task-Pool + 1.601 Traces fertig).**
+> **📌 Update (2026-07-08 → 07-12) — Welle 2 + 2.5 umgesetzt: Clean Rebuild + Weltvergrößerung ✅ (10.473er-Pool, 9.146 Traces).**
 > Welle 1 (446 Traces, 64 % Ein-Tool, flacher Eval) war zu einfach; statt sie zu schonen wurde sauber neu
 > gebaut und **Welle 1 komplett archiviert** (`data/archive/wave1_20260708/`). Dafür wuchs die **Domäne
 > selbst**: 8 → **12 Tools** (3 Such-Tools `zuege_suchen`/`mitarbeiter_suchen`/`wartung_liste` für Aufgaben
@@ -183,20 +183,23 @@ assistant: "Paul Schmidt (MA-4551) wurde als Lokführer für EC 290 zugewiesen (
 > „Zuweisung abgelehnt: … fehlt die Qualifikation ICE"). 25 Templates (9 poliert übernommen,
 > `info_wartung_machbar` gestrichen, 16 neue).
 
-| | Welle 1 (archiviert) | Welle 2 (ist, validiert) |
-|---|---|---|
-| Templates | 10 | **25** (Suche ohne IDs, 3–4-Tool-Ketten, bedingte/Multi-Writes, Laufzeit-Fehler) |
-| Task-Pool | 550 | **1.964** — Splits: bakeoff 25 / heldout 59 / **rl_train 295 (GRPO)** / sft 1.610 |
-| Multi-Tool (≥3 Calls, Pool) | 20% | **52%** |
-| Fault/Replan (Pool) | 22% | **41%** (538 state, 128 runtime, 140 state+runtime) |
-| Verifizierte Traces | 446 (archiviert) | **1.601** (99,4 %; 55% Multi-Tool, 41% Fault, 3,1% Selbstkorrektur; branch-on-fail + k=2-Top-up + B2-Harvest) |
+| | Welle 1 (archiviert) | Welle 2 (archiviert) | **Welle 2.5 (ist, validiert)** |
+|---|---|---|---|
+| Welt | 548 Fzg / 450 Aufträge / 10 Depots | wie W1 | **1.070 Fzg / 1.949 Aufträge / 20 Depots** |
+| Templates | 10 | 25 | **26** (+ `info_mitarbeiter`: Lookup-by-ID-Gold-Pfad fürs A1-Tool) |
+| Task-Pool | 550 | 1.964 | **10.473** — Splits: bakeoff 26 / heldout 276 / **rl_train 998 (GRPO)** / sft 9.199 |
+| Multi-Tool (≥3 Calls, Pool) | 20% | 52% | **51%** |
+| Fault/Replan (Pool) | 22% | 41% | **41%** (2.977 state, 237 runtime, 1.030 state+runtime) |
+| Verifizierte Traces | 446 | 1.601 (11-Tool) | **9.146** (99,4 %; 57% Multi-Tool, 40% Fault; branch-on-fail + k=2-Top-up + B2-Harvest) |
 
-> Alle CPU-Gates grün: Oracle-Replay 100 % / 0× gold_replay_failed, Verifier-Selftest 8/8 (inkl.
-> Rejection→Suche→Replan-Roundtrip), Generator byte-deterministisch. **Achtung Eval-Bruch (beabsichtigt):**
-> neuer 12-Tool-Prompt + neues 59er-Heldout → alte 72,5 %/70 %-Zahlen nur noch historisch; Re-Baseline steht
-> aus. **Nachtrag:** die 1.601 Traces entstanden auf der 11-Tool-Domäne — `mitarbeiter_details` (12.) kam
-> danach dazu → ein einheitlicher **12-Tool-Regen** ist geplant. Details:
-> [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md) (Einträge 2026-07-08 + 2026-07-10).
+> Alle CPU-Gates grün: Oracle-Replay **10.473/10.473 = 100 %** / 0× gold_replay_failed, Verifier-Selftest 8/8,
+> Seeder + Generator byte-deterministisch (je 2× gelaufen, identisch). **Achtung Eval-Bruch (beabsichtigt):**
+> 12-Tool-Prompt + neues 276er-Heldout → alte 72,5 %/70 %-Zahlen nur noch historisch; Re-Baseline steht aus.
+> **Welle 2.5 (2026-07-12): der einheitliche 12-Tool-Regen ist gelaufen** — Welt vergrößert (Weg B,
+> replikations-validiert), 9.146 Traces. **A1-Befund:** der Teacher nutzt `mitarbeiter_details` in **16,8 %**
+> der Traces (davon 1.271 **organisch**, d. h. außerhalb des Lookup-Templates — Person vor der Zuweisung
+> prüfen), der Über-Such-„Flail" fiel von ~1,5 % auf **0,11 %**. Details:
+> [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md) (Einträge 2026-07-08 → 07-13).
 
 ---
 
@@ -357,10 +360,10 @@ STATISCH (nur SFT)          AUSFÜHRBAR (Task-Pool in 3 disjunkte Teile splitten
 ```
 
 **Wo wir stehen:** ToolACE ✅, TaskBench ✅, τ²-bench-Abläufe ✅ (via AReaL-Shortcut gezogen + validiert, §2.3;
-beim Mischen auf `correct==1` filtern). db_bahn: **Welle-2-Task-Pool ✅** (1.964 Tasks, validiert; Welle 1
-archiviert) und **1.601 verifizierte Traces ✅** (99,4 %, Sieger-Teacher; 12-Tool-Regen queued). Für RL ist
-beides da: AReaL liefert 1.982 fertige Tasks inkl. DB-Snapshots, db_bahn hat jetzt einen eigenen disjunkten
-**`rl_train`-Split (295 Aufgaben)**, der nie für SFT gerollt wird.
+beim Mischen auf `correct==1` filtern). db_bahn: **Welle-2.5-Task-Pool ✅** (10.473 Tasks, validiert; ältere
+Wellen archiviert) und **9.146 verifizierte 12-Tool-Traces ✅** (99,4 %, Sieger-Teacher). Für RL ist beides da:
+AReaL liefert 1.982 fertige Tasks inkl. DB-Snapshots, db_bahn hat jetzt einen eigenen disjunkten
+**`rl_train`-Split (998 Aufgaben)**, der nie für SFT gerollt wird.
 
 ---
 
@@ -373,7 +376,7 @@ beides da: AReaL liefert 1.982 fertige Tasks inkl. DB-Snapshots, db_bahn hat jet
 | `<plan>`-Rationales | teils | – | ✅ | ✅ |
 | echtes Env | – | – | ✅ | ✅ |
 | Sprache | EN | EN | EN | **DE** |
-| bei uns | ✅ | ✅ | ✅ (AReaL, `correct==1` filtern) | ✅ Pool W2 · 1.601 Traces ✅ |
+| bei uns | ✅ | ✅ | ✅ (AReaL, `correct==1` filtern) | ✅ Pool W2.5 · 9.146 Traces ✅ |
 
 **In einem Satz:** ToolACE + TaskBench liefern die Bausteine (statisch, nur SFT); τ²-bench und db_bahn liefern
 *echte* Umgebungen mit Fehlern und Umplanen — und dieselbe Umgebung dient, auf **getrennten** Aufgaben-Splits,
