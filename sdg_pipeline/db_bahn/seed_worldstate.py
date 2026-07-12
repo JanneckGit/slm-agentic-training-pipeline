@@ -39,7 +39,13 @@ _WEEKDAY_COLS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturd
 
 DEPOTS = ["München-Pasing", "Berlin Rummelsburg", "Frankfurt Griesheim", "Hamburg-Eidelstedt",
           "Köln Betriebsbahnhof", "Dortmund Bbf", "Leipzig Hbf Süd", "Stuttgart Rosenstein",
-          "Nürnberg West", "Hannover Leinhausen"]
+          "Nürnberg West", "Hannover Leinhausen",
+          # wave-2.5 world enlargement: 10 more depots -> smaller per-depot buckets keep the
+          # 1-3-hit filter-combo windows alive at ~4x orders. Names pairwise non-substring
+          # (mitarbeiter_suchen/wartung_liste match depot filters as substrings).
+          "Dresden-Friedrichstadt", "Bremen Sebaldsbrück", "Karlsruhe Rheinbrücke",
+          "Mannheim Rangierbahnhof", "Duisburg-Wedau", "Rostock Seehafen", "Erfurt Nord",
+          "Saarbrücken Burbach", "Kiel Meimersdorf", "Augsburg Oberhausen"]
 VEHICLE_TYPES = {"ICE": ["ICE 1", "ICE 3", "ICE 4", "ICE 3neo"], "ICE 42": ["ICE 4"],
                  "IC": ["IC 2", "IC 1"], "EC": ["EC"], "ECE": ["ICE 3neo"],
                  "RJ": ["railjet"], "EN": ["Nightjet"]}
@@ -161,13 +167,16 @@ def build_synthetic(real: dict, seed: int, sim: date) -> dict:
     trips, by_trip, stations = real["trips"], real["_by_trip"], {s["station_id"]: s for s in real["stations"]}
     now_sec = sum(int(x) * f for x, f in zip(SIM_NOW.split(":"), (3600, 60, 1)))
 
-    # vehicles: one per trip's product family, pooled + assigned round-robin (seeded)
+    # vehicles: minted per trip into the product-family pool, then assigned from the pool
+    # (wave-2.5: mint prob 0.5 -> 1.0 = one minted vehicle per trip; assignment still draws
+    # from the whole pool, so ~half stay trip-less "reserve fleet" -> more order-pattern
+    # vehicles for the maintenance templates + realistic depot stock for wartung_liste)
     vehicles, veh_pool = [], {}
     for t in trips:
         prod = t["product"]
         pool = veh_pool.setdefault(prod, [])
         r = rng(seed, "veh", t["trip_id"])
-        if not pool or r.random() < 0.5:  # grow the pool sometimes -> reuse otherwise
+        if not pool or r.random() < 1.0:  # always grow the pool (one vehicle minted per trip)
             vtype = r.choice(VEHICLE_TYPES.get(t.get("short_name", prod), VEHICLE_TYPES.get(prod, ["IC 2"])))
             vid = f"{vtype.replace(' ', '')}-{9000 + len(vehicles)}"
             vehicles.append({"vehicle_id": vid, "type": vtype, "capacity": r.choice([250, 380, 460, 830]),
@@ -215,11 +224,12 @@ def build_synthetic(real: dict, seed: int, sim: date) -> dict:
                           "next_station_id": b["station_id"], "at_station": None,
                           "source": "interpolated_from_schedule (mock)"})
 
-    # maintenance orders: a subset of vehicles
+    # maintenance orders: every vehicle carries 1-3 (wave-2.5: was [0,0,1,1,2] on ~548 vehicles;
+    # ~1070 vehicles x mean 1.8 orders feed the pattern pools ueberfaellig/konflikt/2open)
     maintenance = []
     for i, v in enumerate(vehicles):
         r = rng(seed, "maint", v["vehicle_id"])
-        for _ in range(r.choice([0, 0, 1, 1, 2])):
+        for _ in range(r.choice([1, 1, 2, 2, 3])):
             due = datetime.combine(sim, datetime.min.time()) + timedelta(hours=r.randint(-48, 120))
             maintenance.append({
                 "order_id": f"WO-{2026}-{len(maintenance) + 1000}", "vehicle_id": v["vehicle_id"],

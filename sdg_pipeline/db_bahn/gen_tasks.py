@@ -55,7 +55,7 @@ QUALS = ["ICE", "IC", "EC", "Nacht", "Gefahrgut"]
 ROLES = ["Lokführer", "Zugbegleiter", "Techniker", "Disponent"]
 
 MACombo = namedtuple("MACombo", "key rolle qualifikation heimatbasis verfuegbar_um emp_ids")
-WOCombo = namedtuple("WOCombo", "key status depot faellig_vor order_ids")
+WOCombo = namedtuple("WOCombo", "key status depot faellig_vor schweregrad order_ids")  # schweregrad: None = ohne Filter
 
 
 def rng(*keys) -> random.Random:
@@ -155,6 +155,8 @@ class Gen:
             return self._ma_combos()
         if kind == "wartung_filter_combos":
             return self._wo_combos()
+        if kind == "employees":  # wave-2.5: lookup-by-ID template (A1) draws directly from staff
+            return sorted(self.master.employees.values(), key=lambda e: e.emp_id)
         raise ValueError(kind)
 
     def _veh_orders(self) -> dict[str, list]:
@@ -188,7 +190,11 @@ class Gen:
         for eid in sorted(self.master.employees):
             e = self.master.employees[eid]
             emp_by.setdefault((e.role, e.home_base), []).append(e)
-        times = ["04:30", "06:15", "08:45", "13:30", "18:45", "21:15", "23:30"]
+        # wave-2.5: 12 times, edge-heavy, all inside real shift coverage 04:00-23:00 (the old
+        # "23:30" was dead — shifts end at min(23, start+8)). Edge times keep the 1-3-hit
+        # window alive now that 20 depots halve the per-bucket employee density.
+        times = ["04:15", "04:45", "05:15", "05:45", "06:15", "06:45",
+                 "07:30", "20:45", "21:30", "22:15", "22:45", "23:00"]
         combos = []
         for (rolle, base), emps in sorted(emp_by.items()):
             for q in QUALS:
@@ -203,17 +209,26 @@ class Gen:
         return combos
 
     def _wo_combos(self) -> list:
-        """Filter combos (status, depot, faellig_vor) with 1-3 matching maintenance orders."""
+        """Filter combos (status, depot, faellig_vor[, schweregrad]) with 1-3 matching orders.
+        wave-2.5: 12 half-daily cutoffs covering the real due_at range (sim -48h..+120h =
+        2026-06-27..07-04; the old 2026-06-25 cutoff was dead, 07-13 duplicated 07-06) plus
+        schweregrad as optional 4th dimension — keeps 1-3-hit windows alive at ~4x orders."""
         depots = sorted({o.depot for o in self.master.maintenance_orders.values()})
-        cutoffs = ["2026-06-25", "2026-06-29", "2026-07-02", "2026-07-06", "2026-07-13"]
+        cutoffs = ["2026-06-27 12:00", "2026-06-28", "2026-06-28 12:00", "2026-06-29",
+                   "2026-06-29 12:00", "2026-06-30", "2026-06-30 12:00", "2026-07-01",
+                   "2026-07-01 12:00", "2026-07-02", "2026-07-03", "2026-07-04"]
         combos = []
         for status in ("geplant", "in_Arbeit", "überfällig"):
             for depot in depots:
                 for cutoff in cutoffs:
-                    hits = tuple(sorted(o.order_id for o in self.master.maintenance_orders.values()
-                                        if o.status == status and o.depot == depot and o.due_at < cutoff))
-                    if 1 <= len(hits) <= 3:
-                        combos.append(WOCombo(f"{status}|{depot}|{cutoff}", status, depot, cutoff, hits))
+                    for sev in (None, "niedrig", "mittel", "hoch"):
+                        hits = tuple(sorted(o.order_id for o in self.master.maintenance_orders.values()
+                                            if o.status == status and o.depot == depot
+                                            and o.due_at < cutoff
+                                            and (sev is None or o.severity == sev)))
+                        if 1 <= len(hits) <= 3:
+                            combos.append(WOCombo(f"{status}|{depot}|{cutoff}|{sev or 'alle'}",
+                                                  status, depot, cutoff, sev, hits))
         return combos
 
     def spare_mitarbeiter(self, trip_id: str, r: random.Random, rolle: str,
@@ -371,6 +386,25 @@ def t_info_crew(g: Gen, trip, idx, inject: bool):
     key = {"kind": "info", "expected_tools": ["mitarbeiter_info"],
            "oracle_calls": [oc("mitarbeiter_info", zugnummer=trip.zugnummer)],
            "facts": {"lokfuehrer": lokf}}
+    return task, key
+
+
+def t_info_mitarbeiter(g: Gen, emp, idx, inject: bool):
+    """wave-2.5 (A1): lookup-by-ID gold path — the ticket NAMES the emp_id, the correct move is
+    mitarbeiter_details (not a blind mitarbeiter_suchen through a 10-row page). Guarantees the
+    student sees clean demonstrations of tool #12. comm uses id/role/base/quals — never the
+    (ambiguous) name, and never the shift string (en-dash reproduction risk)."""
+    tk = g.fresh()
+    d = tk.mitarbeiter_details(emp.emp_id)
+    comm = [d["mitarbeiter_id"], d["rolle"], d["heimatbasis"]] + list(d["qualifikationen"])
+    ticket = (f"Welche Rolle und welche Qualifikationen hat der Mitarbeiter {emp.emp_id}, und was ist "
+              f"seine Heimatbasis? Nenne Mitarbeiter-ID, Rolle, Heimatbasis und alle Qualifikationen.")
+    task = build_task(f"info_mitarbeiter__{sid(emp.emp_id)}__{idx:03d}", ticket,
+                      "INFO: Stammdaten eines BEKANNTEN Mitarbeiters per ID nachschlagen (Lookup statt Suche)",
+                      [], None, None, comm, ["COMMUNICATE"])
+    key = {"kind": "info", "expected_tools": ["mitarbeiter_details"],
+           "oracle_calls": [oc("mitarbeiter_details", mitarbeiter_id=emp.emp_id)],
+           "facts": {"details": d}}
     return task, key
 
 
@@ -589,19 +623,22 @@ def t_info_schichtcheck(g: Gen, trip, idx, inject: bool):
 
 def t_info_wartung_depot(g: Gen, combo: WOCombo, idx, inject: bool):
     tk = g.fresh()
-    res = tk.wartung_liste(status=combo.status, depot=combo.depot, faellig_vor=combo.faellig_vor)
+    args = {"status": combo.status, "depot": combo.depot, "faellig_vor": combo.faellig_vor}
+    if combo.schweregrad is not None:
+        args["schweregrad"] = combo.schweregrad
+    res = tk.wartung_liste(**args)
     rows = res["treffer"]
     if not (1 <= len(rows) <= 3) or {r_["order_id"] for r_ in rows} != set(combo.order_ids):
         return None
     comm = [r_["order_id"] for r_ in rows] + sorted({r_["due_at"][:10] for r_ in rows})
-    ticket = (f"Welche Wartungsaufträge mit Status '{combo.status}' im Depot {combo.depot} sind vor dem "
-              f"{combo.faellig_vor} fällig? Nenne je Auftrag die Auftrags-ID und das Fälligkeitsdatum.")
+    sev_txt = f" mit Schweregrad '{combo.schweregrad}'" if combo.schweregrad is not None else ""
+    ticket = (f"Welche Wartungsaufträge mit Status '{combo.status}'{sev_txt} im Depot {combo.depot} sind "
+              f"vor dem {combo.faellig_vor} fällig? Nenne je Auftrag die Auftrags-ID und das Fälligkeitsdatum.")
     task = build_task(f"info_wartung_depot__{sid(combo.key)}__{idx:03d}", ticket,
-                      "INFO+SUCHE: Wartungsaufträge flottenweit filtern (Status/Depot/Fälligkeit)",
+                      "INFO+SUCHE: Wartungsaufträge flottenweit filtern (Status/Depot/Fälligkeit[/Schweregrad])",
                       [], None, None, comm, ["COMMUNICATE"])
     key = {"kind": "info", "expected_tools": ["wartung_liste"],
-           "oracle_calls": [oc("wartung_liste", status=combo.status, depot=combo.depot,
-                               faellig_vor=combo.faellig_vor)],
+           "oracle_calls": [oc("wartung_liste", **args)],
            "facts": {"orders": rows}}
     return task, key
 
@@ -1015,34 +1052,39 @@ class Spec(NamedTuple):
 
 
 TEMPLATES = [
-    # easy/mid tier (polished wave-1 shapes)
-    Spec(t_info_verspaetung, "trips", 40, True),
-    Spec(t_info_standort, "trips_pos", 40, False),
-    Spec(t_info_ankunft, "trips_pos", 80, True),
-    Spec(t_info_wartung, "trips_orders", 40, False),
-    Spec(t_info_crew, "trips_lokf", 40, False),
-    Spec(t_action_wartung, "trips", 60, False),
-    Spec(t_action_crew, "trips_lokf", 60, False),
-    Spec(t_action_wartung_status, "trips_orders", 40, False),
-    Spec(t_action_ersatz, "trips_lokf", 60, None),
-    # hard tier (wave 2) — the 3-4-call templates carry the >=50% multi-tool target,
-    # so their n sits above the 1-2-call ones (gate-d calibration, 2026-07-08)
-    Spec(t_info_zugsuche_status, "trips_pos_route", 140, True),
-    Spec(t_info_verspaetung_suche, "trips", 100, None),
-    Spec(t_info_mitarbeiter_suche, "ma_filter_combos", 100, False),
-    Spec(t_info_schichtcheck, "trips_lokf", 100, False),
-    Spec(t_info_wartung_depot, "wartung_filter_combos", 100, False),
-    Spec(t_info_zug_komplett, "trips_komplett", 140, True),
-    Spec(t_info_ankunft_suche, "trips_route_page", 140, True),
-    Spec(t_action_ersatz_quali, "trips_lokf", 140, None),
-    Spec(t_action_crew_doppelt, "trips_lokf", 100, False),
-    Spec(t_action_verstaerkung, "trips", 140, False),
-    Spec(t_action_wartung_suche, "trips_route_page", 140, None),
-    Spec(t_action_inspektion_bedingt, "trips", 100, True, 0.5),
-    Spec(t_action_ueberfaellig, "trips_veh_ueberfaellig", 100, False),
-    Spec(t_action_wstatus_konflikt, "trips_veh_konflikt", 100, False),
-    Spec(t_action_wartung_batch, "trips_veh_2open", 100, False),
-    Spec(t_action_gefahrgut, "trips_lokf_no_quali_produkt", 100, False),
+    # wave-2.5 n-table (validated by exact seeder+generator replication, 2026-07-11):
+    # target T ~= 10.5k with multi-tool (>=3 calls) >= 50% and fault 38-42%. n is a SOFT cap —
+    # pool-capped templates carry a generous n to harvest their full eligible ceiling
+    # (actual = min(n, eligible)); n-capped templates carry the calibrated exact value.
+    # easy/mid tier (1-2 calls; deliberately bounded so the easy tier can't drown the mix)
+    Spec(t_info_verspaetung, "trips", 250, True),
+    Spec(t_info_standort, "trips_pos", 300, False),               # pool-capped ~245
+    Spec(t_info_ankunft, "trips_pos", 300, True),                 # pool-capped ~245 (3 calls!)
+    Spec(t_info_wartung, "trips_orders", 450, False),
+    Spec(t_info_crew, "trips_lokf", 300, False),
+    Spec(t_info_mitarbeiter, "employees", 300, False),            # NEW (A1): lookup-by-ID gold path
+    Spec(t_action_wartung, "trips", 400, False),
+    Spec(t_action_crew, "trips_lokf", 300, False),
+    Spec(t_action_wartung_status, "trips_orders", 450, False),
+    Spec(t_action_ersatz, "trips_lokf", 250, None),
+    # hard tier — the 3-4-call templates carry the >=50% multi-tool target,
+    # so their n sits at/above their eligible ceilings (wave-2.5 recalibration)
+    Spec(t_info_zugsuche_status, "trips_pos_route", 250, True),   # pool-capped ~181
+    Spec(t_info_verspaetung_suche, "trips", 999, None),           # gate-capped ~890
+    Spec(t_info_mitarbeiter_suche, "ma_filter_combos", 300, False),
+    Spec(t_info_schichtcheck, "trips_lokf", 450, False),
+    Spec(t_info_wartung_depot, "wartung_filter_combos", 150, False),
+    Spec(t_info_zug_komplett, "trips_komplett", 300, True),       # pool-capped ~221
+    Spec(t_info_ankunft_suche, "trips_route_page", 999, True),    # pool-capped ~852
+    Spec(t_action_ersatz_quali, "trips_lokf", 1100, None),        # eligibility-capped ~1030
+    Spec(t_action_crew_doppelt, "trips_lokf", 180, False),
+    Spec(t_action_verstaerkung, "trips", 1100, False),            # pool-capped ~1070
+    Spec(t_action_wartung_suche, "trips_route_page", 999, None),  # pool-capped ~852
+    Spec(t_action_inspektion_bedingt, "trips", 800, True, 0.5),   # eligibility-capped ~705
+    Spec(t_action_ueberfaellig, "trips_veh_ueberfaellig", 250, False),   # pool-capped ~136
+    Spec(t_action_wstatus_konflikt, "trips_veh_konflikt", 120, False),   # pool-capped ~57
+    Spec(t_action_wartung_batch, "trips_veh_2open", 250, False),         # pool-capped ~121
+    Spec(t_action_gefahrgut, "trips_lokf_no_quali_produkt", 100, False), # pool-capped ~88 (GTFS-fix)
 ]
 
 
@@ -1050,9 +1092,11 @@ def main():
     ap = argparse.ArgumentParser(description="Generate db_bahn tasks with built-in answer keys (wave 2)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fault-rate", type=float, default=0.35)
-    ap.add_argument("--n-bakeoff", type=int, default=25)
-    ap.add_argument("--n-heldout", type=int, default=60)
-    ap.add_argument("--n-rl", type=int, default=300,
+    # wave-2.5 defaults for the ~10.5k pool: bakeoff MUST equal the template count (26) or the
+    # alphabetically last template silently drops out; heldout/rl scaled for eval power + GRPO
+    ap.add_argument("--n-bakeoff", type=int, default=26)
+    ap.add_argument("--n-heldout", type=int, default=275)
+    ap.add_argument("--n-rl", type=int, default=1000,
                     help="GRPO task reserve — disjoint from SFT, never rolled out for SFT")
     ap.add_argument("--out-dir", default=str(DATA_DIR))
     args = ap.parse_args()
@@ -1071,7 +1115,8 @@ def main():
             if made >= spec.n:
                 break
             item = pool[j]
-            entity = getattr(item, "zugnummer", None) or item.key
+            # trips -> zugnummer; employees -> emp_id (wave-2.5); combos -> .key
+            entity = getattr(item, "zugnummer", None) or getattr(item, "emp_id", None) or item.key
             dedup_key = (tname, entity)
             if dedup_key in seen:  # unique (template, primary entity)
                 stats["near_dup_skipped"] += 1
