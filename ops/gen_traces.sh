@@ -44,7 +44,9 @@ serve() {  # winner's flags, from ops/teacher_bakeoff.sh
 
 roll() {  # $1 = mlflow run-name ; $2.. = extra rollout flags (e.g. --k / --task-ids-file)
   local RUN="$1"; shift
-  timeout 43200 env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
+  # 24h cap (was 12h — killed the 9.2k-task wave-2.5 pass 1 at ~48% on 2026-07-12; the run
+  # then "completed" silently because roll's exit code is not checked. Rollout is resume-safe.)
+  timeout 86400 env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
     sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
     --split "$SPLIT" --model "$TEACHER" --teacher-name "$SHORT" \
     --api-base http://localhost:8000/v1 \
