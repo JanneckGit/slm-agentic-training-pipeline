@@ -1,7 +1,7 @@
 """
 data_pipeline/convert_toolace.py
 ================================
-Convert ToolACE (ShareGPT, bracket-DSL tool calls) into the unified db_bahn chat format for the 4-leg mix.
+Convert ToolACE (ShareGPT, bracket-DSL tool calls) into the unified db_bahn chat format for the 3-leg mix.
 
 ToolACE's value = API-SCHEMA BREADTH (26,507 distinct tools -> generalization to unseen schemas, pays into
 BFCL) + IRRELEVANCE rows ("if none of the functions can be used, point it out"). Weakness: 93% single-turn,
@@ -19,7 +19,7 @@ Per row:
 Sampling: keep ALL rows with >=2 tool-call turns; fill to --n-total (default 4800) with single-call rows
 (seed 42), capping pure no-tool (irrelevance) rows at --n-irrelevance so English chat can't flood the mix.
 
-Usage:  python3 data_pipeline/convert_toolace.py --n-total 4800 --out data/generated/toolace_chat.jsonl
+Usage:  PYTHONPATH=. python3 data_pipeline/convert_toolace.py --n-total 4800 --out data/generated/toolace_chat.jsonl
 """
 
 import argparse
@@ -27,14 +27,13 @@ import ast
 import json
 import random
 import re
-from pathlib import Path
+from data_pipeline.common import TOOLS_BLOCK_TMPL, write_jsonl
 
 TOOLS_HDR = "Here is a list of functions in JSON format that you can invoke:"
 SYS_PREAMBLE = (
     "You are a helpful assistant that can call functions to answer the user's question. "
     "If none of the functions can be used, or a required parameter is missing, say so instead of guessing.\n\n"
-    "# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n"
-    "<tools>\n{tools_block}\n</tools>"
+    + TOOLS_BLOCK_TMPL
 )
 
 
@@ -134,8 +133,9 @@ def convert_row(row: dict) -> tuple[dict, int] | None:
         if role == "user":
             msgs.append({"role": "user", "content": val})
         elif role == "tool":
-            tcid = pending.pop(0) if pending else f"call_orphan_{ctr[0]}"
-            msgs.append({"role": "tool", "tool_call_id": tcid, "content": val})
+            if not pending:  # tool turn without a preceding assistant call -> malformed row, drop it
+                return None
+            msgs.append({"role": "tool", "tool_call_id": pending.pop(0), "content": val})
         elif role == "assistant":
             v = val.strip()
             if v.startswith("[") and v.endswith("]"):  # ToolACE call block (may be final = no execution)
@@ -181,10 +181,7 @@ def main():
         kept += none_[args.n_irrelevance:args.n_irrelevance + (args.n_total - len(kept))]
     rng.shuffle(kept)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w") as f:
-        for e in kept:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    write_jsonl(kept, args.out)
     parsed_total = len(multi) + len(single) + len(none_)
     print(f"ToolACE: parsed {parsed_total} / skipped {skipped} "
           f"({100*skipped/(parsed_total+skipped):.1f}% unparseable)")

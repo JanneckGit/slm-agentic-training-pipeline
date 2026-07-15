@@ -3,7 +3,7 @@
 > **Status:** ✅ **SUPERSEDED — now built** (this pre-build design note is kept for its literature rationale).
 > **Date:** 2026-07-03 · **Scope:** how to synthesize the German Deutsche-Bahn tool-calling trajectories — the
 > **self-synthesized DB leg** of the Stage-1 SFT mix (the **largest of 3 legs**, alongside ToolACE +
-> AReaL/τ²-bench; see [`agentic-sft-data-basis.md`](agentic-sft-data-basis.md)). The synthesis is implemented
+> AReaL/τ²-bench; see [`agentic-datasets-explained.md`](agentic-datasets-explained.md) (Anhang A)). The synthesis is implemented
 > and run — **9,146 verified traces**, see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md).
 > *(TaskBench was dropped from the mix on 2026-07-13 → eval shelf; the mix below is therefore 3-leg.)*
 >

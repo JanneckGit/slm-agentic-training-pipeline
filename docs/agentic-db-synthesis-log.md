@@ -4,6 +4,50 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
+## 2026-07-15 — 🧹 Repo-Konsolidierung: SQL-Legacy komplett raus (Phase C, erweitert)
+
+- **Gelöscht (Git-History = Archiv):** `evaluation/{reward,evaluate}.py`,
+  `training_pipeline/{build_weak_pool,reachability_probe,grpo_verl_runner}.py`,
+  `ops/grpo_pilot_supervised.sh`, `tools/close_rate_probe.py`, `data_pipeline/clean_traces.py`,
+  TaskBench-Zweig aus `prepare_agentic_data.py`, MM-Pfad aus `tools/quantize_fp8.py`. Das geht über den
+  Phase-C-B-Set-Beschluss vom 07-03 hinaus: **auch `grpo_verl_runner.py` fällt** — der Stage-2-GRPO wird
+  sauber neu gebaut (Reward = `trajectory_reward.py`, Daten = `rl_train`-Split + AReaL-RL), das validierte
+  GB10/verl-Rezept steht vollständig in
+  [experiments-verl_RL_lora-grpo.md](text2sql-experiments/experiments-verl_RL_lora-grpo.md).
+- **Bleibt:** `Dockerfile.grpo` + das eingefrorene `text2sql-grpo:verl`-Image (einziges reproduzierbares
+  Rezept für den verl+nightly-vLLM-Stack); der compose-`grpo`-Service ist als *dormant* markiert.
+- **Reproduzierbarkeitslücke geschlossen:** `data/raw/areal/tau2_tools_blocks.json` (Input von
+  `convert_areal.py`) war verloren und wird von keinem Skript erzeugt. Exakt rekonstruiert aus den
+  System-Prompts der produzierten `areal_chat.jsonl` (ein `<tools>`-Block je Domäne) — Re-Run des
+  Converters ist damit wieder **byte-identisch** (verifiziert via cmp).
+- **Golden-Baseline etabliert:** `gen_tasks` (seeded) + `convert_toolace` + `convert_areal` +
+  `format_traj_for_training` + `build_sft_mix` regenerieren alle **byte-identisch** zur Produktion;
+  Hash-Manifest dient als Smoke-Anker für die Refactor-Phasen (Dedup, gen_tasks-Split).
+- **Dedup:** neues `data_pipeline/common.py` (write_jsonl 6×, Tool-Call-Norm 4×, final_answer 3×,
+  `<tools>`-Template 3×, load_config 4×, `rng` 2×, Studenten-Modell-Konstante) — alle Pipeline-Outputs
+  nach der Umstellung byte-identisch verifiziert. Konvention: Host-Aufrufe brauchen `PYTHONPATH=.`
+  (Container backen `/app`, ops-Skripte setzen `$REPO`).
+- **gen_tasks.py gesplittet** (1.213 → 231 Z.): Templates nach `gen_templates_easy/hard.py`,
+  Infrastruktur nach `gen_tasks_lib.py`; Task-Output byte-identisch verifiziert.
+- **validate_areal.py getrimmt** (556 → 490 Z.): `--deep`, telecom-extras, Keyset-Census raus;
+  Re-Run gegen den Snapshot: PASS 0 fail / 0 warn / 30 Checks.
+- **Config beide Dateien bereinigt** (~240 → ~130 Z.): nur noch tatsächlich gelesene Keys
+  (grep-verifiziert); `azure/anthropic/openai/ollama`-Teacher-Blöcke, doc-only `db_bahn:`, ungelesene
+  `training.*`-Keys und `teacher_candidates`-Duplikat (Quelle: `ops/teacher_bakeoff.sh`) entfernt.
+- **Docs:** `agentic-sft-data-basis.md` → Anhang A von `agentic-datasets-explained.md` gemergt.
+- **Quercheck-Nachzügler (gleicher Tag):** `pipeline_config.local.yaml`-Konzept KOMPLETT abgeschafft
+  (Config ist secrets-frei; Datei + compose-Binds + alle Verweise entfernt — es gibt nur noch EINE Config).
+  Docker entschlackt: GuideLLM-venv aus Dockerfile.training (Consumer `efficiency_benchmark.py` existierte
+  nicht mehr), sdg-Image von sdg-hub/litellm/anthropic/openai + `requirements_sdg.txt` befreit (nur noch
+  huggingface-hub/datasets/pyyaml); beide Images neu gebaut (Training-Backup-Tag `pre-cleanup-20260715`),
+  alte grpo-Snapshots (`verl-preval`/`verl-prepatch`, ~121 GB) gepruned — `:verl` bleibt. Kosmetik:
+  „3-leg" statt „4-leg" (5 Stellen), gen_tasks-Docstring 26 Templates, `train_traj --data`-Default = Mix,
+  ungelesene `data.generated_dir/final_dir`-Keys raus, `tools/quantize_fp8.py` im README-Layout ergänzt.
+- **Bugfixes:** Verifier-No-Op (`a.model_dump()`), Verifier-Exception → stderr-Warnung,
+  Prefix-Replay-Divergenz wird geloggt statt geschluckt, `roll()`-Exit-Code hard-fail in
+  gen_traces.sh, ToolACE-Orphan-tool_call_id → Zeilen-Drop (AReaL-Orphan-IDs sind absichtlich:
+  Telecom-User-Tools), vLLM-Compose-Default → `Qwen/Qwen3-4B`, `--val-frac`-Doc-Drift.
+
 ## 2026-07-15 — ✅ SFT DURCH: 99,6 % auf dem Heldout (ep2 gewinnt) — der Durchbruch nach Welle 1
 
 - **Ergebnis (n=276, alle Pässe identisch: k=1, conc 16):** Base **89,1 %** (246/276) → ep1 **98,6 %** (272) →

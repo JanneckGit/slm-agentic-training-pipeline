@@ -44,15 +44,21 @@ serve() {  # winner's flags, from ops/teacher_bakeoff.sh
 
 roll() {  # $1 = mlflow run-name ; $2.. = extra rollout flags (e.g. --k / --task-ids-file)
   local RUN="$1"; shift
-  # 24h cap (was 12h — killed the 9.2k-task wave-2.5 pass 1 at ~48% on 2026-07-12; the run
-  # then "completed" silently because roll's exit code is not checked. Rollout is resume-safe.)
+  # 24h cap (was 12h — killed the 9.2k-task wave-2.5 pass 1 at ~48% on 2026-07-12; back then the
+  # run "completed" silently because roll's exit code was not checked -> now we HARD-FAIL here).
   timeout 86400 env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
     sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
     --split "$SPLIT" --model "$TEACHER" --teacher-name "$SHORT" \
     --api-base http://localhost:8000/v1 \
     --branch-on-fail --max-turns "$MAX_TURNS" --max-tokens-per-turn 1536 --concurrency "$CONCURRENCY" \
     --mlflow --mlflow-experiment "$EXP" --mlflow-run-name "$RUN" \
-    --output "$TRACE" "$@"
+    --output "$TRACE" "$@" || {
+      local rc=$?
+      echo "== ROLLOUT '$RUN' FAILED (exit $rc; 124 = 24h timeout) — ABORT."
+      echo "   Rollout is resume-safe: fix/wait, then rerun this script to continue where it stopped."
+      $COMPOSE --profile vllm down vllm >/dev/null 2>&1
+      exit $rc
+    }
 }
 
 echo "==== GEN-TRACES START $(date) — teacher=$SHORT split=$SPLIT topup=$TOPUP ===="
@@ -91,8 +97,11 @@ echo "== teardown vllm =="
 $COMPOSE --profile vllm down vllm >/dev/null 2>&1
 
 echo "== [4/4] format verified traces -> $CHAT =="
-"$TAU2PY" data_pipeline/format_traj_for_training.py --input "$TRACE" \
-  --split-file "$SPLITF" --split "$SPLIT" --output "$CHAT"
+env PYTHONPATH="$REPO" "$TAU2PY" data_pipeline/format_traj_for_training.py --input "$TRACE" \
+  --split-file "$SPLITF" --split "$SPLIT" --output "$CHAT" || {
+    echo "== FORMAT FAILED (exit $?) — ABORT (traces in $TRACE are intact, rerun step 4 after fixing)."
+    exit 1
+  }
 KEPT=$(wc -l < "$CHAT" 2>/dev/null || echo 0)
 
 echo "==== GEN-TRACES DONE $(date) ===="

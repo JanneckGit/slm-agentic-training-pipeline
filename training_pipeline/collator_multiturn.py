@@ -76,7 +76,8 @@ class TrajSFTCollator:
 def _selftest():
     """Run in the training container: asserts the mask covers assistant+tool_call, excludes user+tool obs."""
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B", trust_remote_code=True)
+    from data_pipeline.common import STUDENT_MODEL_DEFAULT
+    tok = AutoTokenizer.from_pretrained(STUDENT_MODEL_DEFAULT, trust_remote_code=True)
     msgs = [
         {"role": "system", "content": "SYS"},
         {"role": "user", "content": "Wo ist ICE 7?"},

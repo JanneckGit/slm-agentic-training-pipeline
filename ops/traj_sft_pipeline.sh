@@ -44,7 +44,7 @@ if serve "$BASE" "$BASE" 0.85; then
 else echo "== BEFORE serve FAILED"; docker logs text2sql_vllm_teacher --tail 30 >>logs/traj_sft.log 2>&1; fi
 $COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
 
-DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 4-leg SFT mix (db_bahn + AReaL + ToolACE)
+DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 3-leg SFT mix (db_bahn + AReaL + ToolACE)
 VAL=${VAL:-data/final/sft_mix_val.jsonl}         # held-out val split (eval_loss, never in gradient)
 echo "== [2/4] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, 2 epochs, LoRA @12288) =="
 # --save-epoch-adapters -> ${ADAPTER}_ep1 + _ep2 for checkpoint selection; --neftune 5 = noisy-embedding reg.

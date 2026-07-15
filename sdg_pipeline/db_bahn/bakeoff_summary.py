@@ -9,13 +9,15 @@ injected tasks, avg turns, tool-call validity, avg wall s/rollout, traces/GPU-h,
 yield x german per GPU-hour (normalized). German proxy = fraction of final answers that look German
 (>=2 German function words or umlauts) — the quick sampled read stays manual.
 
-Plain python3, no tau2 needed.
+Plain python3 (PYTHONPATH=. — braucht data_pipeline.common), kein tau2 nötig.
 """
 
 import glob
 import json
 import re
 import sys
+
+from data_pipeline.common import final_answer
 
 GERMAN_WORDS = re.compile(
     r"\b(der|die|das|ist|sind|und|für|wurde|wurden|keine|aktuell|Zug|Verspätung|zugeteilt|Minuten|planmäßig)\b",
@@ -25,13 +27,6 @@ UMLAUT = re.compile(r"[äöüÄÖÜß]")
 
 def german_score(text: str) -> bool:
     return len(GERMAN_WORDS.findall(text or "")) >= 2 or bool(UMLAUT.search(text or ""))
-
-
-def final_answer(messages):
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and (m.get("content") or "").strip() and not m.get("tool_calls"):
-            return m["content"]
-    return ""
 
 
 def main():

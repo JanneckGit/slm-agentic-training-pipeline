@@ -6,36 +6,38 @@ SFT data basis, and writes them into data/raw/, mirroring data_pipeline/prepare_
 (the Text-to-SQL seed fetcher).
 
 Stage-1 (mixed SFT) data basis legs:
-  1. ToolACE   (Team-ACE/ToolACE, Apache-2.0)          -> tool-call basics (call -> read -> next)
-  2. TaskBench (microsoft/Taskbench, MIT)                -> planning / decomposition (tool-graph)
-  3. AReaL     (inclusionAI/AReaL-tau2-data, Apache-2.0) -> tau2-bench flows: per-turn SFT
+  1. ToolACE   (Team-ACE/ToolACE, Apache-2.0)            -> tool-call basics (call -> read -> next)
+  2. AReaL     (inclusionAI/AReaL-tau2-data, Apache-2.0) -> tau2-bench flows: per-turn SFT
      (replan/self-correction, airline/retail/telecom) + RL tasks incl. DB snapshots
-  4. synthetic DB flows                                  -> generated locally (not fetched here)
+  3. synthetic DB flows                                  -> generated locally (not fetched here)
 
-This script only ACQUIRES the raw data (a faithful copy; ToolACE/TaskBench get source/split
-tags, AReaL is a byte-identical repo snapshot). Converting the raw records into the unified
+(TaskBench was acquired once but deliberately dropped from the mix — task-graph JSON, no
+executable tool calls; see docs/agentic-datasets-explained.md.)
+
+This script only ACQUIRES the raw data (a faithful copy; ToolACE gets source/split tags,
+AReaL is a byte-identical repo snapshot). Converting the raw records into the unified
 chat/training format happens in a later mix step. Validate the AReaL pull with
 data_pipeline/validate_areal.py.
 
 All datasets are public (not gated), so no HF token is required.
 
 Usage:
-    python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
-    python data_pipeline/prepare_agentic_data.py --dataset toolace --n-samples 200   # quick look
-    python data_pipeline/prepare_agentic_data.py --dataset areal                     # ~970 MB snapshot
+    PYTHONPATH=. python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
+    PYTHONPATH=. python data_pipeline/prepare_agentic_data.py --dataset toolace --n-samples 200   # quick look
+    PYTHONPATH=. python data_pipeline/prepare_agentic_data.py --dataset areal                     # ~970 MB snapshot
 """
 
 import argparse
 import json
 import logging
 import random
-import shutil
 from pathlib import Path
 
-import yaml
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 
-# NOTE: `datasets` is imported lazily inside fetch_toolace/fetch_taskbench — the tau2 venv
+from data_pipeline.common import load_config, write_jsonl
+
+# NOTE: `datasets` is imported lazily inside fetch_toolace — the tau2 venv
 # (.venv-tau2) only ships huggingface_hub, and the AReaL snapshot fetch must run there.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -51,14 +53,6 @@ TOOLACE_DEFAULT = {
     "split": "train",
     "license": "Apache-2.0",
 }
-TASKBENCH_DEFAULT = {
-    "dataset": "microsoft/Taskbench",
-    "split": "test",  # TaskBench ships its data under a `test` split (no `train`)
-    "configs": ["huggingface", "multimedia", "dailylifeapis"],
-    "license": "MIT",
-    # sidecar files (tool inventory + dependency graph) live at data_<config>/<name>
-    "sidecars": ["tool_desc.json", "graph_desc.json"],
-}
 AREAL_DEFAULT = {
     "dataset": "inclusionAI/AReaL-tau2-data",
     "license": "Apache-2.0",
@@ -70,20 +64,6 @@ AREAL_DEFAULT = {
         "rl_domains": {"airline": 1148, "retail": 563, "telecom": 271},
     },
 }
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def write_jsonl(rows: list[dict], path: Path) -> Path:
-    """One JSON object per line – identical idiom to prepare_data.py."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    return path
 
 
 def _maybe_subsample(rows: list[dict], n_samples: int | None) -> list[dict]:
@@ -130,75 +110,6 @@ def fetch_toolace(cfg: dict, raw_dir: Path, n_samples: int | None) -> dict:
         "size_mb": round(size_mb, 2),
         "teaches": "tool-call basics (call a tool, read the response, call the next)",
         "sample": rows[0] if rows else None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# TaskBench – 3 domain configs; each row is a request + a tool-invocation graph
-#   (graph columns are JSON-encoded STRINGS). The tool inventory (tool_desc.json)
-#   and dependency graph (graph_desc.json) are NOT in the parquet -> fetched
-#   separately via hf_hub_download.
-# ---------------------------------------------------------------------------
-def fetch_taskbench(cfg: dict, raw_dir: Path, n_samples: int | None) -> dict:
-    from datasets import load_dataset
-
-    dataset_id = cfg["dataset"]
-    split = cfg["split"]
-    configs = cfg["configs"]
-    sidecars = cfg.get("sidecars", ["tool_desc.json", "graph_desc.json"])
-    out_root = raw_dir / "taskbench"
-
-    per_domain = {}
-    files = []
-    total = 0
-    first_sample = None
-    columns = []
-    for domain in configs:
-        logger.info(f"[TaskBench] load_dataset({dataset_id}, {domain}, split={split}) …")
-        ds = load_dataset(dataset_id, domain, split=split)
-        rows = [{**ex, "source": dataset_id, "domain": domain, "split": split} for ex in ds]
-        rows = _maybe_subsample(rows, n_samples)
-        if rows and first_sample is None:
-            first_sample = rows[0]
-            columns = list(rows[0].keys())
-
-        domain_dir = out_root / domain
-        data_out = write_jsonl(rows, domain_dir / "data.jsonl")
-        files.append(str(data_out))
-        total += len(rows)
-
-        # sidecars: data_<domain>/<name> in the repo -> copy into the domain dir
-        sidecar_ok = []
-        for name in sidecars:
-            try:
-                cached = hf_hub_download(
-                    repo_id=dataset_id,
-                    filename=f"data_{domain}/{name}",
-                    repo_type="dataset",
-                )
-                dst = domain_dir / name
-                shutil.copyfile(cached, dst)
-                files.append(str(dst))
-                sidecar_ok.append(name)
-            except Exception as e:  # noqa: BLE001 – best-effort, report and continue
-                logger.warning(f"[TaskBench] sidecar {domain}/{name} failed: {e}")
-
-        per_domain[domain] = {"rows": len(rows), "sidecars": sidecar_ok}
-        logger.info(f"[TaskBench] {domain}: {len(rows)} rows, sidecars={sidecar_ok} -> {domain_dir}")
-
-    return {
-        "name": "TaskBench",
-        "dataset_id": dataset_id,
-        "license": cfg.get("license", "MIT"),
-        "split": split,
-        "rows_written": total,
-        "per_domain": per_domain,
-        "columns": columns,
-        "files": files,
-        "teaches": "planning / decomposition (which steps, which order, which tool + params)",
-        "note": "graph columns (tool_nodes/tool_links/…) are JSON-encoded strings; "
-                "tool_desc.json + graph_desc.json carry the tool inventory + dependency graph",
-        "sample": first_sample,
     }
 
 
@@ -271,9 +182,6 @@ def _print_summary(summaries: list[dict]) -> None:
         logger.info(f"\n### {s['name']}  ({s['dataset_id']}, {s['license']})")
         rows = s["rows_written"] if s.get("rows_written") is not None else "(snapshot — counts via validate_areal.py)"
         logger.info(f"  rows written : {rows}")
-        if "per_domain" in s:
-            for dom, info in s["per_domain"].items():
-                logger.info(f"    - {dom:14s}: {info['rows']} rows, sidecars={info['sidecars']}")
         logger.info(f"  columns      : {s['columns']}")
         logger.info(f"  teaches      : {s['teaches']}")
         if s.get("sample") is not None:
@@ -281,9 +189,9 @@ def _print_summary(summaries: list[dict]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch ToolACE + TaskBench + AReaL into data/raw (agentic SFT basis)")
+    parser = argparse.ArgumentParser(description="Fetch ToolACE + AReaL into data/raw (agentic SFT basis)")
     parser.add_argument("--config", default="config/pipeline_config.yaml")
-    parser.add_argument("--dataset", choices=["toolace", "taskbench", "areal", "all"], default="all")
+    parser.add_argument("--dataset", choices=["toolace", "areal", "all"], default="all")
     parser.add_argument("--n-samples", type=int, default=None,
                         help="Optional per-dataset cap for a quick 'show' subset")
     parser.add_argument("--seed", type=int, default=42)
@@ -298,14 +206,11 @@ def main():
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     toolace_cfg = {**TOOLACE_DEFAULT, **agentic_cfg.get("toolace", {})}
-    taskbench_cfg = {**TASKBENCH_DEFAULT, **agentic_cfg.get("taskbench", {})}
     areal_cfg = {**AREAL_DEFAULT, **agentic_cfg.get("areal", {})}
 
     summaries = []
     if args.dataset in ("toolace", "all"):
         summaries.append(fetch_toolace(toolace_cfg, raw_dir, args.n_samples))
-    if args.dataset in ("taskbench", "all"):
-        summaries.append(fetch_taskbench(taskbench_cfg, raw_dir, args.n_samples))
     if args.dataset in ("areal", "all"):
         summaries.append(fetch_areal(areal_cfg, raw_dir, args.n_samples))
 

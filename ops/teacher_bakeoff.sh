@@ -101,9 +101,9 @@ for i in "${!CANDIDATES[@]}"; do
     --concurrency 4 --output "$TRACE" $OMITFLAG 2>&1 | tail -12 | tee -a "$LOG"
 
   teardown
-  python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write | tail -3
+  env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write | tail -3
 done
 
 wait  # drain background downloads
 echo "== BAKE-OFF DONE =="
-python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write
+env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write

@@ -1,20 +1,22 @@
 # =============================================================================
-# docker-compose.yml – Text-to-SQL Finetuning Pipeline
+# docker-compose.yml – Agentic SLM Training Pipeline
 # =============================================================================
 # Services:
-#   sdg        – Data preparation + SDG Hub generation (CPU, calls API)
-#   training   – Training Hub finetuning (GPU required)
-#   vllm       – Optional: local vLLM server as teacher model (GPU)
+#   sdg        – public-dataset acquisition (CPU)
+#   training   – LoRA-SFT finetuning + converters (GPU)
+#   grpo       – Stage-2 verl stack (GPU; DORMANT until the agentic re-wire)
+#   vllm       – local vLLM server: teacher for SDG, merged student for eval (GPU)
+#   mlflow     – optional UI (port 5000) over the shared file-store ../mlruns
 #
 # Usage (agentic pipeline):
-#   docker compose run --rm sdg python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.local.yaml
-#   docker compose run --rm training python3 training_pipeline/train_traj.py --config config/pipeline_config.local.yaml
+#   docker compose run --rm sdg python data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml
+#   docker compose run --rm training python3 training_pipeline/train_traj.py --config config/pipeline_config.yaml
 #   bash ops/teacher_bakeoff.sh          # teacher bake-off (serves candidates via the vllm service)
+#   bash ops/gen_traces.sh               # serve winner -> rollout -> format (the db_bahn leg)
 #   bash ops/traj_sft_pipeline.sh        # before-eval -> traj_sft -> merge -> after-eval
 #
 # Optional teacher model (local vLLM):
-#   docker compose up -d vllm
-#   # Wait for vLLM to be ready, then run SDG with backend: vllm_local
+#   docker compose --profile vllm up -d vllm
 # =============================================================================
 
 services:
@@ -37,8 +39,6 @@ services:
       - ../logs:/app/logs
       # HuggingFace model cache (shared with training service)
       - hf_cache:/data/hf_cache
-      # Your local config with API keys (gitignored)
-      - ../config/pipeline_config.local.yaml:/app/config/pipeline_config.local.yaml
 
     environment:
       - PYTHONUNBUFFERED=1
@@ -67,7 +67,6 @@ services:
       - ../logs:/app/logs
       - ../mlruns:/app/mlruns
       - hf_cache:/data/hf_cache
-      - ../config/pipeline_config.local.yaml:/app/config/pipeline_config.local.yaml
 
     environment:
       - PYTHONUNBUFFERED=1
@@ -95,12 +94,13 @@ services:
     shm_size: '16gb'
 
   # ---------------------------------------------------------------------------
-  # GRPO Service – verl (LoRA, async server-mode) on GB10/sm_121. RLVR pilot.
+  # GRPO Service – verl (LoRA, async server-mode) on GB10/sm_121.
+  # DORMANT: the SQL-era runner was removed; the agentic Stage-2 re-wire (db_bahn +
+  # trajectory_reward) is pending. Recipe/flags: docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md
   # image text2sql-grpo:verl = the validated verl+vLLM-0.23-nightly+torch-2.11 stack
   #   (frozen via `docker commit grpo_gate text2sql-grpo:verl`; Dockerfile.grpo is the
   #    from-scratch reproducible fallback — nightly vLLM rolls, so prefer the committed image).
-  # Run (GPU): docker compose --profile grpo run --rm grpo \
-  #              training_pipeline/grpo_verl_runner.py --smoke --date <YYYYMMDD>
+  # Run (GPU): docker compose --profile grpo run --rm grpo <runner.py> …
   # (entrypoint is python3, so pass the script path directly — NOT `python3 ...`.)
   # ---------------------------------------------------------------------------
   grpo:
@@ -113,7 +113,7 @@ services:
     entrypoint: ["python3"]       # committed image's CMD is grpo_gate's keep-alive probe; override it
 
     volumes:
-      - ..:/app                   # repo: runner imports evaluation/reward.py, reads config
+      - ..:/app                   # repo: runner imports the reward fn, reads config
       - ../data:/app/data
       - ../mlruns:/app/mlruns     # MLflow store shared with the SFT/eval runs
       - hf_cache:/data/hf_cache
@@ -122,9 +122,8 @@ services:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/data/hf_cache
       - HF_TOKEN=${HF_TOKEN}
-      - MLFLOW_TRACKING_URI=file:///app/mlruns   # land beside the SFT runs (experiment grpo_distill)
-      - REWARD_TOKENIZER=Qwen/Qwen3-4B           # reward.py think-token count
-      - PYTHONPATH=/app                          # frozen grpo image has no PYTHONPATH baked; reward.py import needs it
+      - MLFLOW_TRACKING_URI=file:///app/mlruns   # land beside the SFT runs
+      - PYTHONPATH=/app                          # frozen grpo image has no PYTHONPATH baked; reward import needs it
       - RAY_memory_monitor_refresh_ms=0          # Ray OOM-killer false-positives on unified memory
       - HYDRA_FULL_ERROR=1
       - VLLM_USE_FLASHINFER_SAMPLER=0            # GB10 sm_121 FlashInfer top-k/top-p sampler race (vLLM #43885) -> PyTorch-native sampler. THE GB10 rollout-wedge fix (enforce_eager was a red herring; cudagraph stays ON). Container-level so it reaches verl's colocated Ray rollout worker (verified via /proc/<worker>/environ) + survives supervisor resume.
@@ -154,8 +153,8 @@ services:
 
     volumes:
       - hf_cache:/data/hf_cache
-      # RLVR-GRPO pilot: serve locally-merged checkpoints (e.g. qwen314b_student_thinking_merged)
-      # for the reachability probe / SFT-baseline rollouts. VLLM_MODEL points into /app/data.
+      # serve locally-merged checkpoints (e.g. the merged SFT student) for eval
+      # rollouts. VLLM_MODEL points into /app/data.
       - ../data:/app/data
 
     environment:
@@ -164,17 +163,17 @@ services:
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       # RLVR-GRPO pilot: allow runtime LoRA load/unload (3a hot-swap weight-sync spike)
       - VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
-      # GB10 sm_121 FlashInfer top-k/top-p sampler race (vLLM #43885): PyTorch-native sampler so the
-      # reachability probe / SDG / eval don't wedge (~96% util / ~13 W / throughput->0) under sustained
+      # GB10 sm_121 FlashInfer top-k/top-p sampler race (vLLM #43885): PyTorch-native sampler so
+      # SDG / eval rollouts don't wedge (~96% util / ~13 W / throughput->0) under sustained
       # top_k/top_p sampling. THE fix (not enforce_eager). Drop once the image ships #44405 / flashinfer#3615.
       - VLLM_USE_FLASHINFER_SAMPLER=0
 
     command: >
-      --model ${VLLM_MODEL:-Qwen/Qwen3.5-4B}
+      --model ${VLLM_MODEL:-Qwen/Qwen3-4B}
       --dtype bfloat16
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.85}
-      --served-model-name ${VLLM_MODEL:-Qwen/Qwen3.5-4B}
+      --served-model-name ${VLLM_MODEL:-Qwen/Qwen3-4B}
       ${VLLM_EXTRA_ARGS:-}
       --host 0.0.0.0
       --port 8000

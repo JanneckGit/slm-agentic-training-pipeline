@@ -54,6 +54,8 @@ FIRST = ["Anna", "Ben", "Clara", "David", "Eva", "Felix", "Greta", "Hans", "Ines
          "Katrin", "Lars", "Mia", "Noah", "Olga", "Paul", "Rita", "Sven", "Tina", "Uwe"]
 LAST = ["Müller", "Schmidt", "Schneider", "Fischer", "Weber", "Meyer", "Wagner", "Becker",
         "Hoffmann", "Schäfer", "Koch", "Bauer", "Richter", "Klein", "Wolf", "Schröder"]
+# WORLD vocab (what exists in db.json). gen_tasks.py deliberately uses SUBSETS of these for what
+# tasks inject/target — the lists are related but NOT interchangeable (see comment there).
 MAINT_TYPES = ["Inspektion", "Reparatur", "Reinigung", "Radsatztausch", "Softwareupdate"]
 MAINT_STATUS = ["geplant", "in_Arbeit", "abgeschlossen", "überfällig"]
 DELAY_CAUSES = ["Bauarbeiten", "Signalstörung", "Verspätung eines vorausfahrenden Zuges",

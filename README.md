@@ -21,8 +21,10 @@ serving and a [τ²-bench](https://github.com/sierra-research/tau2-bench)-based 
 1. **Stage 1 — SFT (LoRA)** on a **3-leg data mix**: public tool-calling breadth, τ²-bench dialogue
    flows, and — the core of this repo — **self-synthesized, verifier-gated German DB trajectories**.
 2. **Stage 2 — GRPO/verl RL**, reward = the same deterministic trajectory verifier / τ²-bench success.
-   *Status: **template only** — the verl recipe is structurally in place but its config is still SQL-wired
-   from the predecessor; the db_bahn re-wire is pending (see [config/pipeline_config.yaml](config/pipeline_config.yaml) `grpo:`).*
+   *Status: **pending clean rebuild** — the SQL-era verl runner was removed (2026-07-15 cleanup); the
+   validated GB10/verl recipe lives in
+   [experiments-verl_RL_lora-grpo.md](docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md), the frozen
+   `text2sql-grpo:verl` image + `Dockerfile.grpo` stay.*
 
 ## Architecture — grounded synthesis → SFT mix → student
 
@@ -53,7 +55,7 @@ flowchart TD
 ## The SFT data mix (3 legs)
 
 What `build_sft_mix.py` actually assembles into `data/final/sft_mix_chat.jsonl` (≠ the raw pull counts —
-those live in the [acquisition record](docs/agentic-sft-data-basis.md)):
+those live in the [acquisition record](docs/agentic-datasets-explained.md#anhang-a--akquise-record-gemergt-aus-agentic-sft-data-basismd-2026-07-15)):
 
 | # | Leg | Source | Teaches | Train | Val | Tokens |
 |---|-----|--------|---------|-------|-----|--------|
@@ -66,7 +68,7 @@ those live in the [acquisition record](docs/agentic-sft-data-basis.md)):
 what drives the run's wall-clock — see [why it takes 41.7 h](docs/SFT-Training-Uebersicht.md).
 
 **TaskBench is deliberately not a leg** — its rows are plans, not executable trajectories → moved to the eval
-shelf ([why](docs/agentic-sft-data-basis.md)). RL task pools (`rl_train` 998 + AReaL τ² 1,982) are listed in the
+shelf ([why](docs/agentic-datasets-explained.md)). RL task pools (`rl_train` 998 + AReaL τ² 1,982) are listed in the
 [one-pager](docs/SFT-Training-Uebersicht.md).
 
 ## The db_bahn synthesis core
@@ -112,22 +114,26 @@ for τ²-bench** (its `requires-python >=3.12`; the pinned training stack stays 
 python3.12 -m venv .venv-tau2
 git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench   # pin commit 1901a30
 ./.venv-tau2/bin/pip install /tmp/tau2-bench
-cp config/pipeline_config.yaml config/pipeline_config.local.yaml             # then fill secrets (gitignored)
 ```
 
 All `ops/` scripts use `.venv-tau2/` by default (override with `TAU2PY=/path/to/python`).
+`config/pipeline_config.yaml` is the single config — no secrets needed (the teacher is local vLLM).
+
+**Import convention:** repo scripts import the shared `data_pipeline/common.py`, so host invocations
+need the repo root on the path — prefix with `PYTHONPATH=.` (as all examples below do), or install
+once via `pip install -e . --no-deps` (containers bake `PYTHONPATH=/app`, ops scripts set it).
 
 ## Pipeline steps
 
 **CPU** (host `python3` unless noted `[TAU2PY]`):
 
 ```bash
-# 0) public legs -> data/raw/{toolace,taskbench,areal}/   (areal = ~970 MB snapshot)
-python3 data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
+# 0) public legs -> data/raw/{toolace,areal}/   (areal = ~970 MB snapshot)
+PYTHONPATH=. python3 data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
 
 # 0b) validate the AReaL leg (streaming schema/integrity/referential checks -> validation_report.json)
-./.venv-tau2/bin/python data_pipeline/validate_areal.py \
-  --config config/pipeline_config.local.yaml --deep
+PYTHONPATH=. ./.venv-tau2/bin/python data_pipeline/validate_areal.py \
+  --config config/pipeline_config.yaml
 
 # 1) frozen world-state from the GTFS snapshot (byte-reproducible, seed 42)
 python3 sdg_pipeline/db_bahn/seed_worldstate.py --gtfs-dir data/raw/db_sandbox/gtfs_de_fv \
@@ -158,11 +164,11 @@ bash ops/gen_traces.sh          # serve winner -> rollout sft_train (k=1 branch-
 `traj_sft_pipeline.sh` has no input):
 
 ```bash
-python3 data_pipeline/convert_toolace.py     # bracket-DSL -> data/generated/toolace_chat.jsonl  (4,800 kept)
+PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # bracket-DSL -> data/generated/toolace_chat.jsonl  (4,800 kept)
 docker compose -f docker/docker-compose.yml run --rm -T training \
   python3 data_pipeline/convert_areal.py     # per-turn rows -> episodes -> data/generated/areal_chat.jsonl
                                              #   (2,052; runs in-container — needs transformers for the 12k trim)
-python3 data_pipeline/build_sft_mix.py       # -> data/final/sft_mix_chat.jsonl (15,687) + sft_mix_val.jsonl (301)
+PYTHONPATH=. python3 data_pipeline/build_sft_mix.py       # -> data/final/sft_mix_chat.jsonl (15,687) + sft_mix_val.jsonl (301)
 ```
 
 ```bash
@@ -196,8 +202,8 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
   run-to-run noise (~1 task): [decision log](docs/agentic-db-synthesis-log.md).
   *(Supersedes the wave-1 72.5 % → 70 % at n = 40 — a setup artifact, not a limit of the method.)*
 
-> **Next:** Stage-2 GRPO re-wire (`rl_train` 998 + AReaL τ² 1,982 tasks; the verl config is still SQL-wired
-> from the predecessor).
+> **Next:** Stage-2 GRPO rebuild (`rl_train` 998 + AReaL τ² 1,982 tasks; reward = `trajectory_reward.py`,
+> recipe = the archived GB10/verl doc — the SQL-era runner is gone).
 
 ## Training recipe (Stage 1)
 
@@ -221,10 +227,11 @@ Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db
 .
 ├── sdg_pipeline/db_bahn/             # the synthesis core (§ Architecture)
 │   ├── seed_worldstate.py            #   frozen BahnDB world-state (db.json, seed 42)
-│   ├── gen_tasks.py                  #   10,473 tasks / 26 templates / answer keys / splits
+│   ├── gen_tasks.py                  #   10,473 tasks: registry + splits (templates: gen_templates_easy/hard.py, infra: gen_tasks_lib.py)
 │   ├── rollout.py                    #   solve vs REAL tools (branch-on-fail, k=2 top-up, B2 harvest)
 │   └── tau2_domain/                  #   data_model, environment, tools.py (12 READ/WRITE), policy.md
 ├── data_pipeline/
+│   ├── common.py                     # shared helpers (jsonl I/O, tool-call norm, <tools> template, config)
 │   ├── prepare_agentic_data.py       # fetch the public sets -> data/raw/
 │   ├── validate_areal.py             # streaming schema / integrity / referential checks
 │   ├── convert_toolace.py            # bracket-DSL -> unified chat
@@ -233,20 +240,21 @@ Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db
 │   └── format_traj_for_training.py   # db_bahn rollouts -> chat (split-aware)
 ├── training_pipeline/
 │   ├── train_traj.py                 # LoRA SFT (FA2 + Liger + NEFTune, checkpoint-selection)
-│   ├── collator_multiturn.py         # assistant-only loss mask
-│   └── grpo_verl_runner.py           # Stage-2 verl vehicle (dormant until the db_bahn re-wire)
+│   └── collator_multiturn.py         # assistant-only loss mask
 ├── evaluation/trajectory_reward.py   # deterministic verifier (= the Stage-2 reward seam)
 ├── serving/merge_adapter.py          # LoRA adapter -> merged sharded model (what vLLM serves)
+├── tools/quantize_fp8.py             # FP8 deploy quantization (manual, via the llmcompressor venv)
 ├── ops/                              # teacher_bakeoff.sh · gen_traces.sh · traj_sft_pipeline.sh
 ├── docker/                           # sdg / training / vllm / grpo / mlflow (GB10 sm_121 stack)
-├── config/                           # pipeline_config.yaml + .local.yaml (runtime reads the local one)
+├── config/                           # pipeline_config.yaml — the single config (no secrets needed)
 ├── data/                             # raw/ · generated/ · final/                      [gitignored]
 ├── archive/                          # snapshots of earlier data waves                 [gitignored]
 └── docs/                             # design docs · decision log · bake-off · text2sql-experiments/
 ```
 
-> Some Text2SQL-era files are dead and scheduled for removal — listed in the
-> [decision log](docs/agentic-db-synthesis-log.md).
+> The dormant Text2SQL-era code (SQL reward/eval harness, weak-pool builders, the SQL-wired
+> verl runner) was removed in the 2026-07-15 cleanup — see the
+> [decision log](docs/agentic-db-synthesis-log.md); git history keeps the files.
 
 ## Docs
 
@@ -255,7 +263,6 @@ Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db
 - [docs/agentic-datasets-explained.md](docs/agentic-datasets-explained.md) — the datasets in depth, tutorial-style (DE)
 - [docs/agentic-db-synthesis-log.md](docs/agentic-db-synthesis-log.md) — decision & bug log, newest on top
 - [docs/agentic-sft-db-synthesis.md](docs/agentic-sft-db-synthesis.md) — design + literature levers (9 papers)
-- [docs/agentic-sft-data-basis.md](docs/agentic-sft-data-basis.md) — the public SFT data basis (acquisition record)
 - [docs/teacher-bakeoff.md](docs/teacher-bakeoff.md) — teacher comparison + winner validation
 - [docs/text2sql-experiments/](docs/text2sql-experiments/) — archived evidence base of the predecessor pipeline
   (incl. `agentic-pivot-overview.md` — the pivot-era carryover map, historical)

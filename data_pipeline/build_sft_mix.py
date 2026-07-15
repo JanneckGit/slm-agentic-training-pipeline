@@ -1,7 +1,7 @@
 """
 data_pipeline/build_sft_mix.py
 ==============================
-Assemble the 4-leg SFT mix from the three converted chat files into ONE shuffled training set + a held-out
+Assemble the 3-leg SFT mix from the three converted chat files into ONE shuffled training set + a held-out
 val split (never in the gradient) for the overfit detector.
 
 Legs (all already in the unified db_bahn chat format):
@@ -16,14 +16,15 @@ Filters here:
 
 Output: data/final/sft_mix_chat.jsonl + data/final/sft_mix_val.jsonl, plus a printed stats gate.
 
-Usage:  python3 data_pipeline/build_sft_mix.py --val-frac 0.025
+Usage:  PYTHONPATH=. python3 data_pipeline/build_sft_mix.py            # default --val-frac 0.0188 (~300 val)
 """
 
 import argparse
 import json
 import random
 from collections import Counter
-from pathlib import Path
+
+from data_pipeline.common import write_jsonl
 
 LEGS = {
     "db_bahn": "data/final/db_traces_chat.jsonl",
@@ -72,10 +73,7 @@ def main():
     rng.shuffle(val)
 
     for path, data in [(args.out_train, train), (args.out_val, val)]:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            for e in data:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        write_jsonl(data, path)
 
     # --- stats gate ---
     print("=== SFT-MIX STATS ===")

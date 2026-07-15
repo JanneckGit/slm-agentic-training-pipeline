@@ -14,7 +14,7 @@ loss mask is applied later by training_pipeline/collator_multiturn.py.
 Sanity gates per record: >=1 assistant turn with tool_calls, a non-empty final answer, valid roles.
 
 Usage:
-    python3 data_pipeline/format_traj_for_training.py \
+    PYTHONPATH=. python3 data_pipeline/format_traj_for_training.py \
         --input data/generated/db_traces_sft_train_q36-35b-a3b.jsonl \
         --output data/final/db_traces_chat.jsonl
 """
@@ -23,20 +23,18 @@ import argparse
 import json
 from pathlib import Path
 
+from data_pipeline.common import args_dict, final_answer
+
 VALID_ROLES = {"system", "user", "assistant", "tool"}
 
 
 def convert(rec: dict) -> dict | None:
-    if rec.get("score", {}).get("score") != 1.0:
-        return None
+    # NOTE: the verified-only gate (score==1.0) lives in main() — records arriving here passed it.
     msgs = rec.get("messages") or []
     if not msgs or any(m.get("role") not in VALID_ROLES for m in msgs):
         return None
     has_call = any(m.get("role") == "assistant" and m.get("tool_calls") for m in msgs)
-    final = next((m for m in reversed(msgs)
-                  if m.get("role") == "assistant" and not m.get("tool_calls")
-                  and (m.get("content") or "").strip()), None)
-    if not has_call or final is None:
+    if not has_call or not final_answer(msgs):
         return None
     # normalize: drop empty-content keys, keep tool_call_id on tool turns.
     # tool_call arguments -> DICT (the Qwen chat template renders arguments as a mapping, not a JSON string).
@@ -44,18 +42,10 @@ def convert(rec: dict) -> dict | None:
     for m in msgs:
         e = {"role": m["role"], "content": m.get("content") or ""}
         if m.get("tool_calls"):
-            tcs = []
-            for tc in m["tool_calls"]:
-                fn = tc["function"]
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                tcs.append({"id": tc.get("id", ""), "type": "function",
-                            "function": {"name": fn["name"], "arguments": args}})
-            e["tool_calls"] = tcs
+            e["tool_calls"] = [{"id": tc.get("id", ""), "type": "function",
+                                "function": {"name": tc["function"]["name"],
+                                             "arguments": args_dict(tc["function"].get("arguments"))}}
+                               for tc in m["tool_calls"]]
         if m.get("tool_call_id"):
             e["tool_call_id"] = m["tool_call_id"]
         out.append(e)

@@ -2,7 +2,7 @@
 
 > Was ist welcher Datensatz, wie sieht er aus, was bringt er dem Modell bei — und wie genau nutzen wir
 > τ²-bench dabei. Alle Beispiele unten sind **echt** aus unseren Dateien (bzw. für τ²-bench aus dem Framework).
-> Verwandt: [agentic-sft-data-basis.md](agentic-sft-data-basis.md) (Zahlen), [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md) (DB-Design).
+> Verwandt: [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md) (DB-Design).
 >
 > ⚠️ **Der gebaute Mix hat 3 Legs, nicht 4: TaskBench ist NICHT im SFT-Mix** (→ Eval-Regal, Begründung §2.2).
 > Dieses Doc erklärt weiterhin alle **vier** Datensätze — TaskBench bleibt als Vergleich + späteres Eval
@@ -394,3 +394,59 @@ Dieses Doc erklärt die Datensätze; den jeweils aktuellen Stand hält die Über
 **In einem Satz:** ToolACE + TaskBench liefern die Bausteine (statisch, nur SFT); τ²-bench und db_bahn liefern
 *echte* Umgebungen mit Fehlern und Umplanen — und dieselbe Umgebung dient, auf **getrennten** Aufgaben-Splits,
 gleichzeitig als SFT-Trace-Fabrik, GRPO-Reward und Eval-Benchmark.
+
+---
+
+## Anhang A — Akquise-Record (gemergt aus agentic-sft-data-basis.md, 2026-07-15)
+
+> Die Rohdaten liegen unter `data/raw/` (gitignored) — **dieser Anhang ist das versionierte Artefakt**
+> für den Pull. Es sind **Pull-Zahlen**, nicht Mix-Beiträge (Mix: [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md)).
+
+### Was gezogen wurde
+
+| Dataset | HF id | Lizenz | Rows | Split | On disk | Rolle im Mix |
+|---|---|---|---:|---|---:|---|
+| **ToolACE** | `Team-ACE/ToolACE` | Apache-2.0 | **11,300** | `train` | ~35 MB | Tool-Call-**Basics** |
+| **TaskBench** | `microsoft/Taskbench` | MIT | **17,331** | `test` | ~29 MB | ~~Planung~~ → **nicht im Mix** (Eval-Regal, §2.2) |
+| **AReaL (τ²-bench)** | `inclusionAI/AReaL-tau2-data` | Apache-2.0 | **33,531** SFT (+1,982 RL) | — | ~926 MB | **Dialog / Policy** (multi-turn) |
+
+Alle öffentlich (nicht gated) → kein HF-Token nötig. Gezogen von
+[`prepare_agentic_data.py`](../data_pipeline/prepare_agentic_data.py) (seit 2026-07-15 nur noch
+`toolace|areal` — der TaskBench-Fetch wurde mit dem Mix-Drop entfernt; die Rohdaten bleiben auf Platte),
+validiert von [`validate_areal.py`](../data_pipeline/validate_areal.py).
+
+### Neu beschaffen (Re-Fetch)
+
+```bash
+# im sdg-Container (reproduzierbar, persistenter HF-Cache):
+docker compose -f docker/docker-compose.yml run --rm sdg \
+  python data_pipeline/prepare_agentic_data.py \
+  --config config/pipeline_config.yaml --dataset all
+# oder auf dem Host (braucht datasets + huggingface_hub):
+PYTHONPATH=. python data_pipeline/prepare_agentic_data.py --dataset all      # toolace|areal einzeln möglich
+# areal ist ein ~970-MB-Snapshot — danach prüfen:
+PYTHONPATH=. .venv-tau2/bin/python data_pipeline/validate_areal.py --config config/pipeline_config.yaml
+```
+
+Dataset-IDs/Configs: `config/pipeline_config.yaml` unter `data.agentic` (Skript hat eingebaute Defaults).
+**Achtung `convert_areal.py`:** braucht `data/raw/areal/tau2_tools_blocks.json` (ein `<tools>`-Block je
+Domäne). Falls verloren: exakt rekonstruierbar aus den System-Prompts einer produzierten
+`areal_chat.jsonl` (so geschehen 2026-07-15).
+
+### Ablage
+
+```
+data/raw/
+├── toolace/toolace.jsonl                                   # 11,300
+├── taskbench/{huggingface,multimedia,dailylifeapis}/       # 7,458 / 5,555 / 4,318 (+ Sidecars; Eval-Regal)
+├── areal/  (per-turn SFT + RL-Tasks + DB-Snapshots)        # 33,531 SFT + 1,982 RL
+│   ├── tau2_tools_blocks.json                              # <tools>-Blöcke für convert_areal.py
+│   └── validation_report.json                              # validate_areal.py-Output (PASS)
+└── agentic_manifest.json                                   # Counts/Pfade/Spalten
+```
+
+### ToolACE-Formatnotiz (für den Converter)
+
+Assistant-Calls sind **Bracket-DSL** (`[Func(arg=…)]`, BFCL/ToolACE-Stil), **kein** OpenAI-`tool_calls`-JSON;
+die Tool-Definitionen stecken als JSON-Array im `system`-String. `convert_toolace.py` hebt beides in das
+einheitliche Chat-Format (Details §2.1).

@@ -1,7 +1,7 @@
 """
 data_pipeline/convert_areal.py
 ==============================
-Convert the AReaL tau2 SFT data (per-turn rows) into the unified db_bahn chat format for the 4-leg mix.
+Convert the AReaL tau2 SFT data (per-turn rows) into the unified db_bahn chat format for the 3-leg mix.
 
 AReaL ships 33,531 per-turn rows: each row = {messages: prior context, answer: the target turn, metadata}.
 ~12 rows of one dialog share a growing context. We REASSEMBLE one full episode per dialog (last row's
@@ -21,6 +21,8 @@ Pipeline per episode:
 
 Runs in the TRAINING container (needs the Qwen3-4B tokenizer for the exact trim). Reads the tool schemas
 from data/raw/areal/tau2_tools_blocks.json (pre-dumped from the tau2 package, which lives only in .venv-tau2).
+If that file is lost (data/raw is gitignored), reconstruct it exactly from a produced areal_chat.jsonl:
+one <tools>…</tools> block per domain sits verbatim in each record's system prompt (done 2026-07-15).
 
 Usage (training container):
     python3 data_pipeline/convert_areal.py --max-seq-len 12288 \
@@ -30,14 +32,12 @@ Usage (training container):
 import argparse
 import json
 from collections import defaultdict
-from pathlib import Path
 
 from transformers import AutoTokenizer
 
-TOOLS_SUFFIX = (
-    "\n\n# Tools\n\nYou are provided with function signatures within <tools></tools> XML tags:\n"
-    "<tools>\n{tools_block}\n</tools>"
-)
+from data_pipeline.common import STUDENT_MODEL_DEFAULT, TOOLS_BLOCK_TMPL, args_dict, write_jsonl
+
+TOOLS_SUFFIX = "\n\n" + TOOLS_BLOCK_TMPL
 
 
 def domain_of(dialog_id: str) -> str:
@@ -50,16 +50,10 @@ def norm_tool_calls(tcs, ctr):
     out, ids = [], []
     for tc in tcs or []:
         fn = tc.get("function", tc)
-        args = fn.get("arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except json.JSONDecodeError:
-                args = {}
         cid = f"call_{ctr[0]}"
         ctr[0] += 1
         out.append({"id": cid, "type": "function",
-                    "function": {"name": fn["name"], "arguments": args if isinstance(args, dict) else {}}})
+                    "function": {"name": fn["name"], "arguments": args_dict(fn.get("arguments"))}})
         ids.append(cid)
     return out, ids
 
@@ -85,7 +79,9 @@ def build_messages(rows_last, tools_block):
         elif role == "user":
             msgs.append({"role": "user", "content": m.get("content") or ""})
         elif role == "tool":
-            # attach the next pending tool_call id (parallel calls resolve in order)
+            # attach the next pending tool_call id (parallel calls resolve in order).
+            # call_orphan_* is DELIBERATE: telecom has USER-side tools (status bar, phone checks) whose
+            # observations follow a user turn with no assistant tool_call (~175/2052 episodes).
             tcid = pending_ids.pop(0) if pending_ids else f"call_orphan_{ctr[0]}"
             if not pending_ids and tcid.startswith("call_orphan"):
                 ctr[0] += 1
@@ -132,7 +128,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sft", default="data/raw/areal/tau2_sft_train.jsonl")
     ap.add_argument("--tools", default="data/raw/areal/tau2_tools_blocks.json")
-    ap.add_argument("--model", default="Qwen/Qwen3-4B")
+    ap.add_argument("--model", default=STUDENT_MODEL_DEFAULT)
     ap.add_argument("--max-seq-len", type=int, default=12288)
     ap.add_argument("--out", default="data/generated/areal_chat.jsonl")
     args = ap.parse_args()
@@ -166,10 +162,7 @@ def main():
                     "_meta": {"source": "areal", "domain": dom, "dialog_id": did,
                               "lang": "en", "n_turns": len(kept), "trimmed": trimmed}})
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w") as f:
-        for e in out:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    write_jsonl(out, args.out)
     print(f"AReaL: {len(flags)} dialogs, {len(full_ok)} full-correct -> {len(out)} episodes "
           f"(dropped {stats['dropped_overlength']} overlength, trimmed {stats['trimmed']}) -> {args.out}")
     print("  domains:", {k[4:]: v for k, v in sorted(stats.items()) if k.startswith("dom_")})

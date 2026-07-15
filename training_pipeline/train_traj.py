@@ -10,7 +10,7 @@ trains with a plain HF Trainer + TrajSFTCollator, saves the LoRA adapter (+ toke
 
 Usage (training container):
     python3 training_pipeline/train_traj.py --config config/pipeline_config.yaml \
-        --data data/final/db_traces_chat.jsonl --model Qwen/Qwen3-4B \
+        --data data/final/sft_mix_chat.jsonl --model Qwen/Qwen3-4B \
         --out data/final/checkpoints/db_bahn_traj_lora --epochs 2 --max-seq-len 12288
 """
 
@@ -22,11 +22,11 @@ from collections import Counter
 from pathlib import Path
 
 import torch
-import yaml
 from datasets import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback,
                           TrainingArguments, set_seed)
 
+from data_pipeline.common import STUDENT_MODEL_DEFAULT, load_config
 from training_pipeline.collator_multiturn import TrajSFTCollator, build_masked_labels
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -73,11 +73,11 @@ class MlflowExtraParams(TrainerCallback):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/pipeline_config.yaml")
-    ap.add_argument("--data", default="data/final/db_traces_chat.jsonl")
-    ap.add_argument("--model", default="Qwen/Qwen3-4B")  # dense, text-only, thinking (NOT the MM hybrid 3.5)
+    ap.add_argument("--data", default="data/final/sft_mix_chat.jsonl")  # the 3-leg Stage-1 mix
+    ap.add_argument("--model", default=STUDENT_MODEL_DEFAULT)  # dense, text-only, thinking (NOT the MM hybrid 3.5)
     ap.add_argument("--out", default="data/final/checkpoints/db_bahn_traj_lora")
     ap.add_argument("--epochs", type=float, default=2.0)
-    ap.add_argument("--max-seq-len", type=int, default=12288)  # 4-leg mix: db_bahn<=5.9k, AReaL trimmed@12288
+    ap.add_argument("--max-seq-len", type=int, default=12288)  # 3-leg mix: db_bahn<=5.9k, AReaL trimmed@12288
     ap.add_argument("--val-file", default=None, help="held-out val JSONL -> eval_loss (never in gradient)")
     ap.add_argument("--eval-steps", type=int, default=300)  # overfit-diag only (no early-stop) -> few eval points suffice
     ap.add_argument("--attn", default="flash_attention_2",
@@ -104,7 +104,7 @@ def main():
     report_to = [] if args.no_mlflow else ["mlflow"]
     run_name = args.run_name or f"traj_sft_{Path(args.model).name}_{args.epochs:g}ep"
 
-    config = yaml.safe_load(open(args.config)) if Path(args.config).exists() else {}
+    config = load_config(args.config) if Path(args.config).exists() else {}
     t_cfg = config.get("training", {})
     lora_cfg = t_cfg.get("lora", {})
     seed = config.get("seed", 42)

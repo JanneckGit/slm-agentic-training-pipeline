@@ -10,16 +10,17 @@ Checks (all JSONL processing is streaming — the 874 MB SFT file is never held 
                     (data.agentic.areal.expected, from the HF card), duplicate ids, sizes
   (c) referential : every RL db_path resolves to a file in tau2_rl_database/; every
                     snapshot parses (json/toml)
-  (d) --deep      : the installed tau2 package loads each DB snapshot (WARN-level only —
-                    tau2 models are extra=forbid, so an upstream schema fork rejects
-                    perfectly good raw data; that signals adapter work, not corruption)
 
 Severity model: every check is fail/warn/info. Exit code 1 iff a fail-level check failed.
 Report: <root>/validation_report.json + a `validation` stamp on the AReaL-tau2 entry in
 data/raw/agentic_manifest.json.
 
+2026-07-15 trim: the one-off acquisition extras (--deep tau2 snapshot loading, telecom-extras
+info, metadata/criteria keyset census) were removed after the frozen snapshot passed with
+0 fail / 0 warn — the retained core is what a RE-download would need to re-verify.
+
 Usage:
-    .venv-tau2/bin/python data_pipeline/validate_areal.py --config config/pipeline_config.local.yaml --deep
+    PYTHONPATH=. .venv-tau2/bin/python data_pipeline/validate_areal.py --config config/pipeline_config.yaml
 """
 
 import argparse
@@ -31,7 +32,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
+from data_pipeline.common import load_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,11 +51,6 @@ EXPECTED_DEFAULT = {
     "sft_domains": {"airline": 12842, "retail": 11395, "telecom": 9294},
     "rl_domains": {"airline": 1148, "retail": 563, "telecom": 271},
 }
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
 
 
 def check(name: str, level: str, passed: bool, detail: str) -> dict:
@@ -139,7 +135,6 @@ def validate_sft(path: Path, expected: dict) -> tuple[list[dict], dict]:
     core_missing = rows_correct = rows_with_correct_label = 0
     domain_counts: Counter = Counter()
     underivable_domain = 0
-    meta_keysets: Counter = Counter()
     dialog_turn_seen: set = set()
     dialog_turn_dupes = 0
     dialog_key = turn_key = None
@@ -185,8 +180,7 @@ def validate_sft(path: Path, expected: dict) -> tuple[list[dict], dict]:
         if not (str(content).strip() or str(thinking).strip() or n_calls):
             empty_answers += 1
 
-        # metadata census + core keys + correctness label + domain + (dialog, turn) uniqueness
-        meta_keysets[tuple(sorted(meta.keys()))] += 1
+        # core keys + correctness label + domain + (dialog, turn) uniqueness
         if not SFT_META_CORE.issubset(meta.keys()):
             core_missing += 1
         if "correct" in meta:
@@ -223,13 +217,8 @@ def validate_sft(path: Path, expected: dict) -> tuple[list[dict], dict]:
     if bad_calls:
         results.append(check("sft_tool_calls_flawless", "warn", False,
                              f"{bad_calls} imperfect tool_calls (within the 1% budget, still worth a look)"))
-    # the three domains ship three keyset variants (see _DOMAIN_MARKER_KEYS) — what must
-    # hold everywhere is the shared core, plus a bounded number of variants overall
     results.append(check("sft_metadata_core_keys", "fail", core_missing <= 0.001 * max(n, 1),
                          f"{core_missing}/{n} rows missing a core key {sorted(SFT_META_CORE)} (fail >0.1%)"))
-    results.append(check("sft_metadata_keyset_variants", "warn", len(meta_keysets) <= 4,
-                         f"{len(meta_keysets)} keyset variants (expected 3, one per domain): "
-                         + "; ".join(f"{v}× {list(k)}" for k, v in meta_keysets.most_common(4))))
     correct_rate = rows_correct / max(rows_with_correct_label, 1)
     results.append(check("sft_correct_label", "info", True,
                          f"{rows_with_correct_label}/{n} rows carry a correct-label; correct==1 rate={correct_rate:.3f} "
@@ -260,7 +249,6 @@ def validate_sft(path: Path, expected: dict) -> tuple[list[dict], dict]:
         "answer_tool_call_rate": round(rows_with_calls / max(n, 1), 4),
         "thinking_rate": round(rows_with_thinking / max(n, 1), 4),
         "correct_rate": round(correct_rate, 4),
-        "metadata_key_census": {", ".join(k): v for k, v in meta_keysets.most_common(5)},
     }
     return results, counts
 
@@ -276,9 +264,7 @@ def validate_rl(path: Path, expected: dict) -> tuple[list[dict], dict, set]:
     ids_seen: set = set()
     dupes = 0
     domain_counts: Counter = Counter()
-    criteria_keysets: Counter = Counter()
     scenario_missing = 0
-    telecom_with_extras = telecom_total = 0
     db_paths: set = set()
 
     for line_no, row, err in iter_jsonl(path):
@@ -309,20 +295,13 @@ def validate_rl(path: Path, expected: dict) -> tuple[list[dict], dict, set]:
         crit = row.get("evaluation_criteria")
         if isinstance(crit, str):
             try:
-                crit = json.loads(crit)
+                json.loads(crit)
             except json.JSONDecodeError:
                 criteria_errors += 1
-                crit = None
-        if isinstance(crit, dict):
-            criteria_keysets[tuple(sorted(crit.keys()))] += 1
 
         us = row.get("user_scenario")
         if not (isinstance(us, dict) and us):
             scenario_missing += 1
-        if domain == "telecom":
-            telecom_total += 1
-            if row.get("initial_state") is not None or row.get("ticket") is not None:
-                telecom_with_extras += 1
 
     results.append(check("rl_lines_parse", "fail", not parse_errors,
                          f"{len(parse_errors)} unparseable lines" + (f"; first: {parse_errors[0]}" if parse_errors else "")))
@@ -342,16 +321,10 @@ def validate_rl(path: Path, expected: dict) -> tuple[list[dict], dict, set]:
     split_ok = all(domain_counts.get(d, 0) == exp_domains.get(d) for d in DOMAINS)
     results.append(check("rl_domain_split", "fail", split_ok,
                          f"derived={dict(domain_counts)}, expected={exp_domains}"))
-    dominant = criteria_keysets.most_common(1)[0] if criteria_keysets else (tuple(), 0)
-    results.append(check("rl_eval_criteria_keys", "info", True,
-                         f"dominant evaluation_criteria keyset ({dominant[1]}/{n}): {list(dominant[0])}"))
-    results.append(check("rl_telecom_extras", "info", True,
-                         f"telecom rows with initial_state/ticket: {telecom_with_extras}/{telecom_total}"))
 
     counts = {
         "rl_rows": n,
         "rl_domains": dict(domain_counts),
-        "eval_criteria_key_census": {", ".join(k): v for k, v in criteria_keysets.most_common(5)},
         "distinct_db_paths": len(db_paths),
     }
     return results, counts, db_paths
@@ -413,38 +386,6 @@ def validate_db_refs(db_paths: set, root: Path) -> tuple[list[dict], list[dict]]
 
 
 # ---------------------------------------------------------------------------
-# (d) --deep: can the installed tau2 package host these snapshots?
-# ---------------------------------------------------------------------------
-def deep_check_tau2(root: Path, db_files_report: list[dict]) -> list[dict]:
-    try:
-        from tau2.domains.airline.data_model import FlightDB
-        from tau2.domains.retail.data_model import RetailDB
-        from tau2.domains.telecom.data_model import TelecomDB
-    except ImportError as e:
-        return [check("tau2_deep_load", "warn", False, f"tau2 package not importable: {e}")]
-
-    loaders = [("tau2_airline", FlightDB), ("tau2_retail", RetailDB), ("tau2_telecom", TelecomDB)]
-    n_ok = n_bad = n_unmatched = 0
-    for entry in db_files_report:
-        model = next((m for prefix, m in loaders if entry["file"].startswith(prefix)), None)
-        if model is None:
-            n_unmatched += 1
-            entry["tau2_load"] = "skipped (no domain prefix match)"
-            continue
-        try:
-            model.load(str(root / DB_DIR / entry["file"]))
-            entry["tau2_load"] = "ok"
-            n_ok += 1
-        except Exception as e:  # noqa: BLE001 — extra=forbid rejections are expected-possible
-            entry["tau2_load"] = f"error: {str(e)[:300]}"
-            n_bad += 1
-    # WARN, never fail: a rejection means adapter work for the RL env later, not a bad download
-    return [check("tau2_deep_load", "warn", n_bad == 0,
-                  f"tau2 loads {n_ok} ok, {n_bad} rejected, {n_unmatched} unmatched "
-                  "(rejections = schema fork vs installed tau2 → input for the deferred RL-env decision)")]
-
-
-# ---------------------------------------------------------------------------
 # report + manifest stamp
 # ---------------------------------------------------------------------------
 def size_checks(root: Path) -> list[dict]:
@@ -482,8 +423,6 @@ def main():
     parser = argparse.ArgumentParser(description="Validate the raw AReaL tau2 pull in data/raw/areal/")
     parser.add_argument("--config", default="config/pipeline_config.yaml")
     parser.add_argument("--root", default=None, help="AReaL snapshot dir (default: <raw_dir>/areal)")
-    parser.add_argument("--deep", action="store_true",
-                        help="also try loading every DB snapshot with the installed tau2 package (warn-level)")
     parser.add_argument("--report", default=None, help="report path (default: <root>/validation_report.json)")
     args = parser.parse_args()
 
@@ -517,10 +456,6 @@ def main():
     ref_results, db_files_report = validate_db_refs(db_paths, root)
     results += ref_results
 
-    if args.deep:
-        logger.info("[DEEP] loading snapshots via the installed tau2 package …")
-        results += deep_check_tau2(root, db_files_report)
-
     n_fail = sum(1 for r in results if r["level"] == "fail" and not r["passed"])
     n_warn = sum(1 for r in results if r["level"] == "warn" and not r["passed"])
     passed = n_fail == 0
@@ -529,7 +464,6 @@ def main():
         "dataset_id": dataset_id,
         "root": str(root),
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "deep": args.deep,
         "summary": {"passed": passed, "n_fail": n_fail, "n_warn": n_warn, "n_checks": len(results)},
         "counts": counts,
         "checks": results,

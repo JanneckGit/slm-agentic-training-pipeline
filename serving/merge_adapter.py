@@ -11,7 +11,7 @@ Zwei HARTE Asserts (sys.exit(1)) — geerbt von der Disziplin des früheren merg
   2. SAVE-Guard: das Gewicht wird aus dem GESPEICHERTEN Artefakt zurückgelesen und gegen den gemergten
      In-Memory-Wert geprüft (der Welle-1-Crash war genau ein Save-/Config-Bug).
 
-Usage:
+Usage (im Training-Container ist PYTHONPATH=/app gebacken; auf dem Host PYTHONPATH=. voranstellen):
     python3 serving/merge_adapter.py \
         --adapter-path data/final/checkpoints/db_bahn_traj_lora/ep2 \
         --output-path data/final/checkpoints/db_bahn_traj_merged/ep2 \
@@ -24,7 +24,7 @@ import logging
 import sys
 from pathlib import Path
 
-import yaml
+from data_pipeline.common import load_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,8 +49,7 @@ def main():
         logger.info(f"Base model aus adapter_config: {base_model_id}")
     else:
         # Fallback auf pipeline_config
-        with open(args.config) as f:
-            config = yaml.safe_load(f)
+        config = load_config(args.config)
         base_model_id = config["student"].get("model_path") or config["student"]["model_id"]
         logger.info(f"Base model aus pipeline_config: {base_model_id}")
 

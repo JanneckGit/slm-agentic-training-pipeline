@@ -17,7 +17,7 @@ stripped from the running context (loop hygiene, base lesson); `<plan>` stays (V
 
 Runs in the tau2 venv (needs the domain + verifier):
     PYTHONPATH=. <tau2-venv>/bin/python sdg_pipeline/db_bahn/rollout.py \
-        --config config/pipeline_config.local.yaml --split bakeoff_dev --k 3
+        --config config/pipeline_config.yaml --split bakeoff_dev --k 3
 
 CPU smoke without any GPU/teacher:  --dry-run  (scripted oracle exercises the FULL loop incl. parser)
 and --dry-run-broken (hallucinating oracle; must score 0.0).
@@ -33,7 +33,6 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import yaml
 
 try:  # soft dep: eval-metric tracking is opt-in (--mlflow); absence must never break a rollout
     import mlflow
@@ -42,6 +41,7 @@ except ImportError:
 
 from sdg_pipeline.db_bahn.tau2_domain import get_environment
 from sdg_pipeline.db_bahn.tau2_domain.environment import DATA_DIR
+from data_pipeline.common import TOOLS_BLOCK_TMPL, load_config
 from evaluation.trajectory_reward import score_trajectory
 
 TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -49,18 +49,10 @@ TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 #   <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>
 FUNC_XML_RE = re.compile(r"<function=([\w-]+)>(.*?)</function>", re.DOTALL)
 PARAM_XML_RE = re.compile(r"<parameter=([\w-]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
-THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 ZUG_RE = re.compile(r"\b(?:ICE|IC|EC|ECE|RJ|EN)\s\d+\b")
 MAX_TOOL_CONTENT = 4000
 
-SYSTEM_TEMPLATE = """{policy}
-
-# Tools
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{tools_block}
-</tools>
+SYSTEM_TEMPLATE = "{policy}\n\n" + TOOLS_BLOCK_TMPL + """
 
 ## Arbeitsweise (wichtig)
 
@@ -73,11 +65,6 @@ You are provided with function signatures within <tools></tools> XML tags:
 - Nach jedem Werkzeug-Ergebnis: kurz prüfen, ob der Plan noch passt; bei Überraschungen umplanen.
 - Wenn die Aufgabe gelöst ist: KEIN Tool-Aufruf mehr, sondern eine kurze deutsche Schlussantwort mit den
   belegten Fakten (nur Werte, die ein Werkzeug geliefert hat)."""
-
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def resolve_teacher(config: dict, api_base=None, model=None) -> dict:
@@ -252,15 +239,34 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
                     {"role": "user", "content": task["ticket"]}]
     else:
         messages = [dict(m) for m in resume_messages]  # continue from the verified prefix
-        for m in messages:  # reconstruct env state: replay the prefix's tool calls (order-faithful)
+        # reconstruct env state: replay the prefix's tool calls (order-faithful)
+        obs_by_id = {m.get("tool_call_id"): (m.get("content") or "")
+                     for m in messages if m.get("role") == "tool"}
+        for m in messages:
             if m.get("role") != "assistant":
                 continue
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function", {})
+                raw = fn.get("arguments")
+                if isinstance(raw, dict):
+                    args = raw
+                else:
+                    try:
+                        args = json.loads(raw or "{}")
+                    except json.JSONDecodeError:
+                        continue  # the original call errored on parse too (no mutation) -> skip
+                if not isinstance(args, dict):
+                    continue
                 try:
-                    env.use_tool(fn.get("name", ""), **json.loads(fn.get("arguments") or "{}"))
-                except Exception:
-                    pass  # a rejected/failed prefix call mutated nothing; re-raise is harmless
+                    env.use_tool(fn.get("name", ""), **args)
+                except Exception as e:
+                    # a call the ORIGINAL rollout also failed mutated nothing -> harmless. But if
+                    # the recorded observation (matched by tool_call_id) was a success, the replay
+                    # diverged -> the branch would continue on a WRONG env state; surface it.
+                    orig_obs = obs_by_id.get(tc.get("id"), "")
+                    if not orig_obs.startswith('{"error"'):
+                        print(f"warning: prefix replay diverged on {fn.get('name', '')} for task "
+                              f"{task.get('id')}: {type(e).__name__}: {e}")
     t0 = time.time()
     finish = "max_turns"
     for _ in range(max_turns):
@@ -608,7 +614,7 @@ def main():
           f"({stats['emergent_rec'] / v:.1%}), scripted {stats['scripted_rec']}/{stats['verified']} "
           f"({stats['scripted_rec'] / v:.1%})")
 
-    # MLflow summary tracking (opt-in --mlflow; mirrors evaluation/evaluate.py's soft pattern — never
+    # MLflow summary tracking (opt-in --mlflow; soft pattern — never
     # breaks the run). File-based logs/JSONL stay the source of truth; this is the cross-run dashboard.
     if args.mlflow:
         if mlflow is None:

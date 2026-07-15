@@ -6,11 +6,12 @@
 # proven on sm_121 with a dense Qwen3-4B; ~404 tok/s, no OOM). It exists so the stack
 # is reproducible and NOT hostage to one running container.
 #
-# STATUS: documentation / reproduction recipe. NOT built yet. Build when the running
-#         `grpo_gate` container is gone or a clean image is needed:
+# STATUS: documentation / reproduction recipe. The validated stack is ALREADY frozen as
+#         image text2sql-grpo:verl (via `docker commit grpo_gate`) — prefer that image
+#         (nightly vLLM rolls). Rebuild from scratch only if the frozen image is lost:
 #           docker build -f docker/Dockerfile.grpo -t text2sql-grpo:verl .
 #
-# WHY a separate image (isolation doctrine, like /opt/guidellm, /opt/llmcompressor):
+# WHY a separate image (isolation doctrine, like /opt/llmcompressor):
 #   verl pulls vLLM-0.23-nightly + torch 2.11.0+cu130, which REPLACE the pinned SFT
 #   stack (peft 0.13.2 --no-deps / transformers 5.6.2 / torch 2.10nv). Keep it OUT of
 #   the SFT/training image.
@@ -27,7 +28,7 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 ENV PYTHONUNBUFFERED=1 HF_HOME=/data/hf_cache
 WORKDIR /app
-# PYTHONPATH so verl can import evaluation/reward.py by path (frozen image has no editable install)
+# PYTHONPATH so verl can import the reward fn by path (frozen image has no editable install)
 ENV PYTHONPATH=/app
 
 # 1) uv (the nightly vLLM index is not pip --extra-index-url friendly)
@@ -88,7 +89,7 @@ print("verl", verl.__version__, "| vllm", vllm.__version__, "| torch", torch.__v
       "| transformers", transformers.__version__, "| ray", ray.__version__, "| torchao", torchao.__version__)
 PY
 
-# Pilot infra (reward + data builders) lives in the mounted repo (/app); reward is
+# The runner + reward fn live in the mounted repo (/app); the reward is
 # fed to verl as reward.custom_reward_function (see the experiments doc for the
 # load-bearing run config: model_dtype=bfloat16, attn_implementation=sdpa,
 # rollout TP=1, mode=async, ref-skip; GB10 WEDGE FIX = VLLM_USE_FLASHINFER_SAMPLER=0 (FlashInfer

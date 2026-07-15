@@ -1,61 +1,29 @@
 # =============================================================================
-# Agentic SLM Training Pipeline – Central Configuration
+# Agentic SLM Training Pipeline – Central Configuration (the ONLY config file)
 # =============================================================================
-# Copy this file to pipeline_config.local.yaml and fill in your secrets.
-# pipeline_config.local.yaml is gitignored – never commit secrets.
+# No secrets needed: the teacher is a local vLLM server (dummy key). The old
+# gitignored pipeline_config.local.yaml override was abolished 2026-07-15.
+#
+# 2026-07-15 cleanup: this file now contains ONLY keys that a script actually
+# reads (verified by grep). Run-specific hyperparameters live as CLI flags in
+# the ops/ scripts (the source of truth for how runs were launched).
 # =============================================================================
 
-# Global pipeline seed – shared by world-state seeding, task-gen, rollouts and traj_sft.
+# Global pipeline seed – world-state seeding, task-gen, rollouts and traj_sft (train_traj reads it).
 seed: 42
 
 # -----------------------------------------------------------------------------
-# TEACHER MODEL (for SDG / synthetic data generation)
+# TEACHER MODEL — served locally via the vllm compose service.
+# (rollout.py reads teacher.vllm_local; other backends were removed 2026-07-15 —
+#  no script read them. Serving flags per model: ops/teacher_bakeoff.sh +
+#  docs/teacher-bakeoff.md.)
 # -----------------------------------------------------------------------------
 teacher:
-  # Which backend to use: "anthropic" | "openai" | "vllm_local" | "ollama_local"
-  backend: "azure"
-
-  # Azure openAI
-  azure:
-    api_key: ""
-    api_base: ""
-    model: "gpt-4.1"
-    deployment_name: "gpt-4.1"
-    max_tokens: 2048
-    temperature: 0.7
-
-  # OpenAI-compatible API – standard OpenAI or generic custom endpoint
-  openai:
-    api_key: "YOUR_API_KEY"
-    model: "gpt-4o"
-    api_base: "https://YOUR_ENDPOINT/v1"     # include /v1
-    max_tokens: 2048
-    temperature: 0.7
-
-  # Anthropic Claude API (used when backend: anthropic)
-  anthropic:
-    api_key: "YOUR_ANTHROPIC_API_KEY"        # <-- fill in
-    model: "claude-sonnet-4-20250514"
-    max_tokens: 2048
-    temperature: 0.7
-
-  # Local vLLM server (used when backend: vllm_local)
-  # Start with: docker compose up vllm
   vllm_local:
     api_base: "http://localhost:8000/v1"
     api_key: "token-local"                   # vLLM needs any non-empty key
-    model: "Qwen/Qwen3.6-35B-A3B"            # SDG trace-distill teacher; must match vLLM --served-model-name
-    max_tokens: 2048
-    temperature: 0.7
-
-  # Ollama local (used when backend: ollama_local)
-  # Start with: ollama run llama3.1:70b
-  ollama_local:
-    api_base: "http://localhost:11434/v1"
-    api_key: "ollama"
-    model: "llama3.1:70b"
-    max_tokens: 2048
-    temperature: 0.7
+    model: "Qwen/Qwen3.6-35B-A3B"            # bake-off winner (92% yield, ~16s/rollout); must match --served-model-name
+    max_tokens: 2048                         # fallback only — trajectory.max_tokens_per_turn wins
 
 # -----------------------------------------------------------------------------
 # STUDENT MODEL (the SLM to be finetuned)
@@ -71,25 +39,19 @@ student:
 # DATA PATHS
 # -----------------------------------------------------------------------------
 data:
-  raw_dir: "./data/raw"
-  generated_dir: "./data/generated"
-  final_dir: "./data/final"
+  raw_dir: "./data/raw"    # generated/final paths live as argparse defaults in the pipeline scripts
 
   # ---------------------------------------------------------------------------
-  # AGENTIC SFT data basis (Stage-1 mix) — public tool-calling / planning sets.
-  # Fetched by data_pipeline/prepare_agentic_data.py into data/raw/{toolace,taskbench}/.
-  # Both are public (not gated) — no HF token needed. Script has built-in defaults,
-  # so this block is optional / for documentation + overrides.
+  # AGENTIC SFT data basis (Stage-1 mix) — public tool-calling sets.
+  # Fetched by data_pipeline/prepare_agentic_data.py into data/raw/{toolace,areal}/.
+  # Public (not gated) — no HF token needed. Script has built-in defaults, so this
+  # block is optional / for documentation + overrides.
+  # (TaskBench was acquired once but deliberately dropped from the mix.)
   # ---------------------------------------------------------------------------
   agentic:
     toolace:                                    # tool-call basics
       dataset: "Team-ACE/ToolACE"               # Apache-2.0
       split: "train"                            # 11,300 ShareGPT rows
-    taskbench:                                  # planning / decomposition (tool-graph)
-      dataset: "microsoft/Taskbench"            # MIT
-      split: "test"                             # TaskBench ships data under `test`
-      configs: ["huggingface", "multimedia", "dailylifeapis"]   # 7458 / 5555 / 4318
-      sidecars: ["tool_desc.json", "graph_desc.json"]           # tool inventory + dep-graph
     areal:                                      # tau2-bench flows (AReaL) — per-turn SFT + RL tasks
       dataset: "inclusionAI/AReaL-tau2-data"    # Apache-2.0, public
       expected:                                 # from HF card 2026-07-08 — validate_areal.py hard-fails on mismatch
@@ -99,12 +61,13 @@ data:
         rl_domains:  {airline: 1148,  retail: 563,   telecom: 271}
 
 # -----------------------------------------------------------------------------
-# TRAINING (Training Hub)
+# TRAINING (traj_sft — Stage 1). train_traj.py reads training.lora.* plus the four
+# hyperparameters below as CLI fallbacks. The ACTUAL run recipe (epochs 2, micro 8,
+# --max-seq-len 12288, FA2 + Liger + NEFTune) is launched by ops/traj_sft_pipeline.sh;
+# rationale: docs/SFT-Training-Uebersicht.md.
 # -----------------------------------------------------------------------------
 training:
-  algorithm: "lora_sft"      # Options: "lora_sft" | "sft" | "osft"
-
-  # LoRA hyperparameters (used for lora_sft)
+  # LoRA hyperparameters
   lora:
     # lora rank controls how "deep" the training is --> how many weights optimized per matrix
     # higher: learns more complex patterns. r=32/alpha=64 (ratio 2 kept): more capacity for the broad
@@ -120,122 +83,36 @@ training:
       - "gate_proj"
       - "up_proj"
       - "down_proj"
-    load_in_4bit: false       # Set true to use QLoRA (saves VRAM)
 
-  # Training hyperparameters
-  num_epochs: 3
   learning_rate: 2.0e-4
   micro_batch_size: 8            # traj_sft @ 12288: fits with Liger fused CE (--liger; without it micro 8 OOMs 55G)
-  gradient_accumulation_steps: 2   # -> effective batch 16 (micro 8 x accum 2); Liger smoke-validated no-OOM @12k
-  max_seq_len: 2048             # (traj_sft reads --max-seq-len 12288 from CLI; this is the text2sql default)
-  warmup_ratio: 0.03 # tbd: warmup_ratio is deprecated and will be removed in v5.2. Use `warmup_steps` instead.
+  gradient_accumulation_steps: 2 # -> effective batch 16 (micro 8 x accum 2); Liger smoke-validated no-OOM @12k
   lr_scheduler: "cosine"
 
-  # Checkpointing
-  save_steps: 200
-  eval_steps: 200
-  logging_steps: 10
-
-  # Output
-  checkpoint_dir: "./data/final/checkpoints"
+# -----------------------------------------------------------------------------
+# GRPO (Stage 2) — REMOVED 2026-07-15: the SQL-era verl runner + its config were
+# deleted; the agentic rebuild (reward = evaluation/trajectory_reward.py:compute_score,
+# data = rl_train split + AReaL RL tasks) will define fresh keys here.
+# Validated GB10/verl recipe + all load-bearing flags (load_format=auto, FlashInfer
+# sampler off, rep-pen source patch): docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md
+# Frozen stack: image text2sql-grpo:verl (+ docker/Dockerfile.grpo as rebuild recipe).
+# -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# GRPO (RLVR / LoRA) — verl backend, async server-mode on GB10/sm_121.
-# STAGE-2 TEMPLATE: structurally the verl recipe for agentic GRPO; VALUES still SQL-wired
-# (base_model/train_files point at old text2sql artifacts) — re-wire to db_bahn + trajectory_reward.
-# Run via training_pipeline/grpo_verl_runner.py (in the grpo container; Dockerfile.grpo).
-# Load-bearing recipe + metric mapping: docs/experiments-verl_RL_lora-grpo.md.
-# -----------------------------------------------------------------------------
-grpo:
-  # merged bf16 4B-SFT-thinking base, SHARDED (Stage A merge). verl's rollout loads
-  # this merged base FROM DISK (load_format=auto) and the LoRA syncs on top; the FSDP
-  # actor also loads this checkpoint. (load_format=dummy = random rollout weights = the bug.)
-  base_model: "data/final/checkpoints/qwen34b_student_thinking_merged_sharded"
-  train_files: "data/final/grpo/weak_prompts_reachable.jsonl"   # from reachability (Stage F)
-  val_files:   "data/final/weak_test_clean.jsonl"               # held-out -> val-core/sql_exec/acc/mean@1
-  reward_tokenizer: "Qwen/Qwen3-4B"        # reward.py think-token count (env REWARD_TOKENIZER)
-  sft_data_snapshot: "data/final/checkpoints/t-qwen3635ba3b-bf16_s-qwen314b_sdg750_2ep_seed42_20260618_0053_thinking/data_snapshot"  # build_weak_pool leakage guard: SFT train/eval questions to exclude (hard-fail if missing)
-
-  num_generations: 8             # GRPO group size; do NOT raise (long thinking traces dominate cost)
-  temperature: 1.0
-  top_p: 0.95                    # loop-fix (Pilot-Prep [A]): Qwen3 default (verl default 1.0) — REACHES the verl rollout sampler
-  top_k: 20                      # loop-fix: Qwen3 default (verl default -1) — REACHES the verl rollout sampler
-  repetition_penalty: 1.1        # loop-fix: REACHES the rollout via the rep-pen SOURCE PATCH (stock verl hard-codes 1.0; see docker/Dockerfile.grpo). The terminating lever (standalone-proven).
-  learning_rate: 1.0e-6
-  kl_beta: 0                     # -> actor.use_kl_loss=False + algorithm.use_kl_in_reward=False
-  max_prompt_length: 512         # weak-candidate prompts: p99~392 tok, max~465 tok
-  max_completion_length: 2048    # cap-2048 detox re-measure: half of 4096 -> faster eager step + bounds any verl loop tail (reachability max ~953 tok, so 2048 still ample). max_model_len = 512+2048 = 2560
-  reward_timeout_s: 3
-  row_cap: 100000
-  gpu_memory_utilization: 0.45   # 4B is small; ample headroom beside the FSDP actor
-  enforce_eager: false           # cudagraph ON (verl default FULL_AND_PIECEWISE). The GB10 wedge was NOT a cudagraph bug — enforce_eager was a RED HERRING (the rollout wedged at mns=32 *despite* eager). Real cause = the FlashInfer top-k/top-p sampler race (vLLM #43885), fixed by VLLM_USE_FLASHINFER_SAMPLER=0 (set in docker-compose grpo env + the runner). Verified 2026-06-30: cudagraph ON + sampler off + mns=32 ran 3 verl steps wedge-free, ~10 min/step (vs mns=16/eager ~13).
-  rollout_max_num_seqs: 32       # back to 32. mns is only a wedge-FREQUENCY lever (less concurrency = fewer/narrower FlashInfer-sampler CTA groups = rarer race), NOT a fix. With VLLM_USE_FLASHINFER_SAMPLER=0 the race is eliminated, so 32 is safe (verified wedge-free at mns=32, 2026-06-30).
-  rollout_max_num_batched_tokens: 4096   # verl default 8192
-  load_format: auto              # ROOT-CAUSE FIX: rollout vLLM loads the real merged base from disk (dummy=random weights=garbage rollouts); LoRA syncs on top via add_lora. HYBRID keeps dummy by default (vllm_async_server.py:138) -> must force auto.
-  lora_rank: 16
-  lora_alpha: 32
-  train_batch_size: 32           # prompts per step (real pilot)
-  total_epochs: 2                # pilot: 2 epochs over 831 reachable (~52 steps @ batch 32) -> reward lift visible, ~6-7 h, overnight-feasible
-  save_freq: 5                   # checkpoint every 5 steps (default): per-step (save_freq=1) is overkill + bloats disk (50 ckpts x ~8.6GB = 430GB). Recovery backstop only — with VLLM_USE_FLASHINFER_SAMPLER=0 the sampler-race wedge is fixed (see enforce_eager note); a residual wedge/crash costs <=5 steps (verl auto-resume; val-resume-skip patch avoids re-val).
-  test_freq: 13                  # validate held-out (240) ~2x/epoch (~4 pts + step-0 baseline = a curve); test_freq=1 = the runner default = val EVERY step = ~5h val + 2x wedge-exposure (held-out EX moves over the epoch, not the step)
-
-  # MLflow: same store as SFT/eval runs; new experiment beside sft_distill.
-  mlflow_tracking_uri: "file:///app/mlruns"
-  mlflow_experiment: "grpo_distill"          # -> verl trainer.project_name
-  run_name_prefix: "grpo_qwen3_4b_thinking"  # -> trainer.experiment_name (runner appends date)
-
-  # --- end-to-end SMOKE overrides (runner --smoke) -----------------------------
-  # RAW weak_candidates (NOT reachability-filtered): the smoke proves pipeline MECHANICS,
-  # NOT the health of the real (filtered + 50%-biased) training signal. Do not over-read.
-  smoke:
-    # Tiny end-to-end verify run (runner --smoke). REPURPOSED (Pilot-Prep [A]+[B]) to PROVE the loop-fix
-    # in verl's OWN rollout sampler: 16 hard window/set-ops prompts (the ones that looped) at top_p/top_k
-    # control, cap 4096 -> check response_length << cap + clip_ratio << 1 + no 3-gram loop. (The earlier
-    # smoke already proved pipeline MECHANICS end-to-end at cap 2048/8192: data->rollout->reward(dict)->
-    # metrics->console+mlflow, weight-sync timing_s/update_weights, no OOM 16.95GB — see experiments doc.)
-    train_files: "data/final/grpo/_verify_hard16.jsonl"   # 8 set-ops (smoke-looped) + 8 window, hardest
-    n_prompts: 16
-    train_batch_size: 16         # 16 / 16 = 1 step per epoch
-    total_epochs: 1              # cap-2048 detox: exactly ONE complete step (measure a clean step's time), NOT sustained
-    max_completion_length: 2048  # cap-2048 detox: bounds the loop tail at 2048 + halves worst-case gen; clip_ratio reveals clean-vs-loop
-    val_before_train: false      # focus the gate on the TRAIN rollout sampler (the loop path); skip slow greedy val
-    save_freq: -1                # throwaway verify -> no checkpoint
-    test_freq: 1000
-    n_val: 2
-
-# -----------------------------------------------------------------------------
-# DB_BAHN — grounded synthetic DB tool-calling traces (Stage-1 leg 3, Plan B)
-# World-state seeded from gtfs.de de_fv (CC-BY-4.0) + sha256-seeded synthetic tables.
+# DB_BAHN — grounded synthetic DB tool-calling traces (Stage-1 leg 3).
+# World-state seeded from gtfs.de de_fv (CC-BY-4.0) + sha256-seeded synthetic tables;
+# frozen sim-clock 2026-06-29, fault-rate 0.35 — all passed as CLI args to
+# seed_worldstate.py / gen_tasks.py (documentation only, no script reads a db_bahn block).
 # Domain code: sdg_pipeline/db_bahn/ (tau2 runtime-registration; needs the Py3.12 tau2 venv).
 # Docs: docs/agentic-sft-db-synthesis.md · docs/agentic-db-synthesis-log.md
 # -----------------------------------------------------------------------------
-db_bahn:  # NOTE: documentation-only — seed_worldstate.py/gen_tasks.py take these as CLI args
-  seed_source: "data/raw/db_sandbox"     # gtfs zip + db.json + tasks/splits/answer_keys (gitignored)
-  seed: 42
-  sim_date: "2026-06-29"                 # frozen sim-clock (inside the de_fv 7-day window)
-  fault_injection_rate: 0.35             # share of injectable tasks seeded into a surprising state
 
-# Rollout / synthesis knobs (sdg_pipeline/db_bahn/rollout.py + the teacher bake-off)
+# Rollout / synthesis knobs (rollout.py reads exactly these three; everything else —
+# concurrency, max-turns, k, timeouts, branch-on-fail — is CLI, see ops/gen_traces.sh).
 trajectory:
-  concurrency: 4                         # GB10 vLLM guidance: small batch (--max-num-seqs 4)
-  k_bakeoff: 3                           # rollouts per task on the 25-task comparison set
-  max_turns: 10
-  max_regen: 1                           # re-sample a failed rollout once before keeping the 0-score
-  rollout_timeout_s: 300
   max_tokens_per_turn: 1536              # per-turn cap; lowered from 2048 so 11-tool system prompt
                                          # (~3.8k tok) + multi-turn fits max_model_len 12288 (2026-07-09)
   temperature: 0.7
   enable_thinking: false                 # concise <plan> instead of raw <think> (loop hygiene)
-  min_turns_keep: 5                      # SFT keep-filter (OpenThoughts >=5-turn lever)
-  target_verified: 400                   # pilot yield budget (achieved: 446 verified @ 92%)
-  # Bake-off candidates (results: docs/teacher-bakeoff.md; winner marked). serve = extra vLLM flags.
-  teacher_candidates:
-    - {name: "Qwen/Qwen3.6-35B-A3B",                 quant: "bf16",  maxtok: 2048, serve: "--gdn-prefill-backend triton"}  # WINNER: 92% yield, 16s/rollout
-    - {name: "Qwen/Qwen3.6-27B",                     quant: "bf16",  maxtok: 2048, serve: "--gdn-prefill-backend triton"}  # 92%, dense control
-    - {name: "Qwen/Qwen3-30B-A3B-Thinking-2507",     quant: "bf16",  maxtok: 3072, serve: ""}                              # 92% (bare-JSON calls)
-    - {name: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-NVFP4", quant: "nvfp4", maxtok: 2048, serve: "--trust-remote-code"} # 92%, slow (189s)
-    - {name: "ByteDance-Seed/Seed-OSS-36B-Instruct", quant: "bf16",  maxtok: 3072, serve: ""}                              # 83%, strong replan, slow
-    - {name: "Qwen/Qwen3-Next-80B-A3B-Thinking-FP8", quant: "fp8",   maxtok: 3072, serve: "--gdn-prefill-backend triton"}  # 75%
-    - {name: "zai-org/GLM-4.5-Air-FP8",              quant: "fp8",   maxtok: 1024, serve: "--max-num-seqs 2"}              # 58% (6144 ctx tight)
-    - {name: "mistralai/Magistral-Small-2509",       quant: "bf16",  maxtok: 2048, serve: "--tokenizer-mode mistral --config-format mistral --load-format mistral"}  # 33%
-
+  # Teacher bake-off: candidates + serving flags live in ops/teacher_bakeoff.sh (the
+  # single source of truth); results: docs/teacher-bakeoff.md.

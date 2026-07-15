@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slm-finetuning"
+name = "slm-agentic-training-pipeline"
 version = "0.0.0"
-description = "Text-to-SQL SLM finetuning pipeline (SDG -> SFT -> eval -> GRPO)"
+description = "Agentic SLM orchestrator pipeline (grounded SDG -> verified traces -> SFT -> GRPO)"
 requires-python = ">=3.10"
 
 # Intentionally NO dependencies here: the container images pin the full

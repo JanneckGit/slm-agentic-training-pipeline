@@ -2,7 +2,7 @@
 evaluation/trajectory_reward.py
 ===============================
 Deterministic trajectory verifier for the `db_bahn` grounded-synthesis pipeline (Plan B, Phase 4).
-Mirrors evaluation/reward.py's contract: never raises, returns a dict whose "score" is the binary
+verl-compatible contract: never raises, returns a dict whose "score" is the binary
 reward and whose other keys are free aux metrics (verl-compatible shape for Stage-2).
 
 Scoring (all deterministic — the P0-1/P0-2 fixes; do NOT trust tau2's read-only reward alone):
@@ -30,6 +30,9 @@ role:"tool" turns. Requires the tau2 venv (imports the db_bahn domain). Self-tes
 
 import json
 import re
+import sys
+
+from data_pipeline.common import args_dict, final_answer
 
 DEFAULT_MAX_REPLAY_CALLS = 64
 
@@ -52,24 +55,15 @@ def _tool_calls_of(msg: dict) -> list[dict]:
     return msg.get("tool_calls") or []
 
 
-def _parse_args(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    try:
-        return json.loads(raw or "{}")
-    except Exception:
-        return {}
-
-
 def _assistant_text(messages: list[dict]) -> str:
     return "\n".join(m.get("content") or "" for m in messages if m.get("role") == "assistant")
 
 
 def _final_answer(messages: list[dict]) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "assistant" and (m.get("content") or "").strip() and not _tool_calls_of(m):
-            return m["content"]
-    for m in reversed(messages):
+    ans = final_answer(messages)
+    if ans:
+        return ans
+    for m in reversed(messages):  # fallback (verifier-only): last assistant turn even WITH tool_calls
         if m.get("role") == "assistant" and (m.get("content") or "").strip():
             return m["content"]
     return ""
@@ -156,7 +150,7 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
                 if n_calls >= max_replay_calls:
                     break
                 fn = tc.get("function", {})
-                name, args = fn.get("name", ""), _parse_args(fn.get("arguments"))
+                name, args = fn.get("name", ""), args_dict(fn.get("arguments"))
                 n_calls += 1
                 called.append(name)
                 try:
@@ -172,8 +166,8 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         # --- deterministic DB-state component ----------------------------------------------
         gold_env = fresh(apply_init=True)
         for a in (crit.get("actions") or []):
-            a = a if isinstance(a, dict) else a
             try:
+                a = a if isinstance(a, dict) else a.model_dump()
                 gold_env.use_tool(a["name"], **a["arguments"])
             except Exception as e:  # gold must replay — else the task itself is broken
                 out["error"] = f"gold_replay_failed: {e}"
@@ -221,14 +215,16 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         out["self_recovery"] = 1.0 if (solved and out["n_tool_errors"] >= 1) else 0.0
         return out
     except Exception as e:
+        # contract: never raise — but a verifier bug must not pass as a silent 0.0 either
         out["error"] = f"verifier_exception: {type(e).__name__}: {e}"
+        print(f"[trajectory_reward] WARNING {out['error']}", file=sys.stderr)
         return out
 
 
-# --- verl reward-manager adapter (Stage-2 seam; same dict contract as evaluation/reward.py) --
+# --- verl reward-manager adapter (Stage-2 seam) -----------------------------------------------
 def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_info=None, **kw):
     """Stage-2 GRPO seam: extra_info carries {'task': ..., 'answer_key': ...}; solution_str is the
-    trajectory messages as JSON. Returns dict{score, ...aux} exactly like evaluation/reward.py."""
+    trajectory messages as JSON. Returns dict{score, ...aux} (verl custom_reward_function contract)."""
     extra_info = extra_info or {}
     try:
         messages = json.loads(solution_str) if isinstance(solution_str, str) else (solution_str or [])
