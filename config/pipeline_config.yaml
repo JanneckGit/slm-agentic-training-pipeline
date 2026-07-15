@@ -61,10 +61,11 @@ teacher:
 # STUDENT MODEL (the SLM to be finetuned)
 # -----------------------------------------------------------------------------
 student:
-  # HuggingFace model ID or local path
-  model_id: "Qwen/Qwen3.5-4B"
+  # HuggingFace model ID or local path — dense, text-only, thinking (verl-GRPO-proven on sm_121).
+  # NOT the MM hybrid Qwen3.5-4B: multimodal baggage + linear-attn rollout-kernel risk for Stage-2 GRPO.
+  model_id: "Qwen/Qwen3-4B"
   # Set to a local path if you've already downloaded the model:
-  # model_path: "/data/models/Qwen3.5-4B"
+  # model_path: "/data/models/Qwen3-4B"
 
 # -----------------------------------------------------------------------------
 # DATA PATHS
@@ -106,9 +107,10 @@ training:
   # LoRA hyperparameters (used for lora_sft)
   lora:
     # lora rank controls how "deep" the training is --> how many weights optimized per matrix
-    # higher: learns more complex patterns
-    r: 16
-    alpha: 32
+    # higher: learns more complex patterns. r=32/alpha=64 (ratio 2 kept): more capacity for the broad
+    # agentic task (3 domains + tools + German); still <2% of base. Bumped from 16/32.
+    r: 32
+    alpha: 64
     dropout: 0.05
     target_modules:
       - "q_proj"
@@ -123,9 +125,9 @@ training:
   # Training hyperparameters
   num_epochs: 3
   learning_rate: 2.0e-4
-  micro_batch_size: 8
-  gradient_accumulation_steps: 4
-  max_seq_len: 2048
+  micro_batch_size: 8            # traj_sft @ 12288: fits with Liger fused CE (--liger; without it micro 8 OOMs 55G)
+  gradient_accumulation_steps: 2   # -> effective batch 16 (micro 8 x accum 2); Liger smoke-validated no-OOM @12k
+  max_seq_len: 2048             # (traj_sft reads --max-seq-len 12288 from CLI; this is the text2sql default)
   warmup_ratio: 0.03 # tbd: warmup_ratio is deprecated and will be removed in v5.2. Use `warmup_steps` instead.
   lr_scheduler: "cosine"
 

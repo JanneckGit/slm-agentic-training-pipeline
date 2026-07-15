@@ -69,6 +69,14 @@ RUN pip install --no-deps "git+https://github.com/fla-org/flash-linear-attention
 RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="12.0" \
     pip install --no-deps --no-build-isolation causal-conv1d
 
+# 4c. Liger-Kernel (fused linear cross-entropy) für traj_sft. Der HF-Loss materialisiert
+#     sonst die vollen fp32-Logits [micro_batch x seq x vocab] = bei micro 8 @12k
+#     55 GiB als EIN Tensor -> OOM auf den 119 GiB. Ligers fused CE chunk-t Projektion+CE und
+#     materialisiert diese Logits nie -> micro 8 @12k passt (gemessen: kein OOM, Step-1 227->177s
+#     ggü. micro 4). Aktiviert via TrainingArguments use_liger_kernel=True (--liger). --no-deps:
+#     braucht nur triton (im NGC-Image, 3.5.0) -> pinned torch2.10/transformers5.6.2-Stack bleibt unberührt.
+RUN pip install --no-deps liger-kernel==0.8.0
+
 # 5. GuideLLM (Effizienz-Benchmarking) – ISOLIERTES venv, NICHT die Trainings-Env!
 #    guidellm zieht eigenes torch/transformers/datasets nach. In die Haupt-Env
 #    installiert würde es den fein gepinnten Trainings-Stack zerschießen (peft
