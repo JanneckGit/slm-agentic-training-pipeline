@@ -4,6 +4,92 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
+## 2026-07-15 — ✅ SFT DURCH: 99,6 % auf dem Heldout (ep2 gewinnt) — der Durchbruch nach Welle 1
+
+- **Ergebnis (n=276, alle Pässe identisch: k=1, conc 16):** Base **89,1 %** (246/276) → ep1 **98,6 %** (272) →
+  **ep2 99,6 % (275/276)**. **ep2 ist der Sieger** → `selected`-Symlink. Die alte flache Welle-1-Zahl
+  (72,5 % → 70 %, n=40) ist damit als **Setup-Artefakt** widerlegt, nicht als Methoden-Grenze.
+- **Der Headline-Yield untertreibt massiv.** Das Base löste **18 von 26 Templates schon zu 100 %** — die
+  verwässern den Schnitt. Auf den **8 Templates mit echtem Headroom (91 Tasks): 67 % → 98,9 % (+32 pp)**:
+  | Template | Base | ep1 | ep2 |
+  |---|---|---|---|
+  | `t_info_wartung` | **25 %** | 100 % | 100 % |
+  | `t_action_wstatus_konflikt` | **0 %** | 100 % | 100 % |
+  | `t_info_zug_komplett` | **0 %** | 67 % | **100 %** |
+  | `t_info_zugsuche_status` | **0 %** | 60 % | **100 %** |
+  | `t_action_wartung_batch` | 67 % | 100 % | 100 % |
+  | `t_action_inspektion_bedingt` | 79 % | 100 % | 100 % |
+  **Drei Templates konnte das Base gar nicht (0 %)** — das SFT hat also keine Optimierung geliefert, sondern
+  **fehlende Fähigkeiten beigebracht**. **Null Regressionen**: alle 18 100-%-Templates bleiben bei 100 %.
+- **Verhaltens-Befund:** `replan_rate` bleibt ~0,39 (das injizierte Fault-Replan **überlebt** das Training),
+  aber `emergent_recovery_rate` fällt **0,020 → 0,000** — der Student macht die Fehler nicht mehr, aus denen
+  man sich retten müsste. `avg_turns` 5,95 → 5,93 (gleiche Effizienz, nur korrekter).
+- **ep2-vs-ep1 ist echtes Signal, kein Rauschen:** zwei unabhängige Base-Pässe unterschieden sich um **exakt
+  1 Task** (245 vs 246 / 276) → das Rauschen ist ~0,4 pp, nicht die naiv erwarteten ±2 pp (jeder Task hat sein
+  eigenes p; nur Grenzfälle kippen). ep2s +3-Task-Vorsprung liegt darüber. Und die **eval_loss-Kurve hatte es
+  vorhergesagt** (fiel bis zuletzt 0,178 → 0,171) — zwei unabhängige Signale, dieselbe Antwort.
+- **Trainings-Bilanz:** 2 Epochen in **41,7 h** (`train_runtime` 149.962 s), **752 Traces/h**, 3,50 M Token/h,
+  73,0 M Token/Epoche, `train_loss` 0,193. Kein OOM, kein Abbruch.
+- **Phase-B-Entscheidungen (vor dem Eval eingebaut):**
+  - **Eval-concurrency 4 → 16** (+ `--max-num-seqs 16`): die 4 stammten vom 35B-A3B-Teacher; der 4B-Student
+    braucht bei 16 Seqs nur ~29 GB KV von ~94 GB. **Eval-Zeit ~5 h → 27 min für alle 3 Pässe.** Ohne Einfluss
+    aufs Urteil (Base @4 = 88,8 % vs @16 = 89,1 % → 1 Task).
+  - **`merge_adapter.py` gehärtet:** zwei harte Asserts — (1) Probe-Gewicht muss sich durch den Merge ändern
+    (ein stiller No-Op hätte ep1+ep2 = Base gemacht → beide Evals ~89 % → wir hätten „SFT bringt nichts"
+    gelesen, ein **False Negative das wie ein Ergebnis aussieht**), (2) Probe aus dem **gespeicherten** Shard
+    zurücklesen (der Welle-1-Crash war ein Save-/Config-Bug). Beide grün: max|Δ| 5,13e-03 (ep1) / 5,37e-03 (ep2).
+  - **`serving/merge_adapter_mm.py` gelöscht** — kein „Vision-Merger", sondern ein Qwen3.5-spezifischer
+    Key-Remap für ein abgewähltes Modell, 0 Aufrufer. Das Wertvolle (die Assert-Disziplin) lebt jetzt im
+    generischen Skript weiter.
+  - **Checkpoint-Layout: ein Ordner pro Lauf** — `<out>/{ep1,ep2,selected→ep{W}}` statt vier Geschwister-Ordner.
+    Der Final-Save entfällt bei `--save-epoch-adapters` (war eine byte-identische 263-MB-Dublette von ep2),
+    HF-`output_dir` → `_trainer_scratch/` (der leere `_ckpt` verschwindet aus dem Ergebnis-Verzeichnis).
+  - **MLflow vervollständigt:** `max_seq_len`, Quellen-Mix (`mix_db_bahn/areal/toolace`), `tokens_per_hour`,
+    `hardware` nachgetragen; gen-Runs mit `wave=2.5` getaggt; die 3 **Welle-2-Runs (07-09) gelöscht** — sie
+    lagen ununterscheidbar neben den aktuellen (nur am Datum erkennbar).
+- **Tote Text2SQL-Insel — noch da, Löschung steht aus (Phase C):** `evaluation/{reward,evaluate}.py` ·
+  `tools/` (ganz) · `training_pipeline/{build_weak_pool,reachability_probe}.py` · `data_pipeline/clean_traces.py` ·
+  `ops/grpo_pilot_supervised.sh` · der SQL-verdrahtete `grpo:`-Block in beiden Configs. Alle ohne Aufrufer,
+  ihre Datenpfade existieren nicht mehr. **Bleibt:** `grpo_verl_runner.py` + `Dockerfile.grpo` (Stage-2-Vehikel).
+  Dazu tote Config-Felder, die niemand liest, aber plausibel aussehen: `training.num_epochs: 3` (real 2),
+  `max_seq_len: 2048` (real 12288), `eval_steps`, `save_steps`, `logging_steps`, `algorithm`, `checkpoint_dir`
+  — alle von der CLI überschrieben oder ungenutzt. **Wer `num_epochs: 3` setzt, bekommt trotzdem 2.**
+- **Offen:** Stage-2 GRPO-Rewire (`rl_train` 998 + AReaL-τ² 1.982; verl-Config noch SQL-verdrahtet).
+
+## 2026-07-13/14 — ✅ SFT-Mix (3 Legs) + Trainings-Rezept + frische Baseline 88,8 %
+
+- **Student final: `Qwen/Qwen3-4B`** (dense, text-only, thinking) — **löst das Qwen3.5-4B der Welle 1 ab**
+  (die 72,5 %/70 %-Einträge weiter unten beziehen sich noch darauf; sie waren damals korrekt). Grund:
+  Qwen3.5-4B ist ein **MM-Hybrid** mit 24/32 Linear-Attention-Layern (Gated-DeltaNet) → Multimodal-Ballast +
+  Rollout-Kernel-Risiko für Stage-2-GRPO. Achtung: **andere Tokenizer** (Vokabular 151.669 vs. 248.077) —
+  Token-Längen aber praktisch identisch, die 12k-Entscheidung trägt für beide.
+- **TaskBench aus dem SFT-Mix RAUS → Eval-Regal (aus 4 Legs werden 3):** TaskBench-Zeilen sind
+  *Tool-Graph-Pläne*, keine ausführbaren Multi-Turn-Trajektorien — sie würden eine Planungs-Notation antrainieren,
+  die der Agent zur Serve-Zeit nie emittiert. Rohdaten bleiben liegen (kein Converter), später als Eval nutzbar.
+- **Mix gebaut (`build_sft_mix.py`): 15.687 train + 301 val** — db_bahn **8.964** (59 % der Tokens) /
+  AReaL **2.013** (34 %) / ToolACE **4.710** (6 %); 58 % multi-turn, val pro Quelle stratifiziert (seed 42).
+  Deltas gegen die Roh-Zahlen: AReaL 33.531 Per-Turn-Zeilen → **2.013 reassemblierte Episoden** (nur
+  `correct==1`, Trim @12k am letzten Assistant-Speech-Turn); db_bahn 9.146 → 8.964 (Flail-Drop ~10 + 172 val).
+- **Trainings-Rezept — löst die Welle-1-Werte weiter unten ab** (`max_seq_len 4096`, „28 Steps ~54 min",
+  „6-8k reicht" sind damit Geschichte): LoRA **r=32/α=64** (7 Module) · seq **12288** · micro **8** × accum **2**
+  (eff. 16) · 2 Epochen · **FA2 + Liger (fused CE) + group_by_length + NEFTune α5** · Ckpt-Auswahl ep1-vs-ep2 ·
+  val 301 / eval_steps 300. **Liger ist Pflicht für micro > 4 @12k**: der HF-Loss materialisiert sonst die vollen
+  fp32-Logits [8 × 12288 × 151.669] = **55 GiB als EIN Tensor** → OOM am **LM-Head** (nicht an der Attention).
+- **Speed-Befunde (gemessen, GB10):** micro 16 ist **langsamer** als micro 8 (Padding/Sättigung → verworfen);
+  fp8/torch.compile/Unsloth laufen auf **sm_121 alle nicht** (bf16 = fp8 = mxfp8 ~213 TFLOPS gecappt;
+  TransformerEngine ohne sm_121-Support; torchao bricht den Stack). Der Stack ist softwareseitig ausgereizt.
+  **~46 h für 2 Epochen** — Ursache: die 12k-AReaL-Episoden (**89 s/Step vs. 7,6 s** kurz, Faktor ~12) × GB10-
+  Bandbreite (~273 GB/s, ~12× unter H100). Details: [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
+- **Frische BEFORE-Baseline auf `heldout_eval` (n=276, Qwen3-4B untrainiert): 88,8 % verified yield (245/276).**
+  Löst die alten 72,5 %/70 % (n=40, Welle 1, Qwen3.5-4B) als Referenz ab. Headroom für SFT damit ehrlich ~11 pp —
+  der Gewinn ist eher auf den schweren Tasks / in der Replan-Rate zu erwarten als im Headline-Yield.
+- **⚠️ Vorfall + Fix:** `eval_heldout`s `timeout 1800` (30 min) war auf den **alten 40er-heldout** kalibriert —
+  bei 276 Tasks hätte es **jeden** der 3 Eval-Pässe bei ~20 % abgeschnitten (und `rm -f` = kein Resume) → die
+  Ckpt-Auswahl hätte partielle Subsets verglichen. Fix: **Timeout 21600** (6 h). Vor dem 46-h-Commit lief eine
+  **Mini-Generalprobe** (base serven → Rollout → Mini-Train → Merge → *merged* serven → Rollout) — sie beweist
+  genau den Leg, an dem der Welle-1-Lauf nach 20 h crashte (Qwen3.5-Multimodal-Renderer-Bug in vLLM).
+- **Offen:** Lauf beenden → AFTER-eval beider Epochen → Ckpt-Auswahl → Stage-2 GRPO re-wire.
+
 ## 2026-07-12/13 — ✅ WELLE 2.5: Weltvergrößerung → 10.473er-Pool → 9.146 verifizierte 12-Tool-Traces
 
 - **Decision — Weg B (Welt vergrößern) statt nur n hochdrehen (User-Vorgabe: „wesentlich mehr, Qualität
@@ -41,7 +127,8 @@
   **1.271 organisch** außerhalb des Lookup-Templates (Teacher prüft Personen VOR der Zuweisung). Der
   Über-Such-„Flail" fiel von ~1,5 % auf **0,11 %** (10 Traces). Runtime-Ablehnungs-Demos blieben erhalten
   (209 + 905) — die „verify→avoid killt das Replan-Signal"-Sorge trat nicht ein.
-- **Offen:** 4-Leg-Mix bauen → SFT-Training → Re-Baseline auf heldout_eval (276) → Stage-2 GRPO re-wire.
+- **Offen (Stand damals; erledigt im Eintrag oben):** Mix bauen → SFT-Training → Re-Baseline auf
+  heldout_eval (276) → Stage-2 GRPO re-wire.
 
 ## 2026-07-10 — ✅ Regen 2 (Split-Redesign + 1.601 Traces) + A1-Lookup-Tool (12.)
 

@@ -8,12 +8,16 @@
 
 ## Where this fits — the two-stage training plan
 
-1. **Stage 1 — SFT (LoRA)** — mixed on a **4-leg** basis: **ToolACE + TaskBench + τ²-bench flows (AReaL) +
-   self-synthesized German DB trajectories** (one shuffled pass, the DB leg up-weighted).
+> ⚠️ **This is the ACQUISITION record, not the mix.** The counts below are **pull counts**, not mix
+> contributions, and the built mix has **3 legs, not 4** — **TaskBench is not in it** (eval shelf, see its
+> section). Mix numbers: [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
+
+1. **Stage 1 — SFT (LoRA)** — mixed on a **3-leg** basis: **ToolACE + τ²-bench flows (AReaL) +
+   self-synthesized German DB trajectories** (one shuffled pass, the DB leg dominant by count).
 2. **Stage 2 — RL / GRPO (LoRA)** — on **new, disjoint** τ²-bench + db_bahn tasks (reward = trajectory verifier).
 
-This doc is the **acquisition record for the three public sets** (legs 1–3: ToolACE, TaskBench, AReaL). The
-self-synthesized DB leg (leg 4) has its own docs → [agentic-datasets-explained.md](agentic-datasets-explained.md)
+This doc is the **acquisition record for the public sets** (ToolACE, TaskBench, AReaL — TaskBench pulled but
+shelved). The self-synthesized DB leg has its own docs → [agentic-datasets-explained.md](agentic-datasets-explained.md)
 + [agentic-db-synthesis-log.md](agentic-db-synthesis-log.md). Note: τ²-bench enters as an **SFT leg** (via the
 AReaL per-turn data), **not** RL-only.
 
@@ -22,7 +26,7 @@ AReaL per-turn data), **not** RL-only.
 | Dataset | HF id | License | Rows | Split | On disk | Role in the mix |
 |---|---|---|---:|---|---:|---|
 | **ToolACE** | `Team-ACE/ToolACE` | Apache-2.0 | **11,300** | `train` | ~35 MB | tool-call **basics** |
-| **TaskBench** | `microsoft/Taskbench` | MIT | **17,331** | `test` | ~29 MB | **planning** / decomposition |
+| **TaskBench** | `microsoft/Taskbench` | MIT | **17,331** | `test` | ~29 MB | ~~planning / decomposition~~ → **not in the mix** (eval shelf) |
 | **AReaL (τ²-bench)** | `inclusionAI/AReaL-tau2-data` | Apache-2.0 | **33,531** SFT (+1,982 RL) | — | ~926 MB | **dialogue / policy** (multi-turn) |
 | **— total** | | | **62,162** SFT | | ~990 MB | |
 
@@ -58,7 +62,13 @@ tool:       [{"name": "Market Trends API", "results": {"trends": [{"name": "S&P 
 
 ---
 
-## Leg 2 — TaskBench (planning / decomposition)
+## TaskBench (planning / decomposition) — **pulled, then shelved**
+
+> **Decision 2026-07-13 — dropped from the SFT mix → eval shelf.** Reason: the ⚠️ note at the end of this
+> section turned out to be disqualifying. TaskBench rows are **request → plan/graph**, i.e. a *planning
+> notation* with no assistant/tool **execution** turns. Training on them would teach the agent to emit a
+> notation it never produces at serve time (it emits tool calls). The raw data stays on disk; there is
+> deliberately **no `convert_taskbench.py`**. It remains usable as an *evaluation* set for decomposition.
 
 **3 domain configs** (all pulled), each with its own tool inventory:
 
@@ -142,13 +152,17 @@ data/raw/
 `data/raw/` is **gitignored** — the pulled data is never committed; this doc + the fetch script are the
 committed, shareable artifacts.
 
-## Toward the unified training format (for the next step)
+## The unified training format — **built** (2026-07-13)
 
-The mix step must reconcile all legs into **one chat `messages` format** (system with a tool registry;
-assistant turns with tool calls; `role:"tool"` result turns; multi-turn loss masking on assistant turns):
-- **ToolACE:** convert bracket-DSL calls → the target tool-call format; lift tool defs out of `system`.
-- **TaskBench:** `json.loads` the graph columns; render the plan/graph into the target format (no
-  execution turns to mask).
-- **AReaL (τ²):** per-turn rows → assemble into multi-turn chats; **filter on `metadata.correct==1`**.
-- **db_bahn:** already emitted in the target chat format by `format_traj_for_training.py` (verified traces only).
+All legs are reconciled into **one chat `messages` format** (system with a tool registry; assistant turns with
+tool calls; `role:"tool"` result turns; assistant-only loss masking). What was actually implemented:
+- **ToolACE** → [`convert_toolace.py`](../data_pipeline/convert_toolace.py): bracket-DSL → OpenAI tool-calls;
+  tool defs lifted out of `system` into a `<tools>` block. **4,800 kept** (all multi-call + 500 irrelevance + fill).
+- **TaskBench:** ~~render the plan/graph~~ — **dropped**, see above (no execution turns to learn from).
+- **AReaL (τ²)** → [`convert_areal.py`](../data_pipeline/convert_areal.py): per-turn rows **reassembled into
+  episodes**, `metadata.correct==1` filter (episode-level), tau2 tool schemas injected, trimmed at 12k on the
+  last assistant speech turn. **2,052 episodes**.
+- **db_bahn:** already in the target format via `format_traj_for_training.py` (verified traces only).
+- **The mix** → [`build_sft_mix.py`](../data_pipeline/build_sft_mix.py): flail-drop, stratified per-source val
+  cut, one shuffle. Resulting counts: [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
 - **Mixing:** one shuffled SFT pass (not sequential blocks); **the German DB leg up-weighted**.

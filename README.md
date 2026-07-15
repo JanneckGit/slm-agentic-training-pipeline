@@ -14,41 +14,60 @@
 A full training pipeline for a **4B agent** that drives real German DB tools — *Fahrplan*, *Zugstandort*,
 *Wartung*, *Personal* — planning across several tool calls, recovering from errors and replanning when a
 tool rejects an action. It runs on a single **GB10 (DGX Spark, 128 GB unified memory, sm_121)** with vLLM
-serving and a [τ²-bench](https://github.com/sierra-research/tau2-bench)-based tool sandbox. It is the
-successor of the finished Text-to-SQL pipeline (archived under [docs/text2sql-experiments/](docs/text2sql-experiments/)).
+serving and a [τ²-bench](https://github.com/sierra-research/tau2-bench)-based tool sandbox.
 
 **Two-stage training plan**
 
-1. **Stage 1 — SFT (LoRA)** on a **4-leg data mix**: public tool-calling + planning sets, τ²-bench dialogue
+1. **Stage 1 — SFT (LoRA)** on a **3-leg data mix**: public tool-calling breadth, τ²-bench dialogue
    flows, and — the core of this repo — **self-synthesized, verifier-gated German DB trajectories**.
 2. **Stage 2 — GRPO/verl RL**, reward = the same deterministic trajectory verifier / τ²-bench success.
+   *Status: **template only** — the verl recipe is structurally in place but its config is still SQL-wired
+   from the predecessor; the db_bahn re-wire is pending (see [config/pipeline_config.yaml](config/pipeline_config.yaml) `grpo:`).*
 
-## Architecture — Stage-1 grounded synthesis
+## Architecture — grounded synthesis → SFT mix → student
 
 The core idea: **generate tasks whose correct answer is known by construction**, let a strong teacher solve
-them against the *real* tools, and keep only trajectories a deterministic verifier confirms.
+them against the *real* tools, and keep only trajectories a deterministic verifier confirms. Those verified
+German trajectories are then **mixed** with two public legs before the student sees them.
 
 ```mermaid
 flowchart TD
-    A["gtfs.de timetables, CC-BY-4.0<br/>+ sha256-seeded synthetic tables"] -->|seed_worldstate.py| B["frozen BahnDB world-state<br/>db.json, seed 42"]
-    B --> C["tau2-bench domain 'db_bahn'<br/>12 German tools READ+WRITE, policy.md<br/>runtime-registered — tau2 source untouched"]
-    C -->|gen_tasks.py| D["10473 German tasks, 26 templates<br/>by-construction answer keys<br/>INFO + ACTION, fault-injected replan"]
-    D -->|rollout.py| E["teacher solves vs REAL tools<br/>vLLM, branch-on-fail, k=2 top-up, B2 harvest"]
-    E -->|trajectory_reward.py| F{"deterministic verifier<br/>DB-hash + grounding + anti-hallucination"}
-    F -->|keep score == 1.0| G["9146 verified chat trajectories<br/>format_traj_for_training.py"]
-    G -->|train_traj.py + collator_multiturn.py| H["LoRA student — Qwen3.5-4B<br/>assistant-only loss mask"]
+    subgraph SDG["Grounded synthesis — the core of this repo"]
+        A["gtfs.de timetables, CC-BY-4.0<br/>+ sha256-seeded synthetic tables"] -->|seed_worldstate.py| B["frozen BahnDB world-state<br/>db.json, seed 42"]
+        B --> C["tau2-bench domain 'db_bahn'<br/>12 German tools READ+WRITE, policy.md<br/>runtime-registered — tau2 source untouched"]
+        C -->|gen_tasks.py| D["10,473 German tasks, 26 templates<br/>by-construction answer keys<br/>INFO + ACTION, fault-injected replan"]
+        D -->|rollout.py| E["teacher solves vs REAL tools<br/>vLLM, branch-on-fail, k=2 top-up, B2 harvest"]
+        E -->|trajectory_reward.py| F{"deterministic verifier<br/>DB-hash + grounding + anti-hallucination"}
+        F -->|keep score == 1.0| G["9,146 verified chat trajectories<br/>format_traj_for_training.py"]
+    end
+    T["ToolACE raw 11,300"] -->|convert_toolace.py| MIX
+    R["AReaL τ² raw 33,531 per-turn rows"] -->|"convert_areal.py<br/>episode reassembly, correct==1 filter, trim @12k"| MIX
+    G --> MIX["build_sft_mix.py<br/>flail-drop + stratified val cut"]
+    MIX --> M["sft_mix_chat.jsonl — 15,687 train<br/>sft_mix_val.jsonl — 301 val"]
+    M -->|train_traj.py + collator_multiturn.py| H["Stage 1 — LoRA student Qwen3-4B<br/>assistant-only loss mask"]
+    H -->|merge_adapter.py| S["merged student → vLLM"]
+    S -->|"rollout.py on heldout_eval (276)"| EV["before/after re-baseline"]
+    H -.->|re-wire pending| RL["Stage 2 — GRPO/verl<br/>reward = trajectory_reward.py<br/>rl_train 998 + AReaL τ² 1,982"]
 ```
 
-## The SFT data mix (4 legs)
+## The SFT data mix (3 legs)
 
-| # | Leg | Source | Teaches | Size / status |
-|---|-----|--------|---------|---------------|
-| 1 | ToolACE | [`Team-ACE/ToolACE`](https://huggingface.co/datasets/Team-ACE/ToolACE) | tool-call basics | 11,300 rows |
-| 2 | TaskBench | [`microsoft/Taskbench`](https://huggingface.co/datasets/microsoft/Taskbench) | planning / decomposition (tool-graph) | 17,331 rows |
-| 3 | AReaL (τ²-bench flows) | [`inclusionAI/AReaL-tau2-data`](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data) | multi-turn dialogue / policy adherence | 33,531 SFT (+1,982 RL tasks) |
-| 4 | **db_bahn** ⭐ | self-synthesized (this repo) | verifier-gated German DB trajectories | **9,146 verified** |
+What `build_sft_mix.py` actually assembles into `data/final/sft_mix_chat.jsonl` (≠ the raw pull counts —
+those live in the [acquisition record](docs/agentic-sft-data-basis.md)):
 
-Legs 1–3 are public sets pulled and validated locally; **leg 4 is the heart of this repo** — see below.
+| # | Leg | Source | Teaches | Train | Val | Tokens |
+|---|-----|--------|---------|-------|-----|--------|
+| 1 | **db_bahn** ⭐ | self-synthesized (this repo) | verifier-gated German DB trajectories (≤ 5.9k tok) | **8,964** | 172 | **59 %** |
+| 2 | AReaL (τ²-bench) | [`inclusionAI/AReaL-tau2-data`](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data) | multi-turn dialogue / policy adherence (episodes **up to 12k tok**) | **2,013** | 39 | 34 % |
+| 3 | ToolACE | [`Team-ACE/ToolACE`](https://huggingface.co/datasets/Team-ACE/ToolACE) | tool-call basics + irrelevance (~0.8k tok) | **4,710** | 90 | 6 % |
+| | **Total** | | | **15,687** | **301** | 100 % |
+
+58 % multi-turn (≥ 3 assistant turns); val stratified per source, never in the gradient. The token share is
+what drives the run's wall-clock — see [why it takes 41.7 h](docs/SFT-Training-Uebersicht.md).
+
+**TaskBench is deliberately not a leg** — its rows are plans, not executable trajectories → moved to the eval
+shelf ([why](docs/agentic-sft-data-basis.md)). RL task pools (`rl_train` 998 + AReaL τ² 1,982) are listed in the
+[one-pager](docs/SFT-Training-Uebersicht.md).
 
 ## The db_bahn synthesis core
 
@@ -103,7 +122,7 @@ All `ops/` scripts use `.venv-tau2/` by default (override with `TAU2PY=/path/to/
 **CPU** (host `python3` unless noted `[TAU2PY]`):
 
 ```bash
-# 0) public SFT legs -> data/raw/{toolace,taskbench,areal}/   (areal = ~970 MB snapshot)
+# 0) public legs -> data/raw/{toolace,taskbench,areal}/   (areal = ~970 MB snapshot)
 python3 data_pipeline/prepare_agentic_data.py --config config/pipeline_config.yaml --dataset all
 
 # 0b) validate the AReaL leg (streaming schema/integrity/referential checks -> validation_report.json)
@@ -132,8 +151,23 @@ docker compose -f docker/docker-compose.yml run --rm -T training \
 ```bash
 bash ops/teacher_bakeoff.sh     # compare teacher candidates -> docs/teacher-bakeoff.md
 bash ops/gen_traces.sh          # serve winner -> rollout sft_train (k=1 branch-on-fail) -> k=2 top-up
-                                #   -> format -> data/final/db_traces_chat.jsonl   (the SFT input)
-bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) -> merge -> AFTER-eval
+                                #   -> format -> data/final/db_traces_chat.jsonl   (the db_bahn leg)
+```
+
+**Build the SFT mix** (CPU — needs `db_traces_chat.jsonl` from the step above; without this
+`traj_sft_pipeline.sh` has no input):
+
+```bash
+python3 data_pipeline/convert_toolace.py     # bracket-DSL -> data/generated/toolace_chat.jsonl  (4,800 kept)
+docker compose -f docker/docker-compose.yml run --rm -T training \
+  python3 data_pipeline/convert_areal.py     # per-turn rows -> episodes -> data/generated/areal_chat.jsonl
+                                             #   (2,052; runs in-container — needs transformers for the 12k trim)
+python3 data_pipeline/build_sft_mix.py       # -> data/final/sft_mix_chat.jsonl (15,687) + sft_mix_val.jsonl (301)
+```
+
+```bash
+bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) -> merge x2
+                                #   -> AFTER-eval x2 -> checkpoint-selection (ep1 vs ep2)
 ```
 
 ## Results & status
@@ -146,44 +180,89 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
   write, outside the dedicated lookup template) — and the over-search "flail" dropped to **0.11 %** (was ~1.5 %).
   One ops incident: the 12 h `roll()` timeout silently killed pass 1 at 48 % → raised to 24 h, resume-safe rerun
   completed cleanly.
-- **Held-out (honest):** wave-1 before/after was flat (72.5 % → 70 %, n = 40 — the base already solves the easy
-  set; see the analysis in [docs/agentic-db-synthesis-log.md](docs/agentic-db-synthesis-log.md)). The wave-2.5
-  train + re-baseline on `heldout_eval` (276) is the next step.
+- **SFT training done:** 2 epochs in **41.7 h** on the GB10 (752 traces/h). `train_loss` 0.9 → 0.19, eval_loss
+  falling monotonically 0.29 → 0.171 = **no overfit**.
+- **Re-baseline on `heldout_eval`** (n = 276, never trained on; all passes k=1, conc 16):
 
-> **Next:** build the 4-leg SFT mix (convert ToolACE/TaskBench/AReaL into the unified chat format, filter AReaL
-> on `correct==1`, up-weight db_bahn) → SFT training → fresh held-out re-baseline (n = 276) → Stage-2 GRPO
-> re-wire (the `rl_train` reserve now holds 998 tasks).
+  | | verified yield | solved |
+  |---|---|---|
+  | base Qwen3-4B | 89.1 % | 246/276 |
+  | SFT epoch 1 | 98.6 % | 272/276 |
+  | **SFT epoch 2** ⭐ *(selected → `…/selected`)* | **99.6 %** | **275/276** |
+
+  The +10.5 pp headline understates it: the base already solved 18 of 26 templates at 100 %. On the **8
+  templates with actual headroom: 67 % → 98.9 %**, three of which the base could not do **at all** (0 % → 100 %),
+  with **zero regressions**. Per-template breakdown, the checkpoint-selection rationale and the measured
+  run-to-run noise (~1 task): [decision log](docs/agentic-db-synthesis-log.md).
+  *(Supersedes the wave-1 72.5 % → 70 % at n = 40 — a setup artifact, not a limit of the method.)*
+
+> **Next:** Stage-2 GRPO re-wire (`rl_train` 998 + AReaL τ² 1,982 tasks; the verl config is still SQL-wired
+> from the predecessor).
+
+## Training recipe (Stage 1)
+
+| Knob | Value | Why |
+|------|-------|-----|
+| Base | **Qwen/Qwen3-4B** (dense, text-only, thinking) | no multimodal baggage; verl-GRPO-proven on sm_121 |
+| LoRA | **r=32 / α=64**, all 7 linear modules | capacity for a broad task (3 domains + tools + German) |
+| Seq len | **12,288** | AReaL episodes run long; truncating them costs quality |
+| Batch | micro **8** × accum **2** = **eff. 16** | micro 16 was tested → *slower* (padding/saturation) |
+| Epochs | **2**, cosine, lr 2e-4, warmup 3 % | + checkpoint-selection ep1-vs-ep2 |
+| Speed | **FA2** + **Liger** (fused CE) + `group_by_length` | Liger is **required** for micro > 4 @ 12k — it removes the 55 GB fp32 logit tensor that otherwise OOMs the LM head |
+| Regularization | **NEFTune α=5** | noisy input embeddings, train-time only ([arXiv:2310.05914](https://arxiv.org/abs/2310.05914)) |
+| Eval | val **301** stratified, `eval_steps 300` | overfit diagnostic only — the real judge is the rollout `verified_yield` |
+
+Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db_bahn_traj_sft` (training) and
+`db_bahn_traj_eval` (before/after yields).
 
 ## Repo layout
 
+```text
+.
+├── sdg_pipeline/db_bahn/             # the synthesis core (§ Architecture)
+│   ├── seed_worldstate.py            #   frozen BahnDB world-state (db.json, seed 42)
+│   ├── gen_tasks.py                  #   10,473 tasks / 26 templates / answer keys / splits
+│   ├── rollout.py                    #   solve vs REAL tools (branch-on-fail, k=2 top-up, B2 harvest)
+│   └── tau2_domain/                  #   data_model, environment, tools.py (12 READ/WRITE), policy.md
+├── data_pipeline/
+│   ├── prepare_agentic_data.py       # fetch the public sets -> data/raw/
+│   ├── validate_areal.py             # streaming schema / integrity / referential checks
+│   ├── convert_toolace.py            # bracket-DSL -> unified chat
+│   ├── convert_areal.py              # per-turn rows -> episodes (correct==1, trim @12k)
+│   ├── build_sft_mix.py              # assemble the 3-leg mix + stratified val split
+│   └── format_traj_for_training.py   # db_bahn rollouts -> chat (split-aware)
+├── training_pipeline/
+│   ├── train_traj.py                 # LoRA SFT (FA2 + Liger + NEFTune, checkpoint-selection)
+│   ├── collator_multiturn.py         # assistant-only loss mask
+│   └── grpo_verl_runner.py           # Stage-2 verl vehicle (dormant until the db_bahn re-wire)
+├── evaluation/trajectory_reward.py   # deterministic verifier (= the Stage-2 reward seam)
+├── serving/merge_adapter.py          # LoRA adapter -> merged sharded model (what vLLM serves)
+├── ops/                              # teacher_bakeoff.sh · gen_traces.sh · traj_sft_pipeline.sh
+├── docker/                           # sdg / training / vllm / grpo / mlflow (GB10 sm_121 stack)
+├── config/                           # pipeline_config.yaml + .local.yaml (runtime reads the local one)
+├── data/                             # raw/ · generated/ · final/                      [gitignored]
+├── archive/                          # snapshots of earlier data waves                 [gitignored]
+└── docs/                             # design docs · decision log · bake-off · text2sql-experiments/
 ```
-sdg_pipeline/db_bahn/        # world-state seeder, tau2 domain (12 tools/policy), task-gen, rollout, bake-off
-  tau2_domain/               #   data_model, environment, tools.py (12 READ/WRITE), policy.md
-evaluation/trajectory_reward.py   # deterministic trajectory verifier (Stage-2 reward seam, verl dict contract)
-data_pipeline/               # prepare_agentic_data (ToolACE/TaskBench/AReaL), validate_areal,
-                             # format_traj_for_training (split-aware), clean_traces
-training_pipeline/           # train_traj (LoRA SFT), collator_multiturn (assistant-only mask),
-                             # grpo_verl_runner + build_weak_pool + reachability_probe (Stage-2 verl recipe)
-serving/                     # merge_adapter (text), merge_adapter_mm (multimodal — Qwen3.5 deploys)
-tools/                       # close_rate_probe (termination probe), quantize_fp8 (deploy quant)
-ops/                         # teacher_bakeoff, gen_traces, traj_sft_pipeline, grpo_pilot_supervised
-docker/                      # sdg / training / vllm / grpo / mlflow services (GB10 sm_121 stack)
-docs/                        # design docs, decision log, bake-off results + text2sql-experiments/ archive
-```
+
+> Some Text2SQL-era files are dead and scheduled for removal — listed in the
+> [decision log](docs/agentic-db-synthesis-log.md).
 
 ## Docs
 
-- [docs/agentic-datasets-explained.md](docs/agentic-datasets-explained.md) — **start here**: the big picture, all 4 legs explained (DE)
+- [docs/SFT-Training-Uebersicht.md](docs/SFT-Training-Uebersicht.md) — **start here**: current data mix, RL pools,
+  training recipe, result and why the run takes 41.7 h (DE, one page)
+- [docs/agentic-datasets-explained.md](docs/agentic-datasets-explained.md) — the datasets in depth, tutorial-style (DE)
 - [docs/agentic-db-synthesis-log.md](docs/agentic-db-synthesis-log.md) — decision & bug log, newest on top
 - [docs/agentic-sft-db-synthesis.md](docs/agentic-sft-db-synthesis.md) — design + literature levers (9 papers)
 - [docs/agentic-sft-data-basis.md](docs/agentic-sft-data-basis.md) — the public SFT data basis (acquisition record)
-- [docs/agentic-pivot-overview.md](docs/agentic-pivot-overview.md) — what carried over from the Text2SQL base
 - [docs/teacher-bakeoff.md](docs/teacher-bakeoff.md) — teacher comparison + winner validation
 - [docs/text2sql-experiments/](docs/text2sql-experiments/) — archived evidence base of the predecessor pipeline
+  (incl. `agentic-pivot-overview.md` — the pivot-era carryover map, historical)
 
-## GB10 / sm_121 load-bearing flags (inherited, verified)
+## GB10 / sm_121 load-bearing flags
 
-`VLLM_USE_FLASHINFER_SAMPLER=0` (FlashInfer sampler race), `--gdn-prefill-backend triton` (DeltaNet MoEs),
-`--max-num-seqs 4` (small-batch box), `VLLM_MAX_MODEL_LEN=12288` (12-tool system prompt headroom), sharded merges
-(`max_shard_size=5GB`), no MIG → serve one model at a time. Stage-2 verl: `load_format=auto`,
-`attn_implementation=sdpa`, ~9B colocated cap. Details in the [decision log](docs/agentic-db-synthesis-log.md).
+Inherited and verified — mandatory on this box: FlashInfer sampler off, `--gdn-prefill-backend triton` (the MoE
+teacher), sharded merges (`max_shard_size=5GB`), no MIG → serve one model at a time. Serving flags + rationale:
+[teacher-bakeoff.md](docs/teacher-bakeoff.md) · full GB10/verl recipe (Stage-2 `load_format=auto`,
+`attn_implementation=sdpa`): [experiments-verl_RL_lora-grpo.md](docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md).

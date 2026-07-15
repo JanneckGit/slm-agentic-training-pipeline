@@ -3,6 +3,10 @@
 > Was ist welcher Datensatz, wie sieht er aus, was bringt er dem Modell bei — und wie genau nutzen wir
 > τ²-bench dabei. Alle Beispiele unten sind **echt** aus unseren Dateien (bzw. für τ²-bench aus dem Framework).
 > Verwandt: [agentic-sft-data-basis.md](agentic-sft-data-basis.md) (Zahlen), [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md) (DB-Design).
+>
+> ⚠️ **Der gebaute Mix hat 3 Legs, nicht 4: TaskBench ist NICHT im SFT-Mix** (→ Eval-Regal, Begründung §2.2).
+> Dieses Doc erklärt weiterhin alle **vier** Datensätze — TaskBench bleibt als Vergleich + späteres Eval
+> relevant. **Alle Zahlen + Ist-Stand:** [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
 
 ---
 
@@ -23,16 +27,20 @@ deutschen, DB-spezifischen Satz.
           │                │                    │                      │
        ToolACE         TaskBench          τ²-bench-Abläufe          db_bahn-Traces
      (Grundlagen)      (Planung)         (Replan/Korrektur)       (Domäne + Deutsch)
-          │                │                    │                      │
-          └────────────────┴─── Stage-1 SFT (gemischt) ───┴──────────────────────┘
+          │        ⚠ NICHT im Mix              │                      │
+          │        (→ Eval-Regal, §2.2)        │                      │
+          └───────────────────┬─────────────────┴──────────────────────┘
+                              │
+                    Stage-1 SFT (gemischt)   ← Zahlen: siehe Übersicht
                                        │
                              Stage-2 GRPO (RL)  ← neue, disjunkte Aufgaben, Reward = Verifier
                                        │
                                 Eval: τ²-bench-Testsplit + db_bahn-Heldout + BFCL-V3
 ```
 
-**Merksatz:** ToolACE = *Wortschatz*, TaskBench = *Grammatik*, τ²-bench-Abläufe = *auf Fehler reagieren*,
-db_bahn = *unser Dialekt (Bahn, Deutsch)*.
+**Merksatz:** ToolACE = *Wortschatz*, τ²-bench-Abläufe = *auf Fehler reagieren*, db_bahn = *unser Dialekt
+(Bahn, Deutsch)*. (TaskBench = *Grammatik* — die wir am Ende **nicht** trainieren, weil sie nur Pläne
+notiert statt Tools auszuführen; §2.2.)
 
 ---
 
@@ -81,7 +89,13 @@ assistant: "Here are the top Market Trends in the US: 1. S&P 500 …"           
 - **Eigenheit / Aufpassen:** Aufrufe als Klammer-DSL statt OpenAI-`tool_calls`; Tools stecken im `system`-Text.
   Beim Vereinheitlichen müssen wir das umformen. Tool-Antworten sind **erfunden** (kein echtes Env).
 
-### 2.2 TaskBench — „die Grammatik" (Aufgabe zerlegen, Tools ordnen)
+### 2.2 TaskBench — „die Grammatik" ⚠️ **aus dem Mix geflogen (2026-07-13) → Eval-Regal**
+
+> **Warum raus:** genau wegen des Punktes direkt darunter — TaskBench zeigt **nur den Bauplan, nie die
+> Ausführung**. Trainiert man darauf, lernt das Modell eine **Planungs-Notation zu emittieren, die es zur
+> Serve-Zeit nie braucht** (dort emittiert es `tool_calls`). Es gibt keine Assistant-/Tool-Turns zum Maskieren,
+> also auch kein sauberes Loss-Signal für unser Format. Die Rohdaten bleiben liegen (bewusst **kein**
+> `convert_taskbench.py`) — als *Evaluations*-Satz für Zerlegung bleibt es interessant.
 
 - **Was es übt:** **Planung** — eine Anfrage in Teilschritte zerlegen, das richtige Tool je Schritt wählen,
   die Reihenfolge/Abhängigkeiten festlegen („Tool-Graph"). Es zeigt **nicht** das Ausführen, sondern nur den
@@ -176,7 +190,7 @@ assistant: "Paul Schmidt (MA-4551) wurde als Lokführer für EC 290 zugewiesen (
 
 > **📌 Update (2026-07-08 → 07-12) — Welle 2 + 2.5 umgesetzt: Clean Rebuild + Weltvergrößerung ✅ (10.473er-Pool, 9.146 Traces).**
 > Welle 1 (446 Traces, 64 % Ein-Tool, flacher Eval) war zu einfach; statt sie zu schonen wurde sauber neu
-> gebaut und **Welle 1 komplett archiviert** (`data/archive/wave1_20260708/`). Dafür wuchs die **Domäne
+> gebaut und **Welle 1 komplett archiviert** (`archive/data/wave1_20260708/`). Dafür wuchs die **Domäne
 > selbst**: 8 → **12 Tools** (3 Such-Tools `zuege_suchen`/`mitarbeiter_suchen`/`wartung_liste` für Aufgaben
 > **ohne vorgekaute IDs**, + Lookup-by-ID `mitarbeiter_details` als 12.) und die WRITE-Tools **lehnen jetzt
 > regelwidrige Aufrufe ab** (Rolle/Qualifikation/Duplikat/Endstatus → echte **Laufzeit-Fehler-Replans**, z. B.
@@ -194,7 +208,8 @@ assistant: "Paul Schmidt (MA-4551) wurde als Lokführer für EC 290 zugewiesen (
 
 > Alle CPU-Gates grün: Oracle-Replay **10.473/10.473 = 100 %** / 0× gold_replay_failed, Verifier-Selftest 8/8,
 > Seeder + Generator byte-deterministisch (je 2× gelaufen, identisch). **Achtung Eval-Bruch (beabsichtigt):**
-> 12-Tool-Prompt + neues 276er-Heldout → alte 72,5 %/70 %-Zahlen nur noch historisch; Re-Baseline steht aus.
+> 12-Tool-Prompt + neues 276er-Heldout → alte 72,5 %/70 %-Zahlen nur noch historisch (Re-Baseline inzwischen
+> gelaufen → [Übersicht](SFT-Training-Uebersicht.md)).
 > **Welle 2.5 (2026-07-12): der einheitliche 12-Tool-Regen ist gelaufen** — Welt vergrößert (Weg B,
 > replikations-validiert), 9.146 Traces. **A1-Befund:** der Teacher nutzt `mitarbeiter_details` in **16,8 %**
 > der Traces (davon 1.271 **organisch**, d. h. außerhalb des Lookup-Templates — Person vor der Zuweisung
@@ -329,9 +344,9 @@ aufgeschlagenem Buch schreibt — die Antwort wird nachgeschlagen, nicht erinner
   Nachrechner ist einem Judge (Meinungsgeber, nicht reproduzierbar) überlegen (NebulaExp: Exec-Filter =
   Hebel #1). Ein kleiner **Ja/Nein-Judge** (BinEval-Stil) ist nur als *Zusatz* für Weiches sinnvoll
   (Stil, Plan-Qualität, Relevanz) — als Berichts-Schicht, nie als Ersatz des harten Gates.
-- **Und die finale Evaluation?** Dieselbe Prüf-Maschine, drei Einsätze: Daten-Filter (✅ läuft) →
-  Held-out-Messung auf 59 ungesehenen Aufgaben (✅ läuft) → **offizielle** τ²-bench-Testsplits + BFCL-V3
-  (❌ steht noch aus — das ist die papervergleichbare Endmessung).
+- **Und die finale Evaluation?** Dieselbe Prüf-Maschine, drei Einsätze: Daten-Filter (✅) →
+  Held-out-Messung auf ungesehenen Aufgaben (✅ — Zahlen in der [Übersicht](SFT-Training-Uebersicht.md)) →
+  **offizielle** τ²-bench-Testsplits + BFCL-V3 (❌ steht noch aus — das ist die papervergleichbare Endmessung).
 
 ## 5. Die sinnvolle Aufteilung (SFT / RL / Eval)
 
@@ -346,24 +361,22 @@ Zwei einfache Regeln entscheiden alles:
 STATISCH (nur SFT)          AUSFÜHRBAR (Task-Pool in 3 disjunkte Teile splitten)
 ┌──────────┬──────────┐     ┌───────────────────────────────┬──────────────────┐
  ToolACE    TaskBench        τ²-Domänen (airline/retail/tel)   db_bahn
-    │          │             sft-gen │ rl-train │ test         sft │ rl │ heldout
-    │          │                │        │        │            │     │     │
-    ▼          ▼                ▼        │        │            ▼     │     │
-  ┌──────────────────── STAGE-1 SFT (gemischt, DB höher gewichtet) ──┐   │     │
-  │  ToolACE + TaskBench + τ²-sft-gen-Abläufe + db_bahn-sft-Traces   │   │     │
-  └─────────────────────────────────────────────────────────────────┘   │     │
-                                        ┌─── STAGE-2 GRPO (Aufgaben, on-policy) ─┘     │
-                                        │    τ²-rl-train + db_bahn-rl (Reward=Verifier)│
-                                        └─────────────────────────────────────────────┘
-                                                 ┌─── EVAL (nie trainiert) ────────────┘
-                                                 │    τ²-test + db_bahn-heldout + BFCL-V3
+    │      ⚠ NICHT im Mix     sft-gen │ rl-train │ test         sft │ rl │ heldout
+    │      (nur Eval-Regal)      │    │    │     │               │   │    │
+    ▼                            ▼    │    │     │               ▼   │    │
+  ┌──────────── STAGE-1 SFT (gemischt: ToolACE + τ²-Abläufe + db_bahn) ┐  │    │
+  └────────────────────────────────────────────────────────────────────┘  │    │
+                                        ┌─── STAGE-2 GRPO (Aufgaben, on-policy) ─┘    │
+                                        │    τ²-rl-train + db_bahn-rl                 │
+                                        │    (Reward = Verifier)                      │
+                                        └────────────────────────────────────────────┘
+                                                 ┌─── EVAL (nie trainiert) ───────────┘
+                                                 │    db_bahn-heldout (+ τ²-test,
+                                                 │    TaskBench, BFCL-V3 als Regal)
 ```
 
-**Wo wir stehen:** ToolACE ✅, TaskBench ✅, τ²-bench-Abläufe ✅ (via AReaL-Shortcut gezogen + validiert, §2.3;
-beim Mischen auf `correct==1` filtern). db_bahn: **Welle-2.5-Task-Pool ✅** (10.473 Tasks, validiert; ältere
-Wellen archiviert) und **9.146 verifizierte 12-Tool-Traces ✅** (99,4 %, Sieger-Teacher). Für RL ist beides da:
-AReaL liefert 1.982 fertige Tasks inkl. DB-Snapshots, db_bahn hat jetzt einen eigenen disjunkten
-**`rl_train`-Split (998 Aufgaben)**, der nie für SFT gerollt wird.
+**Ist-Stand** (Mix-Zahlen, RL-Pools, Trainings-Ergebnis): → [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
+Dieses Doc erklärt die Datensätze; den jeweils aktuellen Stand hält die Übersicht.
 
 ---
 

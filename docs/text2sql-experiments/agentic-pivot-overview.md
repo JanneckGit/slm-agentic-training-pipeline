@@ -3,7 +3,7 @@
 > **Status:** design / transition note · **Date:** 2026-07-02 · **Scope:** read-only analysis, no code changed.
 >
 > **⚠️ Superseded (2026-07-10).** The agentic build this note forecasts (§6, *"not started"*) is now implemented —
-> see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md); several base files cited in §1/§3 were removed
+> see [`agentic-db-synthesis-log.md`](../agentic-db-synthesis-log.md); several base files cited in §1/§3 were removed
 > in the 2026-07-03 cleanup. Kept as a dated pivot-point record; the §5 carryover map still applies.
 >
 > **Purpose.** This document records what the finished **Text-to-SQL SLM pipeline** (this repo's base)
@@ -11,7 +11,7 @@
 > **agentic SLM orchestrator** (multi-step planning, tool-calling, self-reflection/replan) vs. what is
 > SQL-specific and must be rebuilt.
 >
-> The finished-base evidence logs were moved to [`docs/text2sql-experiments/`](text2sql-experiments/)
+> The finished-base evidence logs were moved to [`docs/text2sql-experiments/`](./)
 > as part of this transition. The agentic research direction (use case, datasets, benchmark, training
 > plan) lives in Notion: *Knowledge Hub → "Agentic LLM / Orchestrator (Forschungsrichtung)"*.
 
@@ -49,7 +49,7 @@ parses it itself — no shared loader), global `seed: 42` through all RNG stages
 | **GRPO / RLVR** | verl `main_ppo`, Dr.GRPO, ref-skip, LoRA-actor + async-vLLM rollout. Weak-pool carve + reachability filter (k=8, keep 0<pass<8, ~50%-bias) | [`grpo_verl_runner.py`](../training_pipeline/grpo_verl_runner.py), [`build_weak_pool.py`](../training_pipeline/build_weak_pool.py), [`reachability_probe.py`](../training_pipeline/reachability_probe.py) |
 | **Eval / reward** | `extract_sql` (extractor-v2) as **single source of truth**, same loose-EX in eval *and* GRPO reward. Exec against in-memory SQLite | [`evaluate.py`](../evaluation/evaluate.py), [`reward.py`](../evaluation/reward.py) |
 | **Serving / ops** | Adapter merge (**sharded save — mandatory**), FP8 quant (leak-assert), vLLM deploy, **self-healing supervisors** (power-draw wedge watchdog + verl auto-resume) | [`merge_adapter.py`](../serving/merge_adapter.py), [`grpo_pilot_supervised.sh`](../ops/grpo_pilot_supervised.sh) |
-| **Docs** | Evidence base: numbers + GB10 fixes | [`text2sql-experiments/`](text2sql-experiments/) |
+| **Docs** | Evidence base: numbers + GB10 fixes | [`text2sql-experiments/`](./) |
 
 ---
 
@@ -57,14 +57,14 @@ parses it itself — no shared loader), global `seed: 42` through all RNG stages
 
 - Student knee at **~4B**; the **~60% EX ceiling is data/metric-bound, not size-bound**.
 - Looping fix raised greedy `</think>`-close rate **4–44% → 92–99%** (root cause: poisoned teacher
-  traces, fixed at the data root — [`text2sql-experiments/experiments.md`](text2sql-experiments/experiments.md)).
+  traces, fixed at the data root — [`text2sql-experiments/experiments.md`](experiments.md)).
 - **3.9× training speedup** via DeltaNet kernels (2355→601 ms, loss Δ ≤ 0.004 —
-  [`experiments-hardware.md`](text2sql-experiments/experiments-hardware.md)).
+  [`experiments-hardware.md`](experiments-hardware.md)).
 - FP8: all 4 deploy models KEEP; only 9B-thinking −0.04 EX
-  ([`experiments-compressor.md`](text2sql-experiments/experiments-compressor.md)).
+  ([`experiments-compressor.md`](experiments-compressor.md)).
 - **GRPO pilot: 50/50 steps ~11 h, 0 wedges; held-out val 0.42→0.44 (+2.1 pt)**, per-category
   59→61% (set-ops +1, subqueries +1, window flat —
-  [`experiments-verl_RL_lora-grpo.md`](text2sql-experiments/experiments-verl_RL_lora-grpo.md)).
+  [`experiments-verl_RL_lora-grpo.md`](experiments-verl_RL_lora-grpo.md)).
 
 ---
 

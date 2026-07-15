@@ -2,23 +2,26 @@
 
 > **Status:** ✅ **SUPERSEDED — now built** (this pre-build design note is kept for its literature rationale).
 > **Date:** 2026-07-03 · **Scope:** how to synthesize the German Deutsche-Bahn tool-calling trajectories — the
-> **self-synthesized DB leg** of the Stage-1 SFT mix (now **leg 4** of 4, alongside ToolACE + TaskBench +
+> **self-synthesized DB leg** of the Stage-1 SFT mix (the **largest of 3 legs**, alongside ToolACE +
 > AReaL/τ²-bench; see [`agentic-sft-data-basis.md`](agentic-sft-data-basis.md)). The synthesis is implemented
 > and run — **9,146 verified traces**, see [`agentic-db-synthesis-log.md`](agentic-db-synthesis-log.md).
+> *(TaskBench was dropped from the mix on 2026-07-13 → eval shelf; the mix below is therefore 3-leg.)*
 >
 > **Decisions locked in:** approach = **(B) grounded synthesis** (teacher drives tool calls against a *real executable* DB sandbox + verifier gate + fault-injection for replan); **teacher = local GB10 model** (a strong API teacher like GPT-5 is not guaranteed). This note sorts the literature levers **before** building, so we don't reinvent what papers already provide. Source: Notion *"Agentic LLM / Orchestrator"* → chapter *"🧪 Hebel aus der Literatur (nach Pipeline-Stufe)"* (9 papers), cross-read against the arXiv originals.
 
 ## Where this fits
 
-Stage-1 SFT mixes **four legs**, shuffled in one pass, the German DB leg up-weighted → then Stage-2 GRPO/verl
-on new, disjoint τ²-bench + db_bahn tasks.
+Stage-1 SFT mixes **three legs**, shuffled in one pass, the German DB leg dominant by count → then Stage-2
+GRPO/verl on new, disjoint τ²-bench + db_bahn tasks.
 
 | Leg | Source | Status |
 |---|---|---|
-| 1. tool-call basics | ToolACE (downloaded) | done |
-| 2. planning/decomposition | TaskBench (downloaded) | done |
-| 3. multi-turn dialogue/policy | AReaL / τ²-bench (downloaded) | done |
-| **4. DB-specific + German + replan** | **synthesized (this note)** | **✅ built — 9,146 traces** |
+| tool-call basics | ToolACE (downloaded) | ✅ in mix |
+| multi-turn dialogue/policy | AReaL / τ²-bench (downloaded) | ✅ in mix (episodes, `correct==1`) |
+| **DB-specific + German + replan** | **synthesized (this note)** | ✅ in mix — the largest leg |
+| ~~planning/decomposition~~ | ~~TaskBench~~ | ❌ **dropped → eval shelf** (plans, no execution turns) |
+
+Counts: [SFT-Training-Uebersicht.md](SFT-Training-Uebersicht.md).
 
 ## How it works — a plain-English walkthrough
 
@@ -46,7 +49,7 @@ on new, disjoint τ²-bench + db_bahn tasks.
 
 **Legend:** 🟢 use now for Stage-1 DB synthesis · 🟡 Stage-2 RL (later) · 🔵 deploy gate · ⚪ context/motivation
 
-### Stage 1 — SFT method & data recipe (the 4-leg mix)
+### Stage 1 — SFT method & data recipe (the 3-leg mix)
 
 | Paper | arXiv | Verdict | Actionable takeaway for us |
 |---|---|---|---|
@@ -92,4 +95,4 @@ Three papers converge that **teacher-fit / harness-compatibility beats teacher-s
 
 ## Open gap
 
-No paper backs the **concrete mix ratio** (ToolACE / TaskBench / τ²-bench + up-weighted German synthetic). The levers give only generic principles (diversity, disjoint SFT/RL split, difficulty filter) — the exact weighting stays an **empirical build decision**.
+No paper backs the **concrete mix ratio** (ToolACE / τ²-bench + dominant German synthetic). The levers give only generic principles (diversity, disjoint SFT/RL split, difficulty filter) — the exact weighting stays an **empirical build decision**. *(Built ratio, by tokens: db_bahn 59 % / AReaL 34 % / ToolACE 6 %.)*
