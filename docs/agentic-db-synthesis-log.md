@@ -4,7 +4,66 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
-## 2026-07-17 — 🧠 Think-Eval auf dem Heldout: Base +6,9 pp durch Denken; ep2 denkt in-domain NICHT mehr
+## 2026-07-16 — 📊 BFCL-V4-Schnelldurchlauf (Indiz, n=100): parallel-Kategorien brechen ein (−9/20), Live & Multi-Turn halten; ep2 denkt auch auf BFCL nicht
+
+> ⚠️ **Indiz-Lauf, n=klein, NICHT leaderboard-vergleichbar** (Sampling + `--partial-eval` + Handler-Caveat).
+> Antwort auf den „BFCL-2×2"-Entscheidungspunkt aus dem Think-Eval-Eintrag (direkt darunter).
+
+- **Setup:** `bfcl-eval==2026.3.23` (eigenes `.venv-bfcl`, Py 3.12; PyPI-Release braucht zusätzlich `soundfile` —
+  transitiv via qwen_agent), Handler-Key **`Qwen/Qwen3-4B-Instruct-2507-FC`** (ein lokaler Hybrid-4B-Key existiert
+  nicht → Caveat: 2507-FC-Handler gegen Hybrid-Thinking-Server; Payload-Name via `--served-model-name`-Alias in
+  `VLLM_EXTRA_ARGS`, spätere Flag ersetzt Compose-Default). **Identische 100 Sample-IDs** für beide Modelle
+  (seed 42, [evaluation/benchmarks/bfcl/sample_ids_v1.json](../evaluation/benchmarks/bfcl/sample_ids_v1.json),
+  via `--run-ids`; für den Volllauf wiederverwendbar). temp 0,6, top_p/top_k via `generation_config.json` (0,95/20),
+  ctx 32768, `--max-num-seqs 16`, GB10 sequenziell Base→ep2. Rohdaten: `data/generated/bfcl_quickrun/{base,ep2}/`;
+  MLflow `bfcl_eval`: `bfcl_quickrun_base` (c521e812), `bfcl_quickrun_ep2` (7b0ef000).
+- **Repro** (Volllauf = dieselbe Mechanik, nur andere ID-Datei): `BFCL_PROJECT_ROOT=<root> LOCAL_SERVER_PORT=8000
+  .venv-bfcl/bin/bfcl generate --model Qwen/Qwen3-4B-Instruct-2507-FC --run-ids --skip-server-setup
+  --temperature 0.6 --num-threads 16` → `bfcl evaluate … --partial-eval`. Vollständige Kommandos inkl.
+  Serve-Alias: README, „Pipeline steps" → *OOD benchmark (BFCL v4)*.
+- **Delta-Tabelle** (correct/n; MT-Subsets = Rohzähler, ±1 Episode = ±20 pp/Subset):
+
+  | Kategorie | n | Base | ep2 | Δ |
+  |---|---|---|---|---|
+  | simple_python | 10 | 10 | 10 | ±0 |
+  | multiple | 10 | 9 | 9 | ±0 |
+  | **parallel** | 10 | 10 | **6** | **−4** |
+  | **parallel_multiple** | 10 | 10 | **5** | **−5** |
+  | live_simple | 8 | 8 | 7 | −1 |
+  | live_multiple | 8 | 6 | 6 | ±0 |
+  | live_relevance | 4 | 3 | 4 | +1 |
+  | live_irrelevance (ToolACE-Check) | 20 | 15 | 14 | −1 |
+  | multi_turn_base | 5 | 1 | 1 | ±0 |
+  | multi_turn_miss_func | 5 | 2 | 1 | −1 |
+  | multi_turn_miss_param | 5 | 1 | 2 | +1 |
+  | multi_turn_long_context | 5 | 0 | 0 | ±0 |
+  | **Σ Single-Turn non-live** | 40 | 39 | 30 | **−9** |
+  | **Σ Live** | 40 | 32 | 31 | −1 |
+  | **Σ Multi-Turn** | 20 | 4 | 4 | ±0 |
+
+  Force-Terminations: 0/20 bei beiden. Truncations (max_tokens 4096): 0 bei beiden.
+- **Befund 1 — der plan-Attraktor generalisiert auf OOD-Tools-Prompts:** Base denkt überall (ST 80/80,
+  MT 16/20 Entries mit `reasoning_content`); **ep2 denkt in 0/100 Fällen** — emittiert aber auch **kein `<plan>`**
+  (ohne db_bahn-Policy), sondern antwortet/callt direkt im SFT-Trace-Stil. Der bloße `<tools>`-Block genügt
+  als Suppressor. Das geplante Think-vs-Think-Design wurde de facto **Base-mit-Think vs. ep2-ohne-Think**
+  (identische Prompts/Params, Verhalten modellseitig) → Deltas tragen diesen Confound.
+- **Befund 2 — lokalisierter OOD-Schaden statt globalem Forgetting:** simple/multiple/Live/MT halten (Σ −1 bei
+  Live, ±0 bei MT); der Einbruch sitzt exakt in **parallel + parallel_multiple (−9 von 20 Entries)** — Antworten,
+  die *mehrere* Tool-Calls in einem Turn erfordern. Passt zur Trainingsverteilung: db_bahn- und AReaL-Traces sind
+  fast durchgehend 1-Call-pro-Turn-sequenziell; plausibel verstärkt durch fehlendes Denken (Base plant die
+  Parallel-Zerlegung sichtbar im Think). Irrelevance hält (15→14, Rauschen) — das ToolACE-Leg trägt.
+- **Befund 3 — Multi-Turn:** 4/20 = 4/20 (Subset-Shuffle ±1) — kein Einbruch, aber auf n=5/Subset auch kein
+  messbarer Transfer; `long_context` bei beiden am Boden (0/5, Risiko-Hypothese unentscheidbar auf diesem n).
+- **Neben-Befund Kosten:** ep2 ist ~3× schneller (ST 1:17 vs. 2:21 min; MT ~9 vs. ~28 min wall — Base-Makespan
+  dominiert von einem 10-min-Solo-Straggler `multi_turn_miss_param_9`; MT-Wall = längste Episodenkette, innen
+  sequenziell). Gesamtlauf inkl. Setup/Smoke/Swap ~70 min.
+- **Konsequenz / Next:** Kein globaler Repair-Fall — der Schaden ist auf **parallele Call-Formate** lokalisiert.
+  Vor einem Repair-SFT-Entscheid (Teilmenge paralleler ToolACE-Beispiele ± Think-Traces) erst **bestätigen**:
+  Volllauf der 4 non-live-AST-Kategorien (~1,7k Entries; ep2 denkt nicht → billig) + `parallel`-Fehleranalyse
+  (Format-Fail vs. Semantik-Fail) aus den vorhandenen Rohdaten. `sample_ids_v1.json` bleibt die dokumentierte
+  Quickrun-Referenz.
+
+## 2026-07-16 — 🧠 Think-Eval auf dem Heldout: Base +6,9 pp durch Denken; ep2 denkt in-domain NICHT mehr
 
 - **Setup:** heldout_eval (276), k=1, `enable_thinking: true` (Scratch-Config), max-tokens/turn 3072, ctx 16384,
   conc 16, temp 0,7 (= Referenz; Qwen-Think-Empfehlung wäre 0,6 — bewusst nicht genommen, Komparabilität).

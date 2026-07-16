@@ -48,7 +48,8 @@ flowchart TD
     MIX --> M["sft_mix_chat.jsonl — 15,687 train<br/>sft_mix_val.jsonl — 301 val"]
     M -->|train_traj.py + collator_multiturn.py| H["Stage 1 — LoRA student Qwen3-4B<br/>assistant-only loss mask"]
     H -->|merge_adapter.py| S["merged student → vLLM"]
-    S -->|"rollout.py on heldout_eval (276)"| EV["before/after re-baseline"]
+    S -->|"rollout.py on heldout_eval (276)"| EV["in-domain re-baseline<br/>before/after, verifier-scored"]
+    S -->|"bfcl generate/evaluate<br/>fixed seed-42 IDs"| OOD["OOD benchmark — BFCL v4<br/>Δ vs base Qwen3-4B"]
     H -.->|re-wire pending| RL["Stage 2 — GRPO/verl<br/>reward = trajectory_reward.py<br/>rl_train 998 + AReaL τ² 1,982"]
 ```
 
@@ -176,6 +177,28 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
                                 #   -> AFTER-eval x2 -> checkpoint-selection (ep1 vs ep2)
 ```
 
+**OOD benchmark (BFCL v4)** — external harness in its own venv, identical seed-42 IDs per model. The harness
+sends the `Qwen3-4B-Instruct-2507` handler name in the payload → the served-name **alias is mandatory** (no
+local hybrid-4B key exists in the registry; caveat: 2507-FC handler against the hybrid-thinking server):
+
+```bash
+python3.12 -m venv .venv-bfcl && .venv-bfcl/bin/pip install -r evaluation/benchmarks/bfcl/requirements.txt
+.venv-bfcl/bin/python evaluation/benchmarks/bfcl/make_sample_ids.py   # -> sample_ids_v1 + phase files (mt / st_live / smoke)
+
+# serve base (SFT student instead: VLLM_MODEL=/app/data/final/checkpoints/db_bahn_traj_merged/ep2, same alias)
+VLLM_MODEL="Qwen/Qwen3-4B" VLLM_MAX_MODEL_LEN=32768 VLLM_GPU_UTIL=0.85 \
+  VLLM_EXTRA_ARGS="--max-num-seqs 16 --served-model-name Qwen/Qwen3-4B-Instruct-2507" \
+  docker compose -f docker/docker-compose.yml --profile vllm up -d vllm
+
+# one BFCL_PROJECT_ROOT per run separates result/ + score/; MT and ST/live can run concurrently from sibling roots
+export BFCL_PROJECT_ROOT=$PWD/data/generated/bfcl_quickrun/base LOCAL_SERVER_PORT=8000
+mkdir -p $BFCL_PROJECT_ROOT && cp evaluation/benchmarks/bfcl/mt.json $BFCL_PROJECT_ROOT/test_case_ids_to_generate.json
+.venv-bfcl/bin/bfcl generate --model Qwen/Qwen3-4B-Instruct-2507-FC --run-ids --skip-server-setup \
+  --temperature 0.6 --num-threads 16          # --run-ids reads the ID file and ignores --test-category
+.venv-bfcl/bin/bfcl evaluate --model Qwen/Qwen3-4B-Instruct-2507-FC --partial-eval \
+  --test-category multi_turn,simple_python,multiple,parallel,parallel_multiple,live_simple,live_multiple,live_relevance,live_irrelevance
+```
+
 ## Results & status
 
 - **Teacher bake-off** over 8 local models → winner **Qwen3.6-35B-A3B** (92 % verified yield, ~16 s/rollout) —
@@ -205,9 +228,21 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
   96.0 % at 6× latency — still below the plan-style SFT student. The **SFT student stays in `<plan>` mode
   in-domain** (won't emit `<think>` under the domain prompt, even force-prefilled) but thinks normally on
   neutral prompts — capability intact, behavior context-conditioned. In-domain thinking would need SFT
-  signal (repair top-up), not RL. Details: [decision log](docs/agentic-db-synthesis-log.md) (2026-07-17).
+  signal (repair top-up), not RL. Details: [decision log](docs/agentic-db-synthesis-log.md) (2026-07-16).
+- **BFCL-v4 quick-run** (OOD probe: n = 100 **identical seed-42 IDs** per model, sampled → *not
+  leaderboard-comparable*): the damage is **localized to parallel-call formats** — `parallel` 10→6,
+  `parallel_multiple` 10→5 — while simple/multiple hold (19/20 = 19/20), live stays flat (32→31, irrelevance
+  holds) and multi-turn is unchanged (4/20 = 4/20; `long_context` 0/5 for both). Fits the training
+  distribution: all three SFT legs are almost entirely one-call-per-turn. Second finding: the plan-attractor
+  **generalizes** — the student emits `<think>` in **0/100** BFCL cases (base: everywhere) yet no `<plan>`
+  either, so every delta carries a think-vs-no-think confound (side effect: ~3× faster). Commands: *OOD
+  benchmark* under [Pipeline steps](#pipeline-steps) · delta table:
+  [decision log](docs/agentic-db-synthesis-log.md) · raw: `data/generated/bfcl_quickrun/` + MLflow `bfcl_eval`.
 
-> **Next:** Stage-2 GRPO rebuild (`rl_train` 998 + AReaL τ² 1,982 tasks; reward = `trajectory_reward.py`,
+> **Next:** (1) **confirm the BFCL parallel regression** before any repair decision — full AST categories
+> (~1.7k entries; cheap, the student doesn't think) + failure analysis of the 9 parallel fails (format vs.
+> semantics); if confirmed → **targeted** repair-SFT (parallel ToolACE subset ± think traces), not a global
+> re-train. (2) Stage-2 GRPO rebuild (`rl_train` 998 + AReaL τ² 1,982 tasks; reward = `trajectory_reward.py`,
 > recipe = the archived GB10/verl doc — the SQL-era runner is gone).
 
 ## Training recipe (Stage 1)
@@ -246,7 +281,9 @@ Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db
 ├── training_pipeline/
 │   ├── train_traj.py                 # LoRA SFT (FA2 + Liger + NEFTune, checkpoint-selection)
 │   └── collator_multiturn.py         # assistant-only loss mask
-├── evaluation/trajectory_reward.py   # deterministic verifier (= the Stage-2 reward seam)
+├── evaluation/
+│   ├── trajectory_reward.py          # deterministic verifier (= the Stage-2 reward seam)
+│   └── benchmarks/bfcl/              # BFCL harness: seed-42 sample IDs + generator + pinned requirements
 ├── serving/merge_adapter.py          # LoRA adapter -> merged sharded model (what vLLM serves)
 ├── tools/quantize_fp8.py             # FP8 deploy quantization (manual, via the llmcompressor venv)
 ├── ops/                              # teacher_bakeoff.sh · gen_traces.sh · traj_sft_pipeline.sh

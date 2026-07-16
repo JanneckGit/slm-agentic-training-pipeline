@@ -1,0 +1,4 @@
+# BFCL quick-run harness venv (.venv-bfcl, host Python 3.12) — pinned for reproducibility.
+bfcl-eval==2026.3.23
+# PyPI-Release 2026.3.23 importiert qwen_agent -> soundfile, deklariert es aber nicht (Import-Crash der CLI ohne).
+soundfile

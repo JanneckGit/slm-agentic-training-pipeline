@@ -48,6 +48,7 @@ build/
 .eggs/
 .venv/
 .venv-tau2/
+.venv-bfcl/
 venv/
 env/
 
