@@ -4,6 +4,76 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
+## 2026-07-16 — 🎯 Stage-2 STEHT: GRPO läuft gegen die echten db_bahn-Tools (verl tool-agent loop), Reward = der Verifier
+
+> **Zweck: Pipeline-Beweis, kein Ergebnis.** Kleiner Pool, wenige Steps, Base-Init — die Zahlen sind Rauschen,
+> die grünen Gates sind das Deliverable.
+
+- **Architektur (der Selbstbau-Anteil ist dünn):** verl besitzt Actor + Rollout, die **Umgebung bleibt die
+  tau2-Domäne db_bahn** — dieselbe, gegen die der Teacher synthetisiert und die Evals laufen. Neu ist nur der
+  Adapter: `training_pipeline/grpo_db_bahn_tools.py` (12× `DbBahnTool(BaseTool)` → `env.use_tool`),
+  `grpo_tool_config.yaml`, `evaluation/grpo_reward.py` (Hermes-Text → messages → **unveränderter**
+  `trajectory_reward.compute_score`), `build_grpo_pool.py`, `ops/grpo_smoke.sh`. Bestehender Code: **nicht angefasst**
+  (nur `image: ${GRPO_IMAGE:-…}` in Compose). Vehikel = `agentic-grpo:verl` = frozen `text2sql-grpo:verl` + tau2
+  (`docker/Dockerfile.grpo-agentic`; Py 3.12.3, Deps konfliktfrei).
+- **Smoke-Ergebnis** (Base Qwen3-4B, **mit Thinking**, TBS 8 × n=4, 2 Steps, 16:14, temp 1.0, LoRA r16):
+
+  | Gate | Messwert |
+  |---|---|
+  | Tool-Loop live | `num_turns` 4–10 (⌀ 7,4) · 3,25 Calls/Episode · **`replan_occurred` 0,75** · `self_recovery` 0,25 · `tool_calls_valid` 0,90 |
+  | Reward-Varianz | `critic/rewards` mean **0,469 → 0,656** (Step 1→2), max 1,0 / min 0,0 ⇒ Gruppen-Varianz > 0 |
+  | Gradienten | `advantages` ±0,75 · `grad_norm` 0,04 · `pg_loss` −0,024 ⇒ Dr.GRPO lernt |
+  | Sync/Checkpoint | `update_weights` 4,1 s · `save_checkpoint` 16,9 s · `global_step_{1,2}` geschrieben |
+  | Sauberkeit | `clip_ratio` 0,0 · `aborted_ratio` 0,0 · Actor-Peak **23 GB** (viel Luft) · 352 tok/s · ~8 min/Step |
+
+  Rollout-Dump: **32/32 Episoden mit `<think>`, 0 mit `<plan>`**, 99 Tool-Calls / 87 Observations — Base denkt
+  wie erwartet (bestätigt die Neutral-Prompt-These aus der Think-Eval). Val `reward/mean@1` = 0,75.
+- **Kurzlauf mit echter GRPO-Gruppe** (`grpo_db_bahn_20260716`: TBS 8 × **n=8** = 64 Episoden/Step, 3 Steps,
+  ~13 min/Step, 192 Episoden gesamt): `critic/rewards/mean` 0,641 / 0,641 / 0,594 — **flach, wie erwartet**
+  (3 Steps × lr 1e-6 bewegen nichts; der Lauf beweist Stabilität, nicht Lernen). Wichtiger: `advantages`
+  ±0,875 durchgehend ≠ 0, Score-Werte {0,0 · 1,0} ⇒ **Gruppen-Varianz hält auch bei n=8** (der Pool ist also
+  brauchbar), `num_turns` ⌀ 7,0–8,0, **192/192 Episoden mit `<think>`**, 598 Tool-Calls, `clip_ratio` /
+  `aborted_ratio` 0,0, Actor-Peak konstant 23,3 GB, `global_step_3` geschrieben. Kein OOM, kein Wedge.
+- **Drei Funde an der verl-Grenze** (alle in je ~2 min sichtbar, gefixt):
+  1. `rollout.agent.default_agent_loop=tool_agent` ist **zwingend** — `multi_turn.enable=True` allein ist ein No-op.
+  2. Tool-YAML braucht `config.type: native` (`tool_registry.py:38`).
+  3. tau2 rendert `Optional[str]` als `anyOf:[{string},{null}]`; verls `OpenAIFunctionPropertySchema` verlangt
+     flaches `type` → `_flatten_optional()` im Adapter (betrifft nur die 3 Such-Tools). Im SDG-Pfad fiel das nie
+     auf: dort werden Schemas als **Text** in den Prompt gedumpt, nie validiert.
+  4. Kosmetisch: nach dem letzten Step stirbt ein DataLoader-Worker per SIGKILL (Ray/Unified-Memory-Peak,
+     `cpu_memory_used` 65 GB) — **nach** Checkpoint + Final-Val, Exit 0. Für längere Läufe beobachten.
+- **Lifecycle-Fallstrick (dokumentiert, weil nicht offensichtlich):** verl ruft `create()`/`release()` **pro
+  Tool-Call**, nicht pro Episode → die Episoden-Env hängt am `agent_data`-Objekt (und **nie** in
+  `extra_fields`, das wird zum Reward-Worker gepickelt).
+- **⚠️ Der wichtigste Befund — nur 46 % der Rollout-Zeit erzeugt Gradient.** Auswertung der 24 Gruppen des
+  Kurzlaufs (je 8 Rollouts desselben Tasks; Dr.GRPO-Advantage ≠ 0 nur bei Intra-Gruppen-Varianz):
+
+  | Gruppen (je n=8) | Anzahl | Gradient |
+  |---|---|---|
+  | gemischt 0/1 | **11** | ✅ |
+  | alle FAIL (`t_info_zugsuche_status`, teils `t_info_verspaetung_suche`) | 4 | ❌ Advantage 0 |
+  | alle PASS (`t_action_ersatz`, `t_action_ersatz_quali`, `t_action_inspektion_bedingt`) | 9 | ❌ Advantage 0 |
+
+  ⇒ **13/24 Gruppen tot = 104 Episoden Rollout ohne einen Gradienten** — das erklärt die flache Reward-Kurve.
+  Beide Enden schaden gleich: zu leicht ist so wertlos wie zu schwer. **Die Template-Heuristik greift zu kurz,
+  weil Varianz pro TASK entsteht, nicht pro Template** — `t_info_verspaetung_suche` liegt in *beiden* toten
+  Kategorien (manche seiner Tasks immer gelöst, manche nie). Reward pro Template (192 Episoden):
+  `t_info_zugsuche_status` 0,00 (0/24 — deckt sich exakt mit Heldout 0/5) · `t_info_ankunft` 0,38 ·
+  `t_info_verspaetung_suche` 0,50 · `t_info_ankunft_suche` 0,50 · `t_action_wartung_suche` 0,58 ·
+  `t_action_ersatz_quali` 0,97 · `t_action_inspektion_bedingt` 1,00 · `t_action_ersatz` 1,00.
+- **Pool-Fakten:** Train 32 Tasks / 8 Templates (`t_action_ersatz_quali` 7, `t_info_verspaetung_suche` 7,
+  `t_info_ankunft_suche` 6, `t_action_wartung_suche` 4, `t_action_inspektion_bedingt` 3,
+  `t_info_zugsuche_status` 3, `t_info_ankunft` 1, `t_action_ersatz` 1) + val 8. Im Kurzlauf **verbraucht:
+  24 Tasks** (3 Steps × TBS 8; die restlichen 8 kamen nie dran — Epoche unvollendet) × n=8 = 192 Episoden.
+- **Konsequenz / Next:** Die Stage-2-Umgebung ist demonstrierbar. Was einem *echten* Lauf fehlt, ist jetzt
+  quantifiziert: **Task-Kuration**. Base+Think löst 96 % des Heldouts, ep2 99,6 % → Sättigung tötet den
+  Gradienten. Nächster Schritt = die **Reachability-Probe des SQL-Pilots** als `reachability.py` neu bauen
+  (Tasks per k=8 vorab proben, nur 0 < p < 1 behalten) → Nutzrate Richtung 100 % statt 46 %. Danach erst
+  lohnen längere Läufe / lr-Tuning. AReaL-τ²-Tasks brauchen eine zweite Env + zweiten Reward-Pfad →
+  separates Leg, nicht in diesen Pool mixen.
+- MLflow: Experiment **`db_bahn_grpo`** (Runs `grpo_smoke_*`); Checkpoints `data/final/grpo/verl_ckpt/<run>/`,
+  Rollout-Dumps `data/final/grpo/rollout_dump/<run>/`, Pool `data/final/grpo/db_bahn_pool/`.
+
 ## 2026-07-16 — 📊 BFCL-V4-Schnelldurchlauf (Indiz, n=100): parallel-Kategorien brechen ein (−9/20), Live & Multi-Turn halten; ep2 denkt auch auf BFCL nicht
 
 > ⚠️ **Indiz-Lauf, n=klein, NICHT leaderboard-vergleichbar** (Sampling + `--partial-eval` + Handler-Caveat).

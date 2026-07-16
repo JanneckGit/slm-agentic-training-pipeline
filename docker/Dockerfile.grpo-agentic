@@ -1,0 +1,22 @@
+# docker/Dockerfile.grpo-agentic
+# =============================================================================
+# The agentic Stage-2 vehicle = the frozen text2sql verl stack + the tau2 env.
+# Rationale: GRPO rollouts drive the REAL db_bahn tools (tau2 Environment) and
+# evaluation/trajectory_reward.py replays them on a fresh env for the DB hash —
+# so tau2 must be importable INSIDE the verl container (the .venv-tau2 host venv
+# is unreachable from there). Everything load-bearing (verl 0.8.0 + rep-pen /
+# val-resume patches, vLLM nightly cu130, torch 2.11) is inherited unchanged.
+#
+#   docker build -f docker/Dockerfile.grpo-agentic -t agentic-grpo:verl .
+#   GRPO_IMAGE=agentic-grpo:verl docker compose --profile grpo run --rm grpo ...
+#
+# Dep check (2026-07-16): base image has Python 3.12.3 (tau2 needs >=3.12,<3.14),
+# litellm 1.82.0 (tau2 ceiling <1.82.7), pydantic 2.12.4, fastapi, httpx, openai —
+# all satisfied; only `toml` is missing. Pinned to the same tau2 commit the host
+# venv uses (1901a30) so env semantics are identical across SDG / eval / RL.
+# =============================================================================
+FROM text2sql-grpo:verl
+
+RUN pip install --no-cache-dir toml \
+      "tau2 @ git+https://github.com/sierra-research/tau2-bench.git@1901a30" && \
+    python3 -c "import tau2, toml; print('tau2 ok')"

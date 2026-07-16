@@ -104,7 +104,7 @@ services:
   # (entrypoint is python3, so pass the script path directly — NOT `python3 ...`.)
   # ---------------------------------------------------------------------------
   grpo:
-    image: text2sql-grpo:verl
+    image: ${GRPO_IMAGE:-text2sql-grpo:verl}   # agentic Stage-2: GRPO_IMAGE=agentic-grpo:verl (= this stack + tau2, docker/Dockerfile.grpo-agentic)
     build:
       context: ..
       dockerfile: docker/Dockerfile.grpo

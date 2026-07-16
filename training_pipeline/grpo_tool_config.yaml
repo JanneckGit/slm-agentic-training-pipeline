@@ -1,0 +1,32 @@
+# verl tool registry for the db_bahn Stage-2 rollouts (rollout.multi_turn.tool_config_path).
+# One entry per tau2 tool; the class resolves its own OpenAI schema from the live env, so this file
+# only names the tools — the source of truth stays sdg_pipeline/db_bahn/tau2_domain/tools.py.
+# `class_name` is imported by module path -> needs PYTHONPATH=/app (set in the compose grpo service).
+tools:
+  # --- Lookup (READ, by id) ---
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: fahrplan}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: verspaetung}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: zugstandort}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: wartung_status}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: mitarbeiter_info}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: mitarbeiter_details}
+  # --- Search (READ, by filter) ---
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: zuege_suchen}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: mitarbeiter_suchen}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: wartung_liste}
+  # --- Write (rule-gated: rejections force a replan) ---
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: wartung_einplanen}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: crew_zuweisen}
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: wartung_status_setzen}

@@ -50,7 +50,10 @@ flowchart TD
     H -->|merge_adapter.py| S["merged student → vLLM"]
     S -->|"rollout.py on heldout_eval (276)"| EV["in-domain re-baseline<br/>before/after, verifier-scored"]
     S -->|"bfcl generate/evaluate<br/>fixed seed-42 IDs"| OOD["OOD benchmark — BFCL v4<br/>Δ vs base Qwen3-4B"]
-    H -.->|re-wire pending| RL["Stage 2 — GRPO/verl<br/>reward = trajectory_reward.py<br/>rl_train 998 + AReaL τ² 1,982"]
+    S -.->|tbd| TB["TaskBench<br/>decomposition / tool-graph"]
+    S -.->|tbd| T2["τ²-bench<br/>live loop + user simulator"]
+    H -->|ops/grpo_smoke.sh| RL["Stage 2 — GRPO/verl · runs<br/>verl tool-agent loop vs. the SAME 12 tools (C)<br/>grpo_db_bahn_tools.py + grpo_tool_config.yaml<br/>reward: grpo_reward.py → trajectory_reward.py<br/>pool: build_grpo_pool.py (rl_train 998)<br/><i>tbd: reachability.py · AReaL τ² domain</i>"]
+    RL -->|"LoRA ckpt → merge_adapter.py"| S
 ```
 
 ## The SFT data mix (3 legs)
@@ -279,15 +282,20 @@ Everything (metrics + full hyperparams incl. `lora_r`) is tracked in MLflow: `db
 │   ├── build_sft_mix.py              # assemble the 3-leg mix + stratified val split
 │   └── format_traj_for_training.py   # db_bahn rollouts -> chat (split-aware)
 ├── training_pipeline/
-│   ├── train_traj.py                 # LoRA SFT (FA2 + Liger + NEFTune, checkpoint-selection)
-│   └── collator_multiturn.py         # assistant-only loss mask
+│   ├── train_traj.py                 # Stage 1: LoRA SFT (FA2 + Liger + NEFTune, checkpoint-selection)
+│   ├── collator_multiturn.py         #   assistant-only loss mask
+│   ├── grpo_db_bahn_tools.py         # Stage 2: the 12 tau2 tools as verl BaseTools (rollout seam)
+│   ├── grpo_tool_config.yaml         #   verl tool registry (rollout.multi_turn.tool_config_path)
+│   └── build_grpo_pool.py            #   rl_train subset -> verl parquet (tbd: reachability-filtered)
 ├── evaluation/
-│   ├── trajectory_reward.py          # deterministic verifier (= the Stage-2 reward seam)
+│   ├── trajectory_reward.py          # deterministic verifier (= the Stage-2 reward)
+│   ├── grpo_reward.py                #   verl seam: hermes episode text -> messages -> the verifier
 │   └── benchmarks/bfcl/              # BFCL harness: seed-42 sample IDs + generator + pinned requirements
 ├── serving/merge_adapter.py          # LoRA adapter -> merged sharded model (what vLLM serves)
 ├── tools/quantize_fp8.py             # FP8 deploy quantization (manual, via the llmcompressor venv)
-├── ops/                              # teacher_bakeoff.sh · gen_traces.sh · traj_sft_pipeline.sh
+├── ops/                              # teacher_bakeoff.sh · gen_traces.sh · traj_sft_pipeline.sh · grpo_smoke.sh
 ├── docker/                           # sdg / training / vllm / grpo / mlflow (GB10 sm_121 stack)
+│                                     #   Dockerfile.grpo-agentic = frozen verl stack + tau2 (Stage-2 vehicle)
 ├── config/                           # pipeline_config.yaml — the single config (no secrets needed)
 ├── data/                             # raw/ · generated/ · final/                      [gitignored]
 ├── archive/                          # snapshots of earlier data waves                 [gitignored]
