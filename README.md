@@ -201,6 +201,11 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft (assistant-only mask) 
   with **zero regressions**. Per-template breakdown, the checkpoint-selection rationale and the measured
   run-to-run noise (~1 task): [decision log](docs/agentic-db-synthesis-log.md).
   *(Supersedes the wave-1 72.5 % → 70 % at n = 40 — a setup artifact, not a limit of the method.)*
+- **Thinking ablation** (same heldout, `enable_thinking: true`): native thinking lifts the **base** to
+  96.0 % at 6× latency — still below the plan-style SFT student. The **SFT student stays in `<plan>` mode
+  in-domain** (won't emit `<think>` under the domain prompt, even force-prefilled) but thinks normally on
+  neutral prompts — capability intact, behavior context-conditioned. In-domain thinking would need SFT
+  signal (repair top-up), not RL. Details: [decision log](docs/agentic-db-synthesis-log.md) (2026-07-17).
 
 > **Next:** Stage-2 GRPO rebuild (`rl_train` 998 + AReaL τ² 1,982 tasks; reward = `trajectory_reward.py`,
 > recipe = the archived GB10/verl doc — the SQL-era runner is gone).

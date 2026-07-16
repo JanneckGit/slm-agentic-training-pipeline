@@ -4,6 +4,33 @@
 > [agentic-sft-db-synthesis.md](agentic-sft-db-synthesis.md); Datensatz-Erklärung:
 > [agentic-datasets-explained.md](agentic-datasets-explained.md).
 
+## 2026-07-17 — 🧠 Think-Eval auf dem Heldout: Base +6,9 pp durch Denken; ep2 denkt in-domain NICHT mehr
+
+- **Setup:** heldout_eval (276), k=1, `enable_thinking: true` (Scratch-Config), max-tokens/turn 3072, ctx 16384,
+  conc 16, temp 0,7 (= Referenz; Qwen-Think-Empfehlung wäre 0,6 — bewusst nicht genommen, Komparabilität).
+  Verifier strippt `<think>` vor Grounding/Communicate (`_strip_think` + Selftest-Fall 1b). MLflow-Runs
+  `heldout_think_base` / `heldout_think_ep2`; Traces `db_traces_heldout_think_{base,ep2}.jsonl`.
+- **Ergebnis (per-task best-of):**
+  | Lauf | solved | median wall_s |
+  |---|---|---|
+  | Base nothink (Ref) | 245/276 = 88,8 % | 13,9 s |
+  | **Base THINK** | **265/276 = 96,0 %** | 84,0 s (6×) |
+  | ep2 nothink (Ref) | 275/276 = 99,6 % | 16,3 s |
+  | ep2 think-flag | 276/276 = 100,0 % | 18,0 s |
+- **Base:** Thinking hebt v.a. `t_info_wartung` (5/12→12/12), `t_action_wartung_batch` (0/3→3/3),
+  `t_info_ankunft_suche`/`inspektion_bedingt`/`verspaetung_suche`; `t_info_zug_komplett` bleibt schwach (2/6).
+  Kosten: ~200 Denk-Wörter/Turn, 6× wall-clock.
+- **ep2 DENKT NICHT** (0/9 Stichproben + kompletter Run im plan-mode; +1 Task = Rauschniveau, kostet nur +1,7 s median):
+  Die Unterdrückung hängt am **Domänen-Kontext** (Tools-Block+Policy), nicht am `<plan>`-Gebot — auch ohne
+  den Arbeitsweise-Absatz kein `<think>`, und selbst **Prefill mit offenem `<think>` wird sofort verlassen**
+  (Escape zum Tool-Call). Auf **neutralen Prompts denkt ep2 normal** (Zeitrechnung: voller Think) — die
+  Fähigkeit ist intakt, der Domänen-Kontext ist ein starker plan-mode-Attraktor.
+- **Konsequenzen:** (1) In-domain gibt es nichts zu holen — plan-ep2 (99,6-100 %) > denkendes Base (96 %) bei
+  5× weniger Latenz. (2) Naives „RL repariert Thinking in-domain" ist unrealistisch: P(<think>)≈0 überlebt
+  sogar Prefill → kein Explorationssignal; GRPO für *Task-Performance* bleibt unberührt davon. (3) Für
+  Benchmarks (eigene, neutrale Prompts) denkt das Modell voraussichtlich — **BFCL-2×2 ist der Entscheidungspunkt**;
+  erst bei nachgewiesenem OOD-Schaden lohnt Repair-SFT (Teilmenge Think-Traces + Top-up) oder Think-Regen.
+
 ## 2026-07-15 — 🧹 Repo-Konsolidierung: SQL-Legacy komplett raus (Phase C, erweitert)
 
 - **Gelöscht (Git-History = Archiv):** `evaluation/{reward,evaluate}.py`,

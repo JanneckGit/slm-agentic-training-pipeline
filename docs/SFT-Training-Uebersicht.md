@@ -54,6 +54,14 @@ Verschlechterung** — alles, was vorher schon lief, läuft weiter.
 Nebenbefund: die Replan-Fähigkeit bleibt erhalten (`replan_rate` ~0,39), aber die Selbstkorrektur-Rate fällt
 auf 0 — der trainierte Agent macht die Fehler gar nicht mehr, aus denen er sich retten müsste.
 
+**Thinking-Ablation (17.07.2026):** Natives Qwen3-Thinking hebt das **Base** auf 96,0 % — bei 6× Latenz
+(median 84 s vs. 14 s/Task) und trotzdem unter dem plan-trainierten Studenten. Der **SFT-Student denkt
+in der Domäne nicht mehr** (plan-mode-Attraktor: kein `<think>` unter dem Domänen-Prompt, selbst mit
+erzwungenem Prefill), auf neutralen Prompts aber normal — Fähigkeit intakt, Verhalten kontext-konditioniert.
+Konsequenz: In-domain lohnt Thinking nicht (99,6 % > 96,0 % bei 1/5 der Kosten); sollte die BFCL-Eval
+OOD-Schaden zeigen, wäre der Weg ein Repair-SFT mit Think-Traces, nicht RL (Explorationssignal fehlt
+nachweislich). Details: [Decision-Log 2026-07-17](agentic-db-synthesis-log.md).
+
 ---
 
 ## 4. Was wir optimiert haben

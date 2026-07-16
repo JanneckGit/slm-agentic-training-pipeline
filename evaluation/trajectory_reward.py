@@ -55,17 +55,26 @@ def _tool_calls_of(msg: dict) -> list[dict]:
     return msg.get("tool_calls") or []
 
 
+THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_think(text) -> str:
+    """Drop <think>…</think> blocks before grading: speculative values in the reasoning must not
+    count as hallucination (grounding) or as communicated info — judged is only the visible answer."""
+    return THINK_RE.sub("", text or "")
+
+
 def _assistant_text(messages: list[dict]) -> str:
-    return "\n".join(m.get("content") or "" for m in messages if m.get("role") == "assistant")
+    return "\n".join(_strip_think(m.get("content")) for m in messages if m.get("role") == "assistant")
 
 
 def _final_answer(messages: list[dict]) -> str:
-    ans = final_answer(messages)
-    if ans:
+    ans = _strip_think(final_answer(messages))
+    if ans.strip():
         return ans
     for m in reversed(messages):  # fallback (verifier-only): last assistant turn even WITH tool_calls
-        if m.get("role") == "assistant" and (m.get("content") or "").strip():
-            return m["content"]
+        if m.get("role") == "assistant" and _strip_think(m.get("content")).strip():
+            return _strip_think(m["content"])
     return ""
 
 
@@ -266,6 +275,14 @@ def _selftest():
     r = score_trajectory(task, msgs, key)
     assert r["score"] == 1.0, f"good ACTION should pass: {r}"
     assert r["self_recovery"] == 0.0, f"clean trace must not flag self_recovery: {r}"
+
+    # 1b) SAME trace, final answer prefixed with a <think> block containing a bogus ID -> still 1.0
+    #     (thinking-mode eval: speculative values in the reasoning must be stripped, not graded)
+    think = json.loads(json.dumps(msgs))
+    think[-1]["content"] = ("<think>\nVielleicht ist auch MA-99999 verfügbar? Nein, laut Tool nicht.\n</think>\n\n"
+                            + think[-1]["content"])
+    r1b = score_trajectory(task, think, key)
+    assert r1b["score"] == 1.0, f"<think> with bogus ID must be stripped, not graded: {r1b}"
 
     # 2) ACTION trace with the WRONG write -> 0.0 (db hash mismatch)
     bad = json.loads(json.dumps(msgs))
