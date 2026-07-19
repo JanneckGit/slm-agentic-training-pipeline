@@ -12,7 +12,7 @@ Stage-1 (mixed SFT) data basis legs:
   3. synthetic DB flows                                  -> generated locally (not fetched here)
 
 (TaskBench was acquired once but deliberately dropped from the mix — task-graph JSON, no
-executable tool calls; see docs/agentic-datasets-explained.md.)
+executable tool calls.)
 
 This script only ACQUIRES the raw data (a faithful copy; ToolACE gets source/split tags,
 AReaL is a byte-identical repo snapshot). Converting the raw records into the unified

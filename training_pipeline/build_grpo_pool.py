@@ -6,7 +6,7 @@ Usage (in the grpo container):  python3 training_pipeline/build_grpo_pool.py [--
 Pool design — GRPO learns from INTRA-GROUP reward variance: a task the policy always solves (or never
 solves) yields advantage 0 under Dr.GRPO, i.e. no gradient. Base+think already solves 96 % of the heldout,
 so an unfiltered rl_train sample would be mostly all-correct groups. This picks the templates where
-base+think measurably fails (heldout, docs/agentic-db-synthesis-log.md 2026-07-16) plus fault-injected
+base+think measurably fails on the heldout split, plus fault-injected
 tasks (replan pressure), which is the cheap stand-in for the reachability probe the SQL-era pilot ran.
 
 verl schema (verified against the frozen image): the reward manager reads reward_model.ground_truth

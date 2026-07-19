@@ -63,6 +63,9 @@ Thumbs.db
 # Archived artifacts (old teacher runs, deprecated experiment logs)
 archive/
 
+# Design docs & decision log (local working notes, not repo content)
+docs/
+
 # Docker
 docker/*.tar
 

@@ -15,8 +15,7 @@ seed: 42
 # -----------------------------------------------------------------------------
 # TEACHER MODEL — served locally via the vllm compose service.
 # (rollout.py reads teacher.vllm_local; other backends were removed 2026-07-15 —
-#  no script read them. Serving flags per model: ops/teacher_bakeoff.sh +
-#  docs/teacher-bakeoff.md.)
+#  no script read them. Serving flags per model: ops/teacher_bakeoff.sh.)
 # -----------------------------------------------------------------------------
 teacher:
   vllm_local:
@@ -63,8 +62,7 @@ data:
 # -----------------------------------------------------------------------------
 # TRAINING (traj_sft — Stage 1). train_traj.py reads training.lora.* plus the four
 # hyperparameters below as CLI fallbacks. The ACTUAL run recipe (epochs 2, micro 8,
-# --max-seq-len 12288, FA2 + Liger + NEFTune) is launched by ops/traj_sft_pipeline.sh;
-# rationale: docs/SFT-Training-Uebersicht.md.
+# --max-seq-len 12288, FA2 + Liger + NEFTune) is launched by ops/traj_sft_pipeline.sh.
 # -----------------------------------------------------------------------------
 training:
   # LoRA hyperparameters
@@ -93,8 +91,8 @@ training:
 # GRPO (Stage 2) — REMOVED 2026-07-15: the SQL-era verl runner + its config were
 # deleted; the agentic rebuild (reward = evaluation/trajectory_reward.py:compute_score,
 # data = rl_train split + AReaL RL tasks) will define fresh keys here.
-# Validated GB10/verl recipe + all load-bearing flags (load_format=auto, FlashInfer
-# sampler off, rep-pen source patch): docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md
+# Validated GB10/verl load-bearing flags: load_format=auto, FlashInfer sampler off,
+# rep-pen source patch — all applied in ops/grpo_smoke.sh.
 # Frozen stack: image text2sql-grpo:verl (+ docker/Dockerfile.grpo as rebuild recipe).
 # -----------------------------------------------------------------------------
 
@@ -104,7 +102,6 @@ training:
 # frozen sim-clock 2026-06-29, fault-rate 0.35 — all passed as CLI args to
 # seed_worldstate.py / gen_tasks.py (documentation only, no script reads a db_bahn block).
 # Domain code: sdg_pipeline/db_bahn/ (tau2 runtime-registration; needs the Py3.12 tau2 venv).
-# Docs: docs/agentic-sft-db-synthesis.md · docs/agentic-db-synthesis-log.md
 # -----------------------------------------------------------------------------
 
 # Rollout / synthesis knobs (rollout.py reads exactly these three; everything else —
@@ -123,4 +120,4 @@ trajectory:
   enable_thinking: true                  # wave-3 hard rule: ALWAYS generate with thinking;
                                          # reasoning is captured inline as <think>…</think>
   # Teacher bake-off: candidates + serving flags live in ops/teacher_bakeoff.sh (the
-  # single source of truth); results: docs/teacher-bakeoff.md.
+  # single source of truth).

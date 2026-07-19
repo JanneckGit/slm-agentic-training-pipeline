@@ -9,8 +9,8 @@
 # loop passes no enable_thinking kwarg -> nothing to configure). Reward = the SAME deterministic
 # verifier the SDG/eval path uses, via evaluation/grpo_reward.py (Hermes text -> messages -> replay).
 #
-# The load-bearing GB10/verl config below is inherited verbatim from the validated SQL-era pilot
-# (docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md): Dr.GRPO + ref-skip, load_format=auto
+# The load-bearing GB10/verl config below is inherited verbatim from the validated SQL-era pilot:
+# Dr.GRPO + ref-skip, load_format=auto
 # (else the rollout serves RANDOM weights), attn_implementation=sdpa (FA2 fails the actor forward on
 # sm_121), rep-pen 1.1 (needs the image's source patch + the leading `+`), and the wedge fix
 # VLLM_USE_FLASHINFER_SAMPLER=0 (set in the compose service).

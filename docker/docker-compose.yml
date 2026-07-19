@@ -95,8 +95,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # GRPO Service – verl (LoRA, async server-mode) on GB10/sm_121.
-  # DORMANT: the SQL-era runner was removed; the agentic Stage-2 re-wire (db_bahn +
-  # trajectory_reward) is pending. Recipe/flags: docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md
+  # Stage 2 runs the db_bahn tool-agent loop with trajectory_reward as the reward;
+  # launcher + all load-bearing flags: ops/grpo_smoke.sh.
   # image text2sql-grpo:verl = the validated verl+vLLM-0.23-nightly+torch-2.11 stack
   #   (frozen via `docker commit grpo_gate text2sql-grpo:verl`; Dockerfile.grpo is the
   #    from-scratch reproducible fallback — nightly vLLM rolls, so prefer the committed image).
