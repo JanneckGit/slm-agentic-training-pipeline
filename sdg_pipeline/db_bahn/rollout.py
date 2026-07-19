@@ -56,13 +56,14 @@ SYSTEM_TEMPLATE = "{policy}\n\n" + TOOLS_BLOCK_TMPL + """
 
 ## Arbeitsweise (wichtig)
 
-- Beginne jeden Schritt mit einem KURZEN Plan in <plan>…</plan> (1–3 Sätze, keine Selbstzweifel,
-  kein „Warte“/„Eigentlich“, keine Wiederholungen).
-- Rufe Werkzeuge in genau diesem Format auf (ein Block pro Aufruf, Argumente als JSON):
+- Denke vor jedem Schritt gründlich nach (Denkmodus), halte die SICHTBARE Ausgabe aber knapp:
+  keine Selbstzweifel, kein „Warte“/„Eigentlich“, keine Wiederholungen.
+- Rufe Werkzeuge in genau diesem Format auf (ein Block pro Aufruf, Argumente als JSON);
+  UNABHÄNGIGE Abfragen bündelst du als MEHRERE Blöcke im selben Zug:
 <tool_call>
 {{"name": "werkzeug_name", "arguments": {{"argument": "wert"}}}}
 </tool_call>
-- Nach jedem Werkzeug-Ergebnis: kurz prüfen, ob der Plan noch passt; bei Überraschungen umplanen.
+- Nach jedem Werkzeug-Ergebnis: kurz prüfen, ob dein Vorgehen noch passt; bei Überraschungen umplanen.
 - Wenn die Aufgabe gelöst ist: KEIN Tool-Aufruf mehr, sondern eine kurze deutsche Schlussantwort mit den
   belegten Fakten (nur Werte, die ein Werkzeug geliefert hat)."""
 
@@ -70,12 +71,19 @@ SYSTEM_TEMPLATE = "{policy}\n\n" + TOOLS_BLOCK_TMPL + """
 def resolve_teacher(config: dict, api_base=None, model=None) -> dict:
     t = (config.get("teacher") or {}).get("vllm_local", {})
     traj = config.get("trajectory") or {}
+    # wave-3 defaults = the official Qwen3.6 thinking-mode recipe (model card): temp 1.0,
+    # top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5 (the anti-loop knob), thinking ON.
     return {"api_base": api_base or t.get("api_base", "http://localhost:8000/v1"),
             "model": model or t.get("model", ""),
             "api_key": t.get("api_key", "token-local"),
             "max_tokens": int(traj.get("max_tokens_per_turn", t.get("max_tokens", 2048))),
-            "temperature": float(traj.get("temperature", 0.7)),
-            "enable_thinking": bool(traj.get("enable_thinking", False))}
+            "temperature": float(traj.get("temperature", 1.0)),
+            "top_p": float(traj.get("top_p", 0.95)),
+            "top_k": int(traj.get("top_k", 20)),
+            "min_p": float(traj.get("min_p", 0.0)),
+            "presence_penalty": float(traj.get("presence_penalty", 1.5)),
+            "enable_thinking": bool(traj.get("enable_thinking", True)),
+            "legacy_stop": bool(traj.get("legacy_stop", False))}
 
 
 def make_teacher_call(cfg: dict, timeout: float = 600.0):
@@ -89,10 +97,15 @@ def make_teacher_call(cfg: dict, timeout: float = 600.0):
         # (vLLM 400s on tools without --enable-auto-tool-choice — exactly the server dependency we avoid).
         payload = {"model": cfg["model"], "messages": messages,
                    "temperature": cfg["temperature"], "max_tokens": cfg["max_tokens"],
-                   # stop right after a tool-call block: prevents models role-playing the tool
-                   # RESPONSE in the same turn (observed with Qwen3-Next hallucinating results)
-                   "stop": ["</tool_call>", "</tools>", "</TOOLCALL>"],
-                   "include_stop_str_in_output": True}
+                   # top_k/min_p are vLLM protocol extensions (accepted at the top level)
+                   "top_p": cfg["top_p"], "top_k": cfg["top_k"], "min_p": cfg["min_p"],
+                   "presence_penalty": cfg["presence_penalty"]}
+        if cfg.get("legacy_stop"):
+            # pre-wave-3 behavior: halt right after the FIRST tool-call block. This also made
+            # multi-call turns (parallel batching) impossible; the role-played-tool-RESPONSE
+            # problem it solved is now handled by parse_tool_calls' tail cut.
+            payload["stop"] = ["</tool_call>", "</tools>", "</TOOLCALL>"]
+            payload["include_stop_str_in_output"] = True
         if not cfg.get("omit_thinking_kwarg"):  # mistral-tokenizer models reject template kwargs
             payload["chat_template_kwargs"] = {"enable_thinking": cfg["enable_thinking"]}
         r = client.post(url, json=payload, headers=headers)
@@ -117,15 +130,43 @@ def strip_think(content: str) -> str:
     return content.strip()
 
 
-def parse_tool_calls(content: str, native: list[dict]) -> tuple[str, list[dict]]:
-    """Native server-parsed tool_calls win; else parse <tool_call> blocks from the (think-stripped) text."""
+def extract_think(content: str) -> tuple[str, str]:
+    """Split reasoning from the visible output across model dialects — the KEEPING mirror of
+    strip_think (wave 3: thinking is captured, canonically rewrapped as <think>…</think> and
+    stored inline in the assistant content). Unpaired trailing close: everything before it is
+    reasoning (thinking-only models — the template injects the opening tag)."""
+    content = content or ""
+    thinks: list[str] = []
+
+    def grab(m):
+        thinks.append(m.group(1).strip())
+        return ""
+
+    rest = re.sub(r"<(?:seed:)?think>(.*?)</(?:seed:)?think>\s*", grab, content, flags=re.DOTALL)
+    rest = re.sub(r"\[THINK\](.*?)\[/THINK\]\s*", grab, rest, flags=re.DOTALL)
+    for close in ("</seed:think>", "</think>", "[/THINK]"):
+        if close in rest:
+            head, rest = rest.rsplit(close, 1)
+            thinks.append(head.strip())
+    return "\n\n".join(t for t in thinks if t), rest.strip()
+
+
+def parse_tool_calls(content: str, native: list[dict]) -> tuple[str, list[dict], int]:
+    """Native server-parsed tool_calls win; else parse <tool_call> blocks from the (think-stripped)
+    text. Third return: chars of role-played prose AFTER the last tool-call block (wave 3: the
+    stop token is gone, so hallucinated tool RESPONSES are cut here instead — and measured)."""
     content = strip_think(content)
     if native:
         calls = [{"id": tc.get("id") or f"n{i:08d}", "type": "function",
                   "function": {"name": tc["function"]["name"],
                                "arguments": tc["function"].get("arguments") or "{}"}}
                  for i, tc in enumerate(native, 1)]
-        return content, calls
+        return content, calls, 0
+    tail_chars = 0
+    blocks = list(TOOLCALL_RE.finditer(content))
+    if blocks:
+        tail_chars = len(content[blocks[-1].end():].strip())
+        content = content[:blocks[-1].end()]
     calls = []
     for i, block in enumerate(TOOLCALL_RE.findall(content), 1):
         try:
@@ -181,7 +222,7 @@ def parse_tool_calls(content: str, native: list[dict]) -> tuple[str, list[dict]]
                 pass
     clean = FUNC_XML_RE.sub("", TOOLCALL_RE.sub("", content))
     clean = re.sub(r"<tool_call>\s*</tool_call>", "", clean).strip()
-    return clean, calls
+    return clean, calls, tail_chars
 
 
 def openai_tools(env) -> list[dict]:
@@ -269,6 +310,8 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
                               f"{task.get('id')}: {type(e).__name__}: {e}")
     t0 = time.time()
     finish = "max_turns"
+    truncated = False
+    tail_total = 0
     for _ in range(max_turns):
         if time.time() - t0 > rollout_timeout_s:
             finish = "timeout"
@@ -278,11 +321,22 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
         except Exception as e:  # HTTP 4xx/5xx, context overflow, transient server error — end this
             finish = f"teacher_error:{type(e).__name__}: {str(e)[:120]}"  # rollout gracefully (score 0,
             break                                                        # keep partial trace, don't abort)
-        clean, calls = parse_tool_calls(content, native)
-        assistant = {"role": "assistant", "content": clean}
+        # wave 3: capture the reasoning and store it INLINE (canonical <think> rewrap). The same
+        # messages list is the next turn's context, so prior-turn think stays visible to the
+        # teacher — matching both the Qwen template's single-query behavior and what the student
+        # will see in training and at inference.
+        think, visible = extract_think(content)
+        clean, calls, tail_chars = parse_tool_calls(visible, native)
+        tail_total += tail_chars
+        assistant = {"role": "assistant",
+                     "content": (f"<think>\n{think}\n</think>\n\n" if think else "") + clean}
         if calls:
             assistant["tool_calls"] = calls
         messages.append(assistant)
+        if fr == "length":  # wave 3: a turn that hit the token cap is almost always a think loop
+            finish = "truncated"
+            truncated = True
+            break
         if not calls:
             finish = "final_answer" if clean.strip() else f"empty({fr})"
             break
@@ -297,6 +351,8 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
                              "content": content_s[:MAX_TOOL_CONTENT]})
     score = score_trajectory(task, messages, key)
     return {"messages": messages, "score": score, "finish_reason": finish,
+            "truncated": truncated, "degen": degen_stats(messages),
+            "roleplay_tail_chars": tail_total,
             "wall_s": round(time.time() - t0, 2)}
 
 
@@ -382,6 +438,42 @@ def _graded(res: dict) -> float:
     return sum(1 for v in comp.values() if v) / len(comp) if comp else 0.0
 
 
+# --- wave 3: degeneration gate (the verifier is outcome-based and blind to think rambling) ----
+# CONSERVATIVE initial thresholds — calibrated against the smoke runs' P99 of healthy verified
+# traces (S6); a hit means "regenerate", not "keep", so false positives only cost a retry.
+DEGEN_MAX_THINK_CHARS = 12_000
+DEGEN_MAX_DUP8_RATIO = 0.5
+THINK_CAPTURE_RE = re.compile(r"<think>\n?(.*?)\n?</think>", re.DOTALL)
+
+
+def degen_stats(messages: list) -> dict:
+    """Worst-case think length + 8-gram duplication ratio across the trace's think blocks."""
+    dup_max, think_max = 0.0, 0
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for th in THINK_CAPTURE_RE.findall(m.get("content") or ""):
+            think_max = max(think_max, len(th))
+            words = th.split()
+            if len(words) >= 32:
+                grams = [" ".join(words[i:i + 8]) for i in range(len(words) - 7)]
+                dup_max = max(dup_max, 1.0 - len(set(grams)) / len(grams))
+    return {"think_ngram_dup_ratio": round(dup_max, 3), "max_think_chars": think_max}
+
+
+def is_degenerate(res: dict) -> bool:
+    d = res.get("degen") or {}
+    return (d.get("think_ngram_dup_ratio", 0.0) > DEGEN_MAX_DUP8_RATIO
+            or d.get("max_think_chars", 0) > DEGEN_MAX_THINK_CHARS)
+
+
+def accepted(res: dict) -> bool:
+    """Wave-3 accept gate: verified AND not token-capped AND not degenerate. Replaces the bare
+    score==1.0 checks in solve_task/_try_recovery, so branch/regen machinery re-rolls loops."""
+    return (res["score"]["score"] == 1.0 and not res.get("truncated")
+            and not is_degenerate(res))
+
+
 def _try_recovery(base: dict, task: dict, key: dict, make_call, args) -> tuple:
     """One B2-priority recovery attempt on a failed rollout: harvest (keep the mistake) first, then
     yield-mode (clean) fallback. Returns (candidate, mode|None, n_resamples). `candidate` is the best
@@ -396,7 +488,7 @@ def _try_recovery(base: dict, task: dict, key: dict, make_call, args) -> tuple:
         cand = run_rollout(task, key, make_call(temp_bump=bump), args.max_turns,
                            args.rollout_timeout_s, resume_messages=prefix)
         n += 1
-        if cand["score"]["score"] == 1.0:
+        if accepted(cand):
             return cand, mode, n
         if _graded(cand) > _graded(best):
             best = cand
@@ -414,29 +506,29 @@ def solve_task(task: dict, key: dict, make_call, args, teacher_cfg) -> dict:
 
     best = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
     n_branch = 0
-    mode = "direct" if best["score"]["score"] == 1.0 else None
+    mode = "direct" if accepted(best) else None
 
     if not is_oracle:
         for _ in range(args.max_regen + 1):
-            if best["score"]["score"] == 1.0:
+            if accepted(best):
                 break
             if branch_on and n_branch < args.branch_attempts:  # branch-first: recovery before restart
                 cand, m, n = _try_recovery(best, task, key, make_call, args)
                 n_branch += n
                 best = cand
-                if best["score"]["score"] == 1.0:
+                if accepted(best):
                     mode = m
                     break
             # recovery didn't verify (or no reusable prefix / budget spent) → fresh full sample
             fresh = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
-            if fresh["score"]["score"] == 1.0:
+            if accepted(fresh):
                 best, mode = fresh, "restart"
                 break
             if _graded(fresh) > _graded(best):
                 best = fresh
 
     best["n_branch_attempts"] = n_branch
-    best["recovery_mode"] = mode or ("direct" if best["score"]["score"] == 1.0 else "failed")
+    best["recovery_mode"] = mode or ("direct" if accepted(best) else "failed")
     return best
 
 
@@ -453,6 +545,16 @@ def main():
                     help="pick --n-tasks round-robin over templates (balanced bake-off subset)")
     ap.add_argument("--max-tokens-per-turn", type=int, default=None)
     ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--min-p", type=float, default=None)
+    ap.add_argument("--presence-penalty", type=float, default=None)
+    ap.add_argument("--enable-thinking", dest="enable_thinking", action="store_true", default=None,
+                    help="override config trajectory.enable_thinking (wave-3 default: on)")
+    ap.add_argument("--no-enable-thinking", dest="enable_thinking", action="store_false")
+    ap.add_argument("--legacy-stop", action="store_true",
+                    help="restore the pre-wave-3 stop list (halts after the FIRST tool call — "
+                         "makes parallel multi-call turns impossible; A/B fallback only)")
     ap.add_argument("--omit-thinking-kwarg", action="store_true",
                     help="don't send chat_template_kwargs (mistral tokenizer mode)")
     ap.add_argument("--concurrency", type=int, default=4)
@@ -539,10 +641,19 @@ def main():
             teacher_cfg["max_tokens"] = args.max_tokens_per_turn
         if args.temperature is not None:
             teacher_cfg["temperature"] = args.temperature
+        for flag in ("top_p", "top_k", "min_p", "presence_penalty"):
+            v = getattr(args, flag)
+            if v is not None:
+                teacher_cfg[flag] = v
+        if args.enable_thinking is not None:
+            teacher_cfg["enable_thinking"] = args.enable_thinking
+        if args.legacy_stop:
+            teacher_cfg["legacy_stop"] = True
         teacher_cfg["omit_thinking_kwarg"] = args.omit_thinking_kwarg
     lock = threading.Lock()
     stats = {"n": 0, "verified": 0, "replan": 0, "turns": 0.0,
-             "branched": 0, "emergent_rec": 0, "scripted_rec": 0}
+             "branched": 0, "emergent_rec": 0, "scripted_rec": 0,
+             "truncated": 0, "degen": 0, "roleplay_tail": 0}
     tmpl_n, tmpl_verified = Counter(), Counter()  # per-template yield (eval breakdown)
     out_f = open(out_path, "a")
 
@@ -571,16 +682,27 @@ def main():
         sc, fault = res["score"], key.get("fault", "none")
         rec = {"task_id": tid, "sample_idx": s, "split": args.split, "teacher": teacher_label,
                "template": key["template"], "injected": key["injected"], "fault": fault,
+               "expected_calls": key.get("expected_calls", 0),  # wave 3: for the >=3x filter
                "n_branch_attempts": res.get("n_branch_attempts", 0),
                "recovery_mode": res.get("recovery_mode", "direct"),
+               "truncated": bool(res.get("truncated")), "degen": res.get("degen") or {},
+               "roleplay_tail_chars": res.get("roleplay_tail_chars", 0),
+               "gen_params": None if teacher_cfg is None else
+               {k: teacher_cfg.get(k) for k in ("temperature", "top_p", "top_k", "min_p",
+                                                "presence_penalty", "enable_thinking",
+                                                "legacy_stop", "max_tokens")},
                "score": sc, "finish_reason": res["finish_reason"],
                "wall_s": res["wall_s"], "messages": res["messages"]}
         with lock:
             out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out_f.flush()
             stats["n"] += 1
-            verified = sc["score"] == 1.0
+            # wave-3 accept semantics: a verified-but-truncated/degenerate trace is NOT a yield
+            verified = accepted(res)
             stats["verified"] += verified
+            stats["truncated"] += rec["truncated"]
+            stats["degen"] += is_degenerate(res)
+            stats["roleplay_tail"] += rec["roleplay_tail_chars"] > 0
             stats["replan"] += sc["replan_occurred"]
             stats["turns"] += sc["turns_used"]
             stats["branched"] += res.get("n_branch_attempts", 0)
@@ -609,6 +731,8 @@ def main():
     print(f"  avg turns         : {stats['turns'] / n:.1f}")
     if args.branch_on_fail:
         print(f"  branch-attempts   : {stats['branched']} total")
+    print(f"  wave-3 gates      : truncated {stats['truncated']}, degen {stats['degen']}, "
+          f"roleplay-tails {stats['roleplay_tail']}")
     # B0 self-recovery detector (share of VERIFIED traces that recovered from >=1 tool error)
     print(f"  self-recovery     : emergent {stats['emergent_rec']}/{stats['verified']} "
           f"({stats['emergent_rec'] / v:.1%}), scripted {stats['scripted_rec']}/{stats['verified']} "
@@ -636,7 +760,9 @@ def main():
                     "verified_yield": stats["verified"] / n, "replan_rate": stats["replan"] / n,
                     "avg_turns": stats["turns"] / n, "n_rollouts": stats["n"],
                     "emergent_recovery_rate": stats["emergent_rec"] / v,
-                    "scripted_recovery_rate": stats["scripted_rec"] / v})
+                    "scripted_recovery_rate": stats["scripted_rec"] / v,
+                    "truncated_rate": stats["truncated"] / n, "degen_rate": stats["degen"] / n,
+                    "roleplay_tail_rate": stats["roleplay_tail"] / n})
                 for tpl in sorted(tmpl_n):  # per-template yield = the eval breakdown (before/after)
                     mlflow.log_metric(f"yield_{tpl}", tmpl_verified[tpl] / max(1, tmpl_n[tpl]))
                 print(f"  [mlflow] logged run '{args.mlflow_run_name or teacher_label}' "

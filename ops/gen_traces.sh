@@ -17,11 +17,13 @@ COMPOSE="docker compose -f docker/docker-compose.yml"
 TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 
 TEACHER=${TEACHER:-"Qwen/Qwen3.6-35B-A3B"}       # bake-off winner: 92% yield, ~16s/rollout
-SHORT=${SHORT:-"q36-35b-a3b"}
+# wave-3 default is a NEW trace file (-w3): the old q36-35b-a3b file holds wave-2.5 NO-THINK
+# traces whose task_ids partially overlap — resuming into it would silently mix them.
+SHORT=${SHORT:-"q36-35b-a3b-w3"}
 SPLIT=${SPLIT:-"sft_train"}
 TOPUP=${TOPUP:-1}
-MAX_TURNS=${MAX_TURNS:-12}                        # headroom for wave-2 multi-tool + replan chains
-CONCURRENCY=${CONCURRENCY:-4}                     # GB10 vLLM guidance (--max-num-seqs 4)
+MAX_TURNS=${MAX_TURNS:-14}                        # wave-3: iteration chains + transient retries
+CONCURRENCY=${CONCURRENCY:-8}                     # smoke-S4 winner; server --max-num-seqs follows it
 EXP="db_bahn_traj_gen"
 
 TRACE="data/generated/db_traces_${SPLIT}_${SHORT}.jsonl"
@@ -32,10 +34,11 @@ mkdir -p data/generated data/final logs
 # host eval/gen writes to the SAME physical store the training container mounts (../mlruns)
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"
 
-serve() {  # winner's flags, from ops/teacher_bakeoff.sh
+serve() {  # winner's flags, from ops/teacher_bakeoff.sh; wave-3: 20480 ctx (inline <think> grows
+  # the dialog), --max-num-seqs coupled to CONCURRENCY (hybrid-GDN KV is ~20 KB/token -> cheap)
   $COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
-  VLLM_MODEL="$TEACHER" VLLM_GPU_UTIL="0.85" VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}" \
-    VLLM_EXTRA_ARGS="--max-num-seqs 4 --gdn-prefill-backend triton" \
+  VLLM_MODEL="$TEACHER" VLLM_GPU_UTIL="0.85" VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
+    VLLM_EXTRA_ARGS="--max-num-seqs $CONCURRENCY --gdn-prefill-backend triton" \
     $COMPOSE --profile vllm up -d vllm >>logs/gen_traces.log 2>&1
   for _ in $(seq 120); do curl -sf localhost:8000/health >/dev/null 2>&1 && return 0; \
     docker ps --format '{{.Names}}' | grep -q text2sql_vllm_teacher || return 1; sleep 10; done
@@ -50,7 +53,7 @@ roll() {  # $1 = mlflow run-name ; $2.. = extra rollout flags (e.g. --k / --task
     sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
     --split "$SPLIT" --model "$TEACHER" --teacher-name "$SHORT" \
     --api-base http://localhost:8000/v1 \
-    --branch-on-fail --max-turns "$MAX_TURNS" --max-tokens-per-turn 1536 --concurrency "$CONCURRENCY" \
+    --branch-on-fail --max-turns "$MAX_TURNS" --max-tokens-per-turn 3072 --concurrency "$CONCURRENCY" \
     --mlflow --mlflow-experiment "$EXP" --mlflow-run-name "$RUN" \
     --output "$TRACE" "$@" || {
       local rc=$?
@@ -75,9 +78,16 @@ if [ "$TOPUP" = "1" ]; then
   N_FAIL=$("$TAU2PY" - <<PY
 import json, collections
 sft = set(json.load(open("$SPLITF"))["$SPLIT"])          # only top up tasks still in this split
+# wave-3 accept semantics (mirror of rollout.accepted): verified AND not token-capped AND not
+# degenerate — a verified-but-degenerate trace must be re-rolled, format_traj would drop it.
 best = collections.defaultdict(float)
 for ln in open("$TRACE"):
-    r = json.loads(ln); best[r["task_id"]] = max(best[r["task_id"]], r["score"]["score"])
+    r = json.loads(ln)
+    d = r.get("degen") or {}
+    ok = (r["score"]["score"] == 1.0 and not r.get("truncated")
+          and d.get("think_ngram_dup_ratio", 0.0) <= 0.5
+          and d.get("max_think_chars", 0) <= 12000)
+    best[r["task_id"]] = max(best[r["task_id"]], 1.0 if ok else 0.0)
 failed = sorted(t for t, s in best.items() if s < 1.0 and t in sft)
 open("$FAILED", "w").write("\n".join(failed))
 print(len(failed))

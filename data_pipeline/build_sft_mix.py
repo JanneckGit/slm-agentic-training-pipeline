@@ -34,10 +34,17 @@ LEGS = {
 
 
 def is_flail(rec: dict) -> bool:
-    """A trace with an identical tool call repeated back-to-back (name + args) — the over-search signal."""
-    calls = [(tc["function"]["name"], json.dumps(tc["function"]["arguments"], sort_keys=True))
+    """A trace with an identical tool call repeated back-to-back (name + args) — the over-search
+    signal. Wave-3 exception: a repeat whose first occurrence got a TRANSIENT error observation
+    ('vorübergehend' marker, tools.py TRANSIENT_MSG) is the policy-mandated retry, not a flail."""
+    obs = {m.get("tool_call_id"): (m.get("content") or "")
+           for m in rec["messages"] if m.get("role") == "tool"}
+    calls = [(tc["function"]["name"], json.dumps(tc["function"]["arguments"], sort_keys=True),
+              tc.get("id"))
              for m in rec["messages"] if m.get("tool_calls") for tc in m["tool_calls"]]
-    return any(calls[i] == calls[i + 1] for i in range(len(calls) - 1))
+    return any(calls[i][:2] == calls[i + 1][:2]
+               and "vorübergehend" not in obs.get(calls[i][2], "")
+               for i in range(len(calls) - 1))
 
 
 def n_assistant_turns(rec: dict) -> int:

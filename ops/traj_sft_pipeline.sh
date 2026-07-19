@@ -15,9 +15,12 @@ MERGED_CTR="/app/data/final/checkpoints/db_bahn_traj_merged"
 ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
 
 serve() {  # $1=model $2=served-name-model $3=gpu_util
+  # wave 3.5: ctx 20480 (inline <think> grows the dialogs — same window as generation).
+  # NO --gdn-prefill-backend here: this script serves only standard transformers (base 4B /
+  # merged students); the GDN flag belongs to the hybrid teacher in ops/gen_traces.sh.
   $COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
-  VLLM_MODEL="$1" VLLM_GPU_UTIL="${3:-0.85}" VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}" \
-    VLLM_EXTRA_ARGS="--max-num-seqs 16 --gdn-prefill-backend triton" \
+  VLLM_MODEL="$1" VLLM_GPU_UTIL="${3:-0.85}" VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
+    VLLM_EXTRA_ARGS="--max-num-seqs 16" \
     $COMPOSE --profile vllm up -d vllm >>logs/traj_sft.log 2>&1
   for _ in $(seq 90); do curl -sf localhost:8000/health >/dev/null 2>&1 && return 0; \
     docker ps --format '{{.Names}}' | grep -q text2sql_vllm_teacher || return 1; sleep 10; done
@@ -26,11 +29,15 @@ serve() {  # $1=model $2=served-name-model $3=gpu_util
 
 eval_heldout() {  # $1=served-model $2=label $3=outfile
   # concurrency 16 must match serve()'s --max-num-seqs 16 (a higher client conc would just queue server-side).
-  # The old 4 was calibrated for the 35B-A3B teacher; the 4B student needs only ~29 GB KV for 16 seqs @12k.
+  # wave 3.5 THINK eval (fair vs. the base+think baselines): thinking ON, 3072/turn, max-turns 15
+  # (the depth classes need up to 13 calls). Sampling = the STUDENT recipe from the Qwen3-4B card
+  # (temp 0.6 / presence 0) — NOT the config default, which now carries the Qwen3.6 TEACHER recipe
+  # (temp 1.0 / presence 1.5); without these flags the wrong recipe would silently apply.
   timeout 21600 env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
     sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
     --split heldout_eval --k 1 --api-base http://localhost:8000/v1 --model "$1" --teacher-name "$2" \
-    --max-turns 8 --max-tokens-per-turn 1536 --max-regen 1 --concurrency 16 \
+    --enable-thinking --temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0.0 \
+    --max-turns 15 --max-tokens-per-turn 3072 --max-regen 1 --concurrency 16 \
     --mlflow --mlflow-run-name "$2" \
     --output "$3" 2>&1 | tail -6
 }

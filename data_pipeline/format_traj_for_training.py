@@ -25,6 +25,11 @@ from pathlib import Path
 
 from data_pipeline.common import args_dict, final_answer
 
+# wave-3 degeneration thresholds — keep in sync with sdg_pipeline/db_bahn/rollout.py
+# (duplicated on purpose: this module must not drag the tau2 env import chain in)
+DEGEN_MAX_THINK_CHARS = 12_000
+DEGEN_MAX_DUP8_RATIO = 0.5
+
 VALID_ROLES = {"system", "user", "assistant", "tool"}
 
 
@@ -54,6 +59,7 @@ def convert(rec: dict) -> dict | None:
         "_meta": {
             "task_id": rec["task_id"], "template": rec["template"],
             "injected": rec["injected"], "fault": rec.get("fault", "none"), "teacher": rec["teacher"],
+            "expected_calls": rec.get("expected_calls", 0),
             "turns": rec["score"]["turns_used"], "n_tool_calls": rec["score"]["n_tool_calls"],
             "replan": bool(rec["score"].get("replan_occurred")),
             # B0/B2: self-correction. A B2-harvested trace ("recovery_mode":"harvest") kept the mistake +
@@ -84,7 +90,8 @@ def main():
         keep_ids = set(json.load(open(args.split_file))[args.split])
 
     n_in = n_out = 0
-    drops = {"unverified": 0, "structure": 0, "off_split": 0}
+    drops = {"unverified": 0, "structure": 0, "off_split": 0,
+             "truncated": 0, "degen": 0, "inefficient": 0}
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -96,6 +103,19 @@ def main():
                 continue
             if rec.get("score", {}).get("score") != 1.0:
                 drops["unverified"] += 1
+                continue
+            # --- wave-3 hard gates (the verifier is outcome-based and blind to these) -------
+            if rec.get("truncated"):  # turn hit the token cap -> almost always a think loop
+                drops["truncated"] += 1
+                continue
+            d = rec.get("degen") or {}
+            if d.get("think_ngram_dup_ratio", 0.0) > DEGEN_MAX_DUP8_RATIO \
+                    or d.get("max_think_chars", 0) > DEGEN_MAX_THINK_CHARS:
+                drops["degen"] += 1
+                continue
+            exp = int(rec.get("expected_calls") or 0)
+            if exp > 0 and rec["score"]["n_tool_calls"] >= 3 * exp:  # flail: >=3x the oracle path
+                drops["inefficient"] += 1
                 continue
             conv = convert(rec)
             if conv is None:
