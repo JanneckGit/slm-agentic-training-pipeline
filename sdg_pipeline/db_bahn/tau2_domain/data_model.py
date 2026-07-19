@@ -10,7 +10,7 @@ Requires the tau2 (Python 3.12) venv — only imported in the tau2 context.
 
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from tau2.environment.db import DB
 
@@ -112,6 +112,12 @@ class Assignment(BaseModel):
 
 class BahnDB(DB):
     """Frozen Deutsche-Bahn world-state (real gtfs.de de_fv seed + synthetic seeded tables)."""
+
+    # Wave 3: pending transient-fault counters {tool_name: remaining_failures}, set via
+    # inject_transient_stoerung. PrivateAttr on purpose: NOT part of model_dump(), so the
+    # verifier's db_match/no_write hash comparison stays blind to consumed counters and
+    # db.json serialization is unchanged. model_copy(deep=True) carries it (pydantic v2).
+    _transient: Dict[str, int] = PrivateAttr(default_factory=dict)
 
     meta: dict = Field(default_factory=dict)
     stations: Dict[str, Station] = Field(default_factory=dict)

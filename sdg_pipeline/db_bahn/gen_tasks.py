@@ -56,6 +56,15 @@ from sdg_pipeline.db_bahn.gen_templates_hard import (
     t_info_ankunft_suche, t_info_mitarbeiter_suche, t_info_schichtcheck,
     t_info_verspaetung_suche, t_info_wartung_depot, t_info_zug_komplett,
     t_info_zugsuche_status)
+from sdg_pipeline.db_bahn.gen_templates_wave3 import (
+    t_action_batch_konflikt, t_action_batch_liste, t_action_doppelfault,
+    t_action_iteration_ersatz, t_action_kaskade, t_action_lagebericht,
+    t_action_umlauf_wartung, t_info_aggregation, t_info_anschluss,
+    t_info_batch_phantom, t_info_batch_verspaetung, t_info_datenluecke,
+    t_info_iteration_bedingt, t_info_ma_verfeinern, t_info_name_suche,
+    t_info_teilerledigt, t_info_transient, t_info_umlauf_fahrzeug,
+    t_info_wo_verfeinern, t_refusal_nicht_existent, t_refusal_nicht_machbar,
+    t_refusal_policy)
 
 
 # ---------------------------------------------------------------------------------------
@@ -103,6 +112,36 @@ TEMPLATES = [
     Spec(t_action_wstatus_konflikt, "trips_veh_konflikt", 120, False),   # pool-capped ~57
     Spec(t_action_wartung_batch, "trips_veh_2open", 250, False),         # pool-capped ~121
     Spec(t_action_gefahrgut, "trips_lokf_no_quali_produkt", 100, False), # pool-capped ~88 (GTFS-fix)
+    # wave-3 hardening tier (2026-07-18): the mechanics the SFT data never demanded —
+    # parallel/batch, iteration over hits, aggregation, refusal, cascades, Umlauf ambiguity,
+    # >10-hit refinement, data gaps, transfer logic, transient errors, ambiguous names
+    # S5-corridor rebalance (2026-07-18): the three IN-CORRIDOR classes (base 6-42%) carry the
+    # real learning signal -> harvest their full pools; the easy-for-base classes stay at their
+    # calibrated n as style/format carriers (think, parallel, refusal wording, retry policy).
+    Spec(t_info_batch_verspaetung, "trips_batch3", 300, None),
+    Spec(t_action_batch_liste, "wo_combos_batch", 999, False),           # pool-capped ~405 (CORRIDOR 42%)
+    Spec(t_info_iteration_bedingt, "station_iter_groups", 999, None),    # pool-capped, window 3-10 (CORRIDOR 6%)
+    Spec(t_info_aggregation, "trips_batch3", 250, None),
+    Spec(t_refusal_nicht_existent, "trips", 150, False),
+    Spec(t_refusal_nicht_machbar, "trips", 150, False),
+    Spec(t_refusal_policy, "trips_veh_abgeschlossen", 200, False),       # pool-capped ~185
+    Spec(t_action_kaskade, "trips_lokf", 200, None),
+    Spec(t_info_umlauf_fahrzeug, "trips_same_vehicle", 250, False),      # pool-capped ~276
+    Spec(t_info_ma_verfeinern, "ma_refine_combos", 300, False),
+    Spec(t_info_wo_verfeinern, "wo_refine_combos", 400, False),          # (CORRIDOR 39%)
+    Spec(t_info_datenluecke, "trips_pos", 200, None),
+    Spec(t_info_anschluss, "anschluss_pairs", 300, True, 0.5),
+    Spec(t_info_teilerledigt, "trips_lokf", 200, True),
+    Spec(t_info_name_suche, "employees_common_name", 250, False),        # pool-capped ~304
+    Spec(t_info_transient, "trips_pos", 150, None),
+    # wave-3.5 tier (2026-07-18): conjunction tickets (multiplicative hardness) + depth
+    # compositions — where the corridor measurement located the real base-4B weakness
+    Spec(t_action_lagebericht, "trips_pos_lokf", 250, True),
+    Spec(t_action_batch_konflikt, "wo_batch_konflikt", 200, False),
+    Spec(t_info_batch_phantom, "trips_batch3", 200, None),
+    Spec(t_action_iteration_ersatz, "station_iter_groups", 999, None),   # pool-capped ~60-75
+    Spec(t_action_doppelfault, "trips_lokf", 250, None),
+    Spec(t_action_umlauf_wartung, "veh_pairs_mixed", 250, False),
 ]
 
 
@@ -113,8 +152,13 @@ def main():
     # wave-2.5 defaults for the ~10.5k pool: bakeoff = one task per template (default tracks the
     # registry, so a new template can't silently drop out); heldout/rl scaled for eval power + GRPO
     ap.add_argument("--n-bakeoff", type=int, default=len(TEMPLATES))
-    ap.add_argument("--n-heldout", type=int, default=275)
-    ap.add_argument("--n-rl", type=int, default=1000,
+    # wave-3.5 split decision (2026-07-19): heldout AND rl are UNIFORM — a fixed count PER
+    # TEMPLATE instead of proportional-to-size. Rationale: per-class solve rates are the eval
+    # instrument (a 2-slot class can only read 0/50/100%), and the rl reserve must not be
+    # dominated by the big easy classes. Neutral rule, NOT hardness weighting. Consequence:
+    # headline eval numbers break with the proportional-397 era (86.6% baseline is stale).
+    ap.add_argument("--n-heldout-per-template", type=int, default=10)
+    ap.add_argument("--n-rl-per-template", type=int, default=20,
                     help="GRPO task reserve — disjoint from SFT, never rolled out for SFT")
     ap.add_argument("--out-dir", default=str(DATA_DIR))
     args = ap.parse_args()
@@ -173,13 +217,15 @@ def main():
         by_tpl[tpl] = sorted(by_tpl[tpl])
         rng(args.seed, "split", tpl).shuffle(by_tpl[tpl])
 
-    total = len(tasks)
-    hel_frac, rl_frac = args.n_heldout / total, args.n_rl / total  # targets are approximate
+    total = len(tasks)  # consumed by the disjointness hard-fail assert below
     heldout, rl, sft = [], [], []
     for tpl in sorted(by_tpl):
         ids = by_tpl[tpl]
-        n_hel = max(1, round(len(ids) * hel_frac))   # >=1 per template in heldout
-        n_rl = max(2, round(len(ids) * rl_frac))     # >=2 per template in rl
+        # UNIFORM per template, FIXED counts (Janneck 2026-07-19: no soft caps) — a template too
+        # small for 10+20+sft trips the "templates missing from sft_train" HARD-FAIL below,
+        # which is the intended loud signal (current smallest template: 57 -> 10/20/27)
+        n_hel = args.n_heldout_per_template
+        n_rl = args.n_rl_per_template
         heldout += ids[:n_hel]
         rl += ids[n_hel:n_hel + n_rl]
         sft += ids[n_hel + n_rl:]                     # the rest -> sft (guaranteed non-empty per template)

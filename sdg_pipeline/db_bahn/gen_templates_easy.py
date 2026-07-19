@@ -8,7 +8,8 @@ Easy/mid-tier task templates (1-2 calls; polished wave-1 set regenerated under t
 from sdg_pipeline.db_bahn.seed_worldstate import rng
 from sdg_pipeline.db_bahn.gen_tasks_lib import (
     DELAY_CAUSES, MAINT_TYPES, Gen,
-    _apply, _grund_comm, build_task, env_assert, inj_call, oc, qual_for, ref_action, sid)
+    _apply, _grund_comm, build_task, env_assert, inj_call, maybe_distraktor, oc,
+    qual_for, ref_action, sid, vary)
 from sdg_pipeline.db_bahn.tau2_domain.tools import BahnTools
 
 # ---------------------------------------------------------------------------------------
@@ -22,8 +23,16 @@ def t_info_verspaetung(g: Gen, trip, idx, inject: bool):
                                minuten=r.choice([25, 35, 45, 60, 90]), grund=r.choice(DELAY_CAUSES))]
     tk = _apply(g.fresh(), injections)
     v = tk.verspaetung(trip.zugnummer)
-    ticket = (f"Prüfe die aktuelle Verspätung von {trip.zugnummer}. "
+    # wave-3 A-hardening: 1/3 of tickets carry a colleague's (unverified) claim to correct,
+    # plus an occasional entity-free distractor sentence — dedicated rng streams, so the
+    # injection draw above is byte-stable.
+    base_q = (f"Prüfe die aktuelle Verspätung von {trip.zugnummer}. "
               f"Wie viele Minuten Verspätung hat der Zug und aus welchem Grund?")
+    claim_q = (f"Angeblich hängt {trip.zugnummer} gerade mit erheblicher Verspätung fest — "
+               f"stimmt das? Prüfe die aktuelle Verspätung und nenne Minuten und Grund "
+               f"(oder 'pünktlich').")
+    ticket = vary(g, "info_verspaetung", trip.zugnummer, [base_q, base_q, claim_q]) \
+        + maybe_distraktor(g, "info_verspaetung", trip.zugnummer, p=0.25)
     task = build_task(f"info_verspaetung__{sid(trip.zugnummer)}__{idx:03d}", ticket,
                       "INFO: aktuelle Verspätung + Grund abfragen", injections, None, None,
                       _grund_comm(v), ["COMMUNICATE"])
@@ -37,7 +46,8 @@ def t_info_standort(g: Gen, trip, idx, inject: bool):
     s = tk.zugstandort(trip.zugnummer)
     if s.get("status") != "unterwegs" or not s.get("naechster_halt"):
         return None
-    ticket = f"Wo befindet sich {trip.zugnummer} gerade? Nenne insbesondere den nächsten Halt."
+    ticket = (f"Wo befindet sich {trip.zugnummer} gerade? Nenne insbesondere den nächsten Halt."
+              + maybe_distraktor(g, "info_standort", trip.zugnummer, p=0.25))
     task = build_task(f"info_standort__{sid(trip.zugnummer)}__{idx:03d}", ticket,
                       "INFO: aktueller Standort + nächster Halt", [], None, None,
                       [s["naechster_halt"]], ["COMMUNICATE"])
@@ -83,7 +93,8 @@ def t_info_wartung(g: Gen, trip, idx, inject: bool):
         return None
     comm = [offen[0]["order_id"], offen[0]["due_at"][:10]]
     ticket = (f"Welche offenen Wartungsaufträge gibt es für das Fahrzeug von {trip.zugnummer}? "
-              f"Nenne Auftrags-ID, Typ, Status und Fälligkeit.")
+              f"Nenne Auftrags-ID, Typ, Status und Fälligkeit."
+              + maybe_distraktor(g, "info_wartung", trip.zugnummer, p=0.25))
     task = build_task(f"info_wartung__{sid(trip.zugnummer)}__{idx:03d}", ticket,
                       "INFO: offene Wartungsaufträge eines Fahrzeugs", [], None, None,
                       comm, ["COMMUNICATE"])
@@ -101,7 +112,8 @@ def t_info_crew(g: Gen, trip, idx, inject: bool):
         return None
     comm = [lokf[0]["mitarbeiter_id"], lokf[0]["name"]]
     ticket = (f"Wer ist auf {trip.zugnummer} als Lokführer eingeteilt? "
-              f"Nenne Name und Mitarbeiter-ID.")
+              f"Nenne Name und Mitarbeiter-ID."
+              + maybe_distraktor(g, "info_crew", trip.zugnummer, p=0.25))
     task = build_task(f"info_crew__{sid(trip.zugnummer)}__{idx:03d}", ticket,
                       "INFO: Besatzung eines Zuges abfragen", [], None, None, comm, ["COMMUNICATE"])
     key = {"kind": "info", "expected_tools": ["mitarbeiter_info"],
@@ -133,8 +145,10 @@ def t_action_wartung(g: Gen, trip, idx, inject: bool):
     r = rng(g.seed, "act", "wartung", trip.trip_id)
     typ = r.choice(MAINT_TYPES)
     due = f"2026-07-{r.randint(4, 10):02d} {r.choice(['06:00', '08:00', '22:00'])}"
+    # wave 3.5 (soft H1): the lookup recipe is gone — the fahrzeug_id is only reachable via
+    # wartung_status, so the route stays physically enforced
     ticket = (f"Plane für das Fahrzeug von {trip.zugnummer} eine Wartung vom Typ '{typ}' ein, "
-              f"fällig am {due}. Ermittle zuerst die Fahrzeug-ID über den Wartungsstatus des Zuges.")
+              f"fällig am {due}.")
     refs = [ref_action(1, "wartung_einplanen", fahrzeug_id=trip.vehicle_id, typ=typ, faellig_am=due)]
     asserts = [env_assert("assert_maintenance_exists", fahrzeug_id=trip.vehicle_id, typ=typ)]
     task = build_task(f"action_wartung__{sid(trip.zugnummer)}__{idx:03d}", ticket,

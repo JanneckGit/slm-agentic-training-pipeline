@@ -117,10 +117,11 @@ def t_info_schichtcheck(g: Gen, trip, idx, inject: bool):
     if chosen is None:
         return None
     b, q, emp_ids = chosen
+    # wave 3.5 (soft H1): the "über den Fahrplan"-recipe is gone; "zur Abfahrtszeit des Zuges"
+    # MUST stay — the dep_time is not in the ticket, so it still forces the fahrplan lookup
     ticket = (f"Für {trip.zugnummer} werden kurzfristig Lokführer gesucht: Welche Lokführer mit "
               f"Qualifikation {q} an der Heimatbasis {b} sind zur Abfahrtszeit des Zuges laut Schicht "
-              f"im Dienst? Ermittle zuerst die Abfahrtszeit über den Fahrplan und nenne dann die "
-              f"Mitarbeiter-IDs.")
+              f"im Dienst? Nenne die Mitarbeiter-IDs.")
     task = build_task(f"info_schichtcheck__{sid(trip.zugnummer)}__{idx:03d}", ticket,
                       "INFO+SUCHE: Schichtabdeckung zur Abfahrtszeit prüfen (Fahrplan -> Suche)",
                       [], None, None, list(emp_ids), ["COMMUNICATE"])
@@ -262,11 +263,13 @@ def t_action_ersatz_quali(g: Gen, trip, idx, inject: bool):
     such_args = {"rolle": "Lokführer", "heimatbasis": base}
     if qual:
         such_args["qualifikation"] = qual
+    # wave 3.5 (soft H1): recovery GOAL + determinism anchors stay, the tool-by-tool route is gone
     ticket = (f"Der eingeteilte Lokführer von {trip.zugnummer} ist kurzfristig ausgefallen. Die "
               f"Disposition schlägt {proposed.name} ({proposed.emp_id}) als Ersatz vor — prüfe die "
-              f"Besatzung und teile ihn als Lokführer zu. Falls die Zuweisung abgelehnt wird: suche "
-              f"per Mitarbeitersuche einen Lokführer{qual_txt} an der Heimatbasis {base} und teile den "
-              f"ersten Treffer (kleinste Mitarbeiter-ID) als Lokführer zu.")
+              f"Besatzung und teile ihn als Lokführer zu. Falls das nicht klappt: sorge für "
+              f"qualifizierten Ersatz — ein Lokführer{qual_txt} von der Heimatbasis {base}; bei "
+              f"mehreren Kandidaten zählt die kleinste Mitarbeiter-ID. Nenne am Ende die zugeteilte "
+              f"Mitarbeiter-ID.")
     refs = [ref_action(1, "crew_zuweisen", zugnummer=trip.zugnummer,
                        mitarbeiter_id=ersatz.emp_id, rolle="Lokführer")]
     asserts = [
@@ -302,9 +305,11 @@ def t_action_crew_doppelt(g: Gen, trip, idx, inject: bool):
     emp_b = g.spare_mitarbeiter(trip.trip_id, r, "Zugbegleiter")
     if emp_b is None:
         return None
-    ticket = (f"Teile {dup['name']} ({dup['mitarbeiter_id']}) dem Zug {trip.zugnummer} als "
-              f"Zugbegleiter zu. Falls die Zuweisung abgelehnt wird (bereits eingeteilt), teile "
-              f"stattdessen {emp_b.name} ({emp_b.emp_id}) als Zugbegleiter zu und bestätige die Zuteilung.")
+    # wave 3.5 (soft H1): the "(bereits eingeteilt)" spoiler and the scripted fallback route are
+    # gone — the named priority order stays (pins the gold write)
+    ticket = (f"Ziel ist, dass auf {trip.zugnummer} am Ende genau ein zusätzlicher Zugbegleiter "
+              f"eingeteilt ist: erste Wahl ist {dup['name']} ({dup['mitarbeiter_id']}), sonst "
+              f"{emp_b.name} ({emp_b.emp_id}). Bestätige die Zuteilung.")
     refs = [ref_action(1, "crew_zuweisen", zugnummer=trip.zugnummer,
                        mitarbeiter_id=emp_b.emp_id, rolle="Zugbegleiter")]
     asserts = [env_assert("assert_crew_assigned", zugnummer=trip.zugnummer, mitarbeiter_id=emp_b.emp_id)]
@@ -336,10 +341,12 @@ def t_action_verstaerkung(g: Gen, trip, idx, inject: bool):
     if chosen is None:
         return None
     base, first = chosen
-    ticket = (f"{trip.zugnummer} braucht kurzfristig einen zusätzlichen Zugbegleiter. Suche per "
-              f"Mitarbeitersuche Zugbegleiter an der Heimatbasis {base}, teile den ersten Treffer "
-              f"(kleinste Mitarbeiter-ID) dem Zug als Zugbegleiter zu und bestätige anschließend über "
-              f"die Besatzungsliste, dass die Zuteilung erfolgt ist.")
+    # wave 3.5 (soft H1): route + tool names gone; base + smallest-id anchor + the confirmation
+    # GOAL stay (mitarbeiter_info remains the only way to see the crew -> route self-enforces)
+    ticket = (f"{trip.zugnummer} braucht kurzfristig einen zusätzlichen Zugbegleiter von der "
+              f"Heimatbasis {base}; bei mehreren Kandidaten zählt die kleinste Mitarbeiter-ID. "
+              f"Vergewissere dich zum Schluss, dass die Zuteilung wirklich in der Besatzung des "
+              f"Zuges steht, und nenne die zugeteilte Mitarbeiter-ID.")
     refs = [ref_action(1, "crew_zuweisen", zugnummer=trip.zugnummer,
                        mitarbeiter_id=first, rolle="Zugbegleiter")]
     asserts = [env_assert("assert_crew_assigned", zugnummer=trip.zugnummer, mitarbeiter_id=first)]
@@ -369,10 +376,11 @@ def t_action_wartung_suche(g: Gen, trip, idx, inject: bool):
     if not _route_search_ok(tk, trip, von, nach):
         return None
     due = f"2026-07-{r.randint(4, 10):02d} {r.choice(['06:00', '08:00', '22:00'])}"
+    # wave 3.5 (soft H1): the 3-tool chain is gone; route anchors (von/nach/Abfahrt) + due +
+    # type literal + the Fahrzeug-ID naming duty stay
     ticket = (f"Ein {trip.product} von {von} nach {nach} (Abfahrt {trip.dep_time}) meldet eine "
-              f"technische Störung am Zug. Finde den Zug über die Zugsuche, ermittle über den "
-              f"Wartungsstatus die Fahrzeug-ID und plane eine Wartung vom Typ 'Reparatur' ein, "
-              f"fällig am {due}. Nenne die Fahrzeug-ID.")
+              f"technische Störung am Zug. Finde heraus, welcher Zug das ist, und plane für sein "
+              f"Fahrzeug eine Wartung vom Typ 'Reparatur' ein, fällig am {due}. Nenne die Fahrzeug-ID.")
     refs = [ref_action(1, "wartung_einplanen", fahrzeug_id=trip.vehicle_id,
                        typ="Reparatur", faellig_am=due)]
     asserts = [env_assert("assert_maintenance_exists", fahrzeug_id=trip.vehicle_id, typ="Reparatur")]
@@ -403,10 +411,11 @@ def t_action_inspektion_bedingt(g: Gen, trip, idx, inject: bool):
     tk = _apply(g.fresh(), injections)
     v = tk.verspaetung(trip.zugnummer)
     due = f"2026-07-{r.randint(4, 10):02d} {r.choice(['06:00', '08:00', '22:00'])}"
+    # wave 3.5 (soft H1 + H5): tool chain gone, answer dictation gone (the clean branch is
+    # carried by db_match + the absence assert — comm there is None now, see below)
     ticket = (f"Prüfe die aktuelle Verspätung von {trip.zugnummer}: Hat der Zug 30 Minuten Verspätung "
-              f"oder mehr, ermittle über den Wartungsstatus die Fahrzeug-ID und plane eine Wartung vom "
-              f"Typ 'Inspektion' ein (fällig am {due}); nenne dann die Fahrzeug-ID. Andernfalls plane "
-              f"nichts ein und antworte mit 'keine Inspektion nötig'.")
+              f"oder mehr, plane für sein Fahrzeug eine Wartung vom Typ 'Inspektion' ein (fällig am "
+              f"{due}) und nenne die Fahrzeug-ID. Andernfalls plane nichts ein.")
     if inject:
         refs = [ref_action(1, "wartung_einplanen", fahrzeug_id=trip.vehicle_id,
                            typ="Inspektion", faellig_am=due)]
@@ -422,7 +431,9 @@ def t_action_inspektion_bedingt(g: Gen, trip, idx, inject: bool):
         refs = []
         asserts = [env_assert("assert_maintenance_exists", assert_value=False,
                               fahrzeug_id=trip.vehicle_id, typ="Inspektion")]
-        comm = ["keine Inspektion nötig"]
+        # wave 3.5 (H5): comm IS scored on action tasks too — with the ticket dictation gone,
+        # the fixed phrase would be unguessable; the no-write assert carries the clean branch
+        comm = None
         expected = ["verspaetung"]
         oracle = [oc("verspaetung", zugnummer=trip.zugnummer)]
     task = build_task(f"action_inspektion_bedingt__{sid(trip.zugnummer)}__{idx:03d}", ticket,
@@ -443,7 +454,7 @@ def t_action_ueberfaellig(g: Gen, trip, idx, inject: bool):
         return None
     order = over[0]
     ticket = (f"Das Fahrzeug von {trip.zugnummer} hat genau einen überfälligen Wartungsauftrag. Finde "
-              f"ihn über den Wartungsstatus und setze ihn auf 'in_Arbeit'. Nenne die Auftrags-ID.")
+              f"ihn und setze ihn auf 'in_Arbeit'. Nenne die Auftrags-ID.")
     refs = [ref_action(1, "wartung_status_setzen", auftrag_id=order["order_id"], status="in_Arbeit")]
     asserts = [env_assert("assert_maintenance_status", auftrag_id=order["order_id"], status="in_Arbeit")]
     task = build_task(f"action_ueberfaellig__{sid(trip.zugnummer)}__{idx:03d}", ticket,
@@ -466,9 +477,10 @@ def t_action_wstatus_konflikt(g: Gen, trip, idx, inject: bool):
     open_ = [o for o in w["wartungsauftraege"] if o["status"] in ("geplant", "überfällig")]
     if not closed or len(open_) != 1:
         return None
+    # wave 3.5 (soft H1): the "(Endstatus)" spoiler is gone — the unique-open-order anchor stays
     ticket = (f"Setze den Wartungsauftrag {closed[0]['order_id']} (Fahrzeug von {trip.zugnummer}) auf "
-              f"'in_Arbeit'. Falls der Statuswechsel abgelehnt wird (Endstatus), setze stattdessen den "
-              f"offenen Wartungsauftrag des Fahrzeugs auf 'in_Arbeit' und nenne dessen Auftrags-ID.")
+              f"'in_Arbeit'. Sollte das nicht zulässig sein, setze stattdessen den offenen "
+              f"Wartungsauftrag des Fahrzeugs auf 'in_Arbeit' und nenne dessen Auftrags-ID.")
     refs = [ref_action(1, "wartung_status_setzen", auftrag_id=open_[0]["order_id"], status="in_Arbeit")]
     asserts = [
         env_assert("assert_maintenance_status", auftrag_id=open_[0]["order_id"], status="in_Arbeit"),
@@ -532,10 +544,11 @@ def t_action_gefahrgut(g: Gen, trip, idx, inject: bool):
     if chosen is None:
         return None
     base, first = chosen
+    # wave 3.5 (soft H1): search route gone; qualification + base + smallest-id anchors stay
     ticket = (f"Für einen Gefahrgut-Sondertransport auf {trip.zugnummer} wird ein zusätzlicher "
-              f"Lokführer mit Qualifikation Gefahrgut benötigt. Suche per Mitarbeitersuche Lokführer "
-              f"mit Qualifikation Gefahrgut an der Heimatbasis {base} und teile den ersten Treffer "
-              f"(kleinste Mitarbeiter-ID) dem Zug als Lokführer zu.")
+              f"Lokführer mit Qualifikation Gefahrgut benötigt. Besorge ihn von der Heimatbasis "
+              f"{base} und teile ihn dem Zug als Lokführer zu; bei mehreren Kandidaten zählt die "
+              f"kleinste Mitarbeiter-ID. Nenne die zugeteilte Mitarbeiter-ID.")
     refs = [ref_action(1, "crew_zuweisen", zugnummer=trip.zugnummer,
                        mitarbeiter_id=first, rolle="Lokführer")]
     asserts = [env_assert("assert_crew_assigned", zugnummer=trip.zugnummer, mitarbeiter_id=first)]

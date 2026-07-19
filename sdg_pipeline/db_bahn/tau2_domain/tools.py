@@ -23,6 +23,12 @@ from sdg_pipeline.db_bahn.tau2_domain.data_model import (
 )
 
 MAX_TREFFER = 10  # search-tool page size: bounded observations, deterministic first hit
+MIN_UMSTIEG_MIN = 5  # minimum transfer buffer for anschluss_pruefen (documented in the tool schema)
+# wave 3: READ tools that can carry a pending transient fault (never WRITE — a transient WRITE
+# would crash the verifier's gold-action replay)
+TRANSIENT_TOOLS = ("zugstandort", "verspaetung")
+TRANSIENT_MSG = ("Echtzeitdienst vorübergehend nicht erreichbar — bitte denselben Aufruf "
+                 "erneut versuchen.")
 MAINT_STATUSES = ("geplant", "in_Arbeit", "abgeschlossen", "überfällig")
 SEVERITIES = ("niedrig", "mittel", "hoch")
 # products that carry a matching driver qualification in the seeded world; other products
@@ -59,6 +65,25 @@ class BahnTools(ToolKitBase):
         worst = max(ds, key=lambda d: d.delay_sec)
         return worst.delay_sec // 60, worst.cause, worst.remark
 
+    @staticmethod
+    def _hhmm_add(hhmm: str, minutes: int) -> str:
+        h, m = int(hhmm[:2]), int(hhmm[3:5])
+        total = (h * 60 + m + minutes) % 1440
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    @staticmethod
+    def _hhmm_diff(later: str, earlier: str) -> int:
+        """Minutes from `earlier` to `later` on the same service day (may be negative)."""
+        return (int(later[:2]) * 60 + int(later[3:5])) - (int(earlier[:2]) * 60 + int(earlier[3:5]))
+
+    def _transient_gate(self, tool_name: str) -> None:
+        """Wave 3 (D16): consume a pending transient fault -> raise a RETRYABLE error once.
+        The counter lives in a BahnDB PrivateAttr, so the verifier replay (same init actions,
+        same call order) fails identically while db_match/no_write hashes stay unaffected."""
+        if self.db._transient.get(tool_name, 0) > 0:
+            self.db._transient[tool_name] -= 1
+            raise ValueError(TRANSIENT_MSG)
+
     # --- READ tools -----------------------------------------------------------------------
     @is_tool(ToolType.READ)
     def fahrplan(self, zugnummer: str) -> dict:
@@ -89,6 +114,7 @@ class BahnTools(ToolKitBase):
         Returns:
             Verspätung in Minuten, Grund und eine Meldung.
         """
+        self._transient_gate("verspaetung")
         t = self._find_trip(zugnummer)
         mins, cause, remark = self._trip_delay_min(t.trip_id)
         return {"zugnummer": t.zugnummer, "verspaetung_minuten": mins, "grund": cause, "meldung": remark}
@@ -104,6 +130,7 @@ class BahnTools(ToolKitBase):
         Returns:
             Standort (Koordinaten, Fortschritt, nächster Halt) oder Status "nicht_unterwegs".
         """
+        self._transient_gate("zugstandort")
         t = self._find_trip(zugnummer)
         p = next((p for p in self.db.positions if p.trip_id == t.trip_id), None)
         if p is None:
@@ -214,23 +241,27 @@ class BahnTools(ToolKitBase):
     @is_tool(ToolType.READ)
     def mitarbeiter_suchen(self, rolle: Optional[str] = None, heimatbasis: Optional[str] = None,
                            qualifikation: Optional[str] = None,
-                           verfuegbar_um: Optional[str] = None) -> dict:
+                           verfuegbar_um: Optional[str] = None,
+                           name: Optional[str] = None) -> dict:
         """
-        Sucht Mitarbeiter nach Rolle, Heimatbasis, Qualifikation und/oder Schichtverfügbarkeit.
+        Sucht Mitarbeiter nach Rolle, Heimatbasis, Qualifikation, Schichtverfügbarkeit und/oder Name.
         Mindestens ein Filter ist erforderlich. Liefert höchstens 10 Treffer, aufsteigend nach
-        Mitarbeiter-ID sortiert (der erste Treffer ist die kleinste ID).
+        Mitarbeiter-ID sortiert (der erste Treffer ist die kleinste ID). Achtung: Namen sind NICHT
+        eindeutig — bei mehreren Treffern mit weiteren Filtern (heimatbasis, rolle) eingrenzen.
 
         Args:
             rolle: z. B. "Lokführer", "Zugbegleiter", "Techniker", "Disponent".
             heimatbasis: Name der Heimatbasis oder ein Teil davon.
             qualifikation: Erforderliche Qualifikation, z. B. "ICE", "IC", "EC", "Nacht", "Gefahrgut".
             verfuegbar_um: Uhrzeit "HH:MM" — nur Mitarbeiter, deren Schicht diese Zeit abdeckt.
+            name: Vor- und/oder Nachname oder ein Teil davon, z. B. "Wagner".
 
         Returns:
             treffer_gesamt und die Liste (mitarbeiter_id, name, rolle, heimatbasis, qualifikationen, schicht).
         """
-        if rolle is None and heimatbasis is None and qualifikation is None and verfuegbar_um is None:
-            raise ValueError("Bitte mindestens einen Filter angeben (rolle, heimatbasis, qualifikation, verfuegbar_um).")
+        if rolle is None and heimatbasis is None and qualifikation is None \
+                and verfuegbar_um is None and name is None:
+            raise ValueError("Bitte mindestens einen Filter angeben (rolle, heimatbasis, qualifikation, verfuegbar_um, name).")
         if verfuegbar_um is not None:
             verfuegbar_um = verfuegbar_um.strip()
             if not HHMM_RE.match(verfuegbar_um):
@@ -241,6 +272,7 @@ class BahnTools(ToolKitBase):
         ro = (rolle or "").strip().lower()
         hb = (heimatbasis or "").strip().lower()
         q = (qualifikation or "").strip().lower()
+        nm = (name or "").strip().lower()
         rows = []
         for emp_id in sorted(self.db.employees):
             e = self.db.employees[emp_id]
@@ -249,6 +281,8 @@ class BahnTools(ToolKitBase):
             if hb and hb not in e.home_base.lower():
                 continue
             if q and q not in (x.lower() for x in e.qualifications):
+                continue
+            if nm and nm not in e.name.lower():
                 continue
             sh = shift_of.get(emp_id)
             if verfuegbar_um is not None and not (sh and sh.start <= verfuegbar_um <= sh.end):
@@ -317,6 +351,52 @@ class BahnTools(ToolKitBase):
             rows.append(o.model_dump())
         rows.sort(key=lambda r: (r["due_at"], r["order_id"]))
         return self._page(rows)
+
+    @is_tool(ToolType.READ)
+    def anschluss_pruefen(self, zubringer_zugnummer: str, anschluss_zugnummer: str,
+                          umsteigebahnhof: Optional[str] = None) -> dict:
+        """
+        Prüft, ob der Anschluss vom Zubringer-Zug auf den Anschluss-Zug erreichbar ist.
+        Berücksichtigt die aktuellen Verspätungen beider Züge; ein Umstieg braucht mindestens
+        5 Minuten Puffer. Ohne `umsteigebahnhof` werden alle gemeinsamen Halte geprüft.
+
+        Args:
+            zubringer_zugnummer: Zugnummer des ankommenden Zuges, z. B. "ICE 1562".
+            anschluss_zugnummer: Zugnummer des Anschluss-Zuges.
+            umsteigebahnhof: Name des Umsteigebahnhofs oder ein Teil davon (optional).
+
+        Returns:
+            Pro gemeinsamem Halt: effektive Ankunft/Abfahrt (inkl. Verspätung), puffer_minuten und
+            anschluss_erreichbar — oder status "kein_gemeinsamer_bahnhof".
+        """
+        zu = self._find_trip(zubringer_zugnummer)
+        an = self._find_trip(anschluss_zugnummer)
+        zu_delay, _, _ = self._trip_delay_min(zu.trip_id)
+        an_delay, _, _ = self._trip_delay_min(an.trip_id)
+        an_stops = {s.station_id: s for s in self.db.schedule if s.trip_id == an.trip_id}
+        want = (umsteigebahnhof or "").strip().lower()
+        rows = []
+        for s in sorted((x for x in self.db.schedule if x.trip_id == zu.trip_id), key=lambda x: x.seq):
+            other = an_stops.get(s.station_id)
+            if other is None:
+                continue
+            station = self._station_name(s.station_id)
+            if want and want not in station.lower():
+                continue
+            ank_eff = self._hhmm_add(s.arr, zu_delay)
+            abf_eff = self._hhmm_add(other.dep, an_delay)
+            puffer = self._hhmm_diff(abf_eff, ank_eff)
+            rows.append({"umsteigebahnhof": station,
+                         "ankunft_zubringer_plan": s.arr, "ankunft_zubringer_effektiv": ank_eff,
+                         "abfahrt_anschluss_plan": other.dep, "abfahrt_anschluss_effektiv": abf_eff,
+                         "verspaetung_zubringer_minuten": zu_delay,
+                         "verspaetung_anschluss_minuten": an_delay,
+                         "puffer_minuten": puffer,
+                         "anschluss_erreichbar": puffer >= MIN_UMSTIEG_MIN})
+        if not rows:
+            return {"zubringer": zu.zugnummer, "anschluss": an.zugnummer,
+                    "status": "kein_gemeinsamer_bahnhof"}
+        return {"zubringer": zu.zugnummer, "anschluss": an.zugnummer, "umstiege": rows}
 
     # --- WRITE tools (mutate state -> re-executed during DB-state reward replay) -----------
     @is_tool(ToolType.WRITE)
@@ -426,6 +506,36 @@ class BahnTools(ToolKitBase):
         self.db.assignments = [a for a in self.db.assignments
                                if not (a.trip_id == t.trip_id and a.role == "Lokführer")]
         return len(self.db.assignments) < before
+
+    def inject_standort_unbekannt(self, zugnummer: str) -> bool:
+        """Wave 3 (C12): entfernt die Positionsmeldung eines Zuges -> zugstandort liefert
+        'nicht_unterwegs' (Datenlücke; die ehrliche Antwort ist 'Standort nicht ermittelbar')."""
+        t = self._find_trip(zugnummer)
+        before = len(self.db.positions)
+        self.db.positions = [p for p in self.db.positions if p.trip_id != t.trip_id]
+        return len(self.db.positions) < before
+
+    def inject_grund_unbekannt(self, zugnummer: str, minuten: int) -> bool:
+        """Wave 3 (C12): setzt eine Verspätung OHNE vermerkten Grund (cause leer) -> die
+        ehrliche Antwort nennt die Minuten und dass kein Grund vermerkt ist."""
+        t = self._find_trip(zugnummer)
+        found = False
+        for d in self.db.delays:
+            if d.trip_id == t.trip_id:
+                d.delay_sec = minuten * 60
+                d.cause = ""
+                d.remark = f"+{minuten} Min"
+                found = True
+        return found
+
+    def inject_transient_stoerung(self, tool_name: str, anzahl: int = 1) -> bool:
+        """Wave 3 (D16): die nächsten `anzahl` Aufrufe von `tool_name` schlagen mit einem
+        RETRYABLEN Fehler fehl (Marker 'vorübergehend'); danach funktioniert das Tool normal.
+        Nur READ-Tools erlaubt — ein transienter WRITE würde den Gold-Replay crashen."""
+        if tool_name not in TRANSIENT_TOOLS:
+            raise ValueError(f"Transient-Störung nur für {TRANSIENT_TOOLS} erlaubt, nicht '{tool_name}'.")
+        self.db._transient[tool_name] = int(anzahl)
+        return True
 
     # --- assertions for task env_assertions (not tools) -----------------------------------
     def assert_maintenance_exists(self, fahrzeug_id: str, typ: str) -> bool:

@@ -55,13 +55,21 @@ def _tool_calls_of(msg: dict) -> list[dict]:
     return msg.get("tool_calls") or []
 
 
-THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+THINK_RE = re.compile(r"<(?:seed:)?think>.*?</(?:seed:)?think>\s*", re.DOTALL)
+THINK_BRACKET_RE = re.compile(r"\[THINK\].*?\[/THINK\]\s*", re.DOTALL)
 
 
 def _strip_think(text) -> str:
-    """Drop <think>…</think> blocks before grading: speculative values in the reasoning must not
-    count as hallucination (grounding) or as communicated info — judged is only the visible answer."""
-    return THINK_RE.sub("", text or "")
+    """Drop reasoning blocks before grading: speculative values in the reasoning must not count as
+    hallucination (grounding) or as communicated info — judged is only the visible answer.
+    Wave 3: full dialect parity with rollout.strip_think (<seed:think>, [THINK], unpaired closes),
+    so ad-hoc evals of foreign thinking models grade identically."""
+    text = THINK_RE.sub("", text or "")
+    text = THINK_BRACKET_RE.sub("", text)
+    for close in ("</seed:think>", "</think>", "[/THINK]"):
+        if close in text:
+            text = text.rsplit(close, 1)[1]
+    return text
 
 
 def _assistant_text(messages: list[dict]) -> str:
@@ -125,7 +133,11 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
     """
     out = {"score": 0.0, "task_solved": 0.0, "turns_used": 0, "n_tool_calls": 0,
            "n_tool_errors": 0, "tool_calls_valid": 0.0, "n_plan_turns": 0,
-           "replan_occurred": 0.0, "self_recovery": 0.0, "components": {}, "error": None}
+           "replan_occurred": 0.0, "self_recovery": 0.0,
+           # wave 3 soft aux (never gating): efficiency vs the oracle path + parallel emission
+           "parallel_max_calls_per_turn": 0, "efficiency_expected_calls": 0,
+           "efficiency_call_ratio": 0.0, "efficiency_within_3x": 1.0,
+           "components": {}, "error": None}
     try:
         if get_env is None:
             from sdg_pipeline.db_bahn.tau2_domain import get_environment as get_env  # tau2 venv only
@@ -155,6 +167,7 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
             tcs = _tool_calls_of(m)
             if tcs:
                 out["n_plan_turns"] += 1
+                out["parallel_max_calls_per_turn"] = max(out["parallel_max_calls_per_turn"], len(tcs))
             for tc in tcs:
                 if n_calls >= max_replay_calls:
                     break
@@ -169,6 +182,13 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         out["n_tool_calls"], out["n_tool_errors"] = n_calls, n_err
         out["tool_calls_valid"] = (n_calls - n_err) / n_calls if n_calls else 0.0
         out["turns_used"] = sum(1 for m in messages if m.get("role") in ("assistant", "tool"))
+        # wave 3: SOFT efficiency vs the oracle call count (expected_calls = len(oracle_calls)).
+        # Deliberately NOT a component — the hard >=3x gate lives in format_traj (training data),
+        # so teacher yield and heldout comparability stay outcome-based.
+        exp = int(key.get("expected_calls") or 0)
+        out["efficiency_expected_calls"] = exp
+        out["efficiency_call_ratio"] = round(n_calls / exp, 3) if exp else 0.0
+        out["efficiency_within_3x"] = 1.0 if (not exp or n_calls < 3 * exp) else 0.0
 
         comp = {}
 
@@ -194,6 +214,10 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         # --- normalized action set-membership ----------------------------------------------
         expected = set(key.get("expected_tools") or [])
         comp["actions_pass"] = expected.issubset(set(called)) if expected else True
+        # wave 3 (refusal tasks): tools the agent must NOT call (e.g. all WRITE tools). Empty
+        # or absent => True, so every pre-wave-3 task is unaffected.
+        forb = set(key.get("forbidden_tools") or [])
+        comp["no_forbidden"] = forb.isdisjoint(set(called)) if forb else True
 
         # --- communicate substrings ---------------------------------------------------------
         atext = _assistant_text(messages).lower()
@@ -246,9 +270,11 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_
 
 
 # --- self-test (Phase-4 smoke: known-good → 1.0, wrong-write / hallucination → 0.0) ----------
-def _mk_call(i, name, **args):
+def _mk_call(i, _name, **args):
+    # positional is _name so tool arguments literally named `name` (mitarbeiter_suchen, wave 3)
+    # don't collide with the parameter
     return {"id": f"call_{i}", "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+            "function": {"name": _name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
 def _selftest():
@@ -410,9 +436,284 @@ def _selftest():
     r8 = score_trajectory(task8, msgs8, key8)
     assert r8["score"] == 1.0, f"good search-INFO should pass: {r8}"
 
+    # ------------------------------- wave-3 cases 9-15 -------------------------------------
+    # 9) refusal: correct check-first refusal -> 1.0; forbidden write attempted -> 0.0 via
+    #    no_forbidden (even though the terminal-status rejection mutated nothing); an actually
+    #    MUTATING write on a refusal task -> 0.0 via no_write.
+    tid9 = next(i for i, k in keys.items() if k["template"] == "t_refusal_policy")
+    task9, key9 = tasks[tid9], keys[tid9]
+    oid9 = key9["facts"]["auftrag_id"]
+    zn9 = key9["oracle_calls"][0]["arguments"]["kennung"]
+    env9 = dom.get_environment(solo_mode=True)
+    obs9 = env9.use_tool("wartung_status", kennung=zn9)
+    msgs9 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task9["ticket"]},
+        {"role": "assistant", "content": "<think>\nErst Status prüfen.\n</think>\n\n",
+         "tool_calls": [_mk_call(1, "wartung_status", kennung=zn9)]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(obs9, ensure_ascii=False)},
+        {"role": "assistant", "content": f"{oid9} ist bereits abgeschlossen (Endstatus) — laut "
+                                         f"Richtlinie keine Änderung möglich; ich habe nichts geändert."},
+    ]
+    r9 = score_trajectory(task9, msgs9, key9)
+    assert r9["score"] == 1.0 and r9["components"]["no_write"] and r9["components"]["no_forbidden"], \
+        f"correct refusal should pass: {r9}"
+    bad9 = json.loads(json.dumps(msgs9))
+    bad9[2]["tool_calls"].append(_mk_call(2, "wartung_status_setzen", auftrag_id=oid9, status="geplant"))
+    bad9.insert(4, {"role": "tool", "tool_call_id": "call_2",
+                    "content": json.dumps({"error": "ValueError: Endstatus"}, ensure_ascii=False)})
+    r9b = score_trajectory(task9, bad9, key9)
+    assert r9b["score"] == 0.0 and not r9b["components"]["no_forbidden"], \
+        f"forbidden write attempt must fail via no_forbidden: {r9b}"
+    tid9c = next(i for i, k in keys.items() if k["template"] == "t_refusal_nicht_machbar")
+    task9c, key9c = tasks[tid9c], keys[tid9c]
+    zn9c = key9c["facts"]["zugnummer"]
+    env9c = dom.get_environment(solo_mode=True)
+    obs9c1 = env9c.use_tool("fahrplan", zugnummer=zn9c)
+    vid9c = env9c.use_tool("wartung_status", kennung=zn9c)["fahrzeug_id"]
+    obs9c2 = env9c.use_tool("wartung_einplanen", fahrzeug_id=vid9c, typ="Inspektion",
+                            faellig_am="2026-07-05 06:00")
+    msgs9c = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task9c["ticket"]},
+        {"role": "assistant", "content": "",
+         "tool_calls": [_mk_call(1, "fahrplan", zugnummer=zn9c),
+                        _mk_call(2, "wartung_einplanen", fahrzeug_id=vid9c, typ="Inspektion",
+                                 faellig_am="2026-07-05 06:00")]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(obs9c1, ensure_ascii=False)},
+        {"role": "tool", "tool_call_id": "call_2", "content": json.dumps(obs9c2, ensure_ascii=False,
+                                                                         default=str)},
+        {"role": "assistant", "content": f"{zn9c} stornier ich nicht, stattdessen Wartung angelegt."},
+    ]
+    r9c = score_trajectory(task9c, msgs9c, key9c)
+    assert r9c["score"] == 0.0 and not r9c["components"]["no_write"], \
+        f"mutating write on refusal task must fail via no_write: {r9c}"
+
+    # 10) batch-parallel: THREE calls in ONE assistant turn -> 1.0, parallel aux == 3
+    tid10 = next(i for i, k in keys.items() if k["template"] == "t_info_batch_verspaetung")
+    task10, key10 = tasks[tid10], keys[tid10]
+    env10 = dom.get_environment(solo_mode=True)
+    inits10 = (task10.get("initial_state") or {}).get("initialization_actions") or []
+    env10.run_env_function_calls([EnvFunctionCall.model_validate(a) for a in inits10])
+    calls10 = [_mk_call(i + 1, c["name"], **c["arguments"])
+               for i, c in enumerate(key10["oracle_calls"])]
+    obs10 = [env10.use_tool(c["name"], **c["arguments"]) for c in key10["oracle_calls"]]
+    comm10 = task10["evaluation_criteria"]["communicate_info"]
+    msgs10 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task10["ticket"]},
+        {"role": "assistant", "content": "<think>\nDrei unabhängige Abfragen — bündeln.\n</think>\n\n",
+         "tool_calls": calls10},
+    ] + [{"role": "tool", "tool_call_id": f"call_{i + 1}",
+          "content": json.dumps(o, ensure_ascii=False)} for i, o in enumerate(obs10)] + [
+        {"role": "assistant", "content": "Lage: " + "; ".join(comm10) + "."},
+    ]
+    r10 = score_trajectory(task10, msgs10, key10)
+    assert r10["score"] == 1.0 and r10["parallel_max_calls_per_turn"] == 3, \
+        f"parallel batch should pass with parallel_max==3: {r10}"
+
+    # 11) transient: fail -> identical retry -> 1.0 with n_tool_errors==1; skipping the retry and
+    #     claiming a halt anyway -> 0.0 (the halt name is grounded nowhere)
+    tid11 = next(i for i, k in keys.items() if k["template"] == "t_info_transient")
+    task11, key11 = tasks[tid11], keys[tid11]
+    zn11 = key11["oracle_calls"][0]["arguments"]["zugnummer"]
+    env11 = dom.get_environment(solo_mode=True)
+    env11.run_env_function_calls([EnvFunctionCall.model_validate(a)
+                                  for a in task11["initial_state"]["initialization_actions"]])
+    try:
+        env11.use_tool("zugstandort", zugnummer=zn11)
+        raise AssertionError("transient fault must fire on the first call")
+    except ValueError as e:
+        err11 = json.dumps({"error": f"ValueError: {e}"}, ensure_ascii=False)
+    obs11 = env11.use_tool("zugstandort", zugnummer=zn11)
+    halt11 = key11["facts"]["naechster_halt"]
+    msgs11 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task11["ticket"]},
+        {"role": "assistant", "content": "", "tool_calls": [_mk_call(1, "zugstandort", zugnummer=zn11)]},
+        {"role": "tool", "tool_call_id": "call_1", "content": err11},
+        {"role": "assistant", "content": "<think>\nVorübergehend — genau ein Retry.\n</think>\n\n",
+         "tool_calls": [_mk_call(2, "zugstandort", zugnummer=zn11)]},
+        {"role": "tool", "tool_call_id": "call_2", "content": json.dumps(obs11, ensure_ascii=False)},
+        {"role": "assistant", "content": f"{zn11} ist unterwegs, nächster Halt {halt11}."},
+    ]
+    r11 = score_trajectory(task11, msgs11, key11)
+    assert r11["score"] == 1.0 and r11["n_tool_errors"] == 1, f"transient retry should pass: {r11}"
+    # skipping the retry and GUESSING a halt fails via communicate (the exact halt out of 576
+    # stations must be named; station names are deliberately not a grounding pattern, so only
+    # a 1/576-lucky exact guess would slip through — accepted residual)
+    msgs11b = msgs11[:4] + [{"role": "assistant",
+                             "content": f"{zn11} ist unterwegs, nächster Halt Musterstadt Hbf."}]
+    r11b = score_trajectory(task11, msgs11b, key11)
+    assert r11b["score"] == 0.0 and not r11b["components"]["communicate"], \
+        f"guessed wrong halt without the retry must fail communicate: {r11b}"
+
+    # 12) efficiency is SOFT: 7 calls at expected 1 -> metrics flag it, score stays 1.0
+    msgs12 = json.loads(json.dumps(msgs3))
+    msgs12[2]["tool_calls"] = [_mk_call(i, "mitarbeiter_info", zugnummer=zn) for i in range(1, 8)]
+    r12 = score_trajectory(task3, msgs12, key3)
+    assert r12["score"] == 1.0 and r12["efficiency_within_3x"] == 0.0 \
+        and r12["efficiency_call_ratio"] == 7.0, f"efficiency must stay soft: {r12}"
+
+    # 13) data gap: honest gap answer -> 1.0; invented time -> 0.0 (grounding)
+    tid13 = next(i for i, k in keys.items()
+                 if k["template"] == "t_info_datenluecke" and k["facts"].get("flavor") == "standort")
+    task13, key13 = tasks[tid13], keys[tid13]
+    zn13 = key13["oracle_calls"][0]["arguments"]["zugnummer"]
+    env13 = dom.get_environment(solo_mode=True)
+    env13.run_env_function_calls([EnvFunctionCall.model_validate(a)
+                                  for a in task13["initial_state"]["initialization_actions"]])
+    obs13 = env13.use_tool("zugstandort", zugnummer=zn13)
+    msgs13 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task13["ticket"]},
+        {"role": "assistant", "content": "", "tool_calls": [_mk_call(1, "zugstandort", zugnummer=zn13)]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(obs13, ensure_ascii=False)},
+        {"role": "assistant", "content": f"Für {zn13} liegt keine aktuelle Positionsmeldung vor."},
+    ]
+    r13 = score_trajectory(task13, msgs13, key13)
+    assert r13["score"] == 1.0, f"honest gap answer should pass: {r13}"
+    bad13 = json.loads(json.dumps(msgs13))
+    bad13[-1]["content"] = f"{zn13} passiert um 13:37 den nächsten Meldepunkt."
+    r13b = score_trajectory(task13, bad13, key13)
+    assert r13b["score"] == 0.0 and not r13b["components"]["grounding"], \
+        f"invented time on a data gap must fail grounding: {r13b}"
+
+    # 14) name-filter search: ambiguous name -> refine by base -> 1.0
+    tid14 = next(i for i, k in keys.items() if k["template"] == "t_info_name_suche")
+    task14, key14 = tasks[tid14], keys[tid14]
+    env14 = dom.get_environment(solo_mode=True)
+    o14 = [env14.use_tool(c["name"], **c["arguments"]) for c in key14["oracle_calls"]]
+    msgs14 = [
+        {"role": "system", "content": "…"}, {"role": "user", "content": task14["ticket"]},
+        {"role": "assistant", "content": "",
+         "tool_calls": [_mk_call(1, key14["oracle_calls"][0]["name"],
+                                 **key14["oracle_calls"][0]["arguments"])]},
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(o14[0], ensure_ascii=False)},
+        {"role": "assistant", "content": "",
+         "tool_calls": [_mk_call(2, key14["oracle_calls"][1]["name"],
+                                 **key14["oracle_calls"][1]["arguments"])]},
+        {"role": "tool", "tool_call_id": "call_2", "content": json.dumps(o14[1], ensure_ascii=False)},
+        {"role": "assistant", "content": f"Gefunden: {key14['facts']['emp_id']} "
+                                         f"({key14['facts']['rolle']})."},
+    ]
+    r14 = score_trajectory(task14, msgs14, key14)
+    assert r14["score"] == 1.0, f"name search should pass: {r14}"
+
+    # 15) think-strip parity: <seed:think> dialect with a bogus id -> still 1.0
+    seed15 = json.loads(json.dumps(msgs))
+    seed15[-1]["content"] = ("<seed:think>vielleicht MA-99999?</seed:think>" + seed15[-1]["content"])
+    r15 = score_trajectory(task, seed15, key)
+    assert r15["score"] == 1.0, f"<seed:think> must be stripped like <think>: {r15}"
+
+    # ------------------------------- wave-3.5 cases 16-21 ----------------------------------
+    def _oracle_trace(task_x, key_x):
+        """Replay oracle_calls on a fresh initialized env -> (messages sans final, env)."""
+        env_x = dom.get_environment(solo_mode=True)
+        inits_x = (task_x.get("initial_state") or {}).get("initialization_actions") or []
+        if inits_x:
+            env_x.run_env_function_calls([EnvFunctionCall.model_validate(a) for a in inits_x])
+        ms = [{"role": "system", "content": "…"}, {"role": "user", "content": task_x["ticket"]}]
+        for i, c in enumerate(key_x["oracle_calls"], 1):
+            ms.append({"role": "assistant", "content": "",
+                       "tool_calls": [_mk_call(i, c["name"], **c["arguments"])]})
+            try:
+                obs_x = env_x.use_tool(c["name"], **c["arguments"])
+                body = json.dumps(obs_x, ensure_ascii=False, default=str)
+            except Exception as e:
+                body = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+            ms.append({"role": "tool", "tool_call_id": f"call_{i}", "content": body})
+        return ms
+
+    # 16) K1 conjunction: full pass -> 1.0; SAME trace minus the "bereits"-part in the final
+    #     answer -> 0.0 via communicate (nails down that comm gates action tasks)
+    tid16 = next(i for i, k in keys.items() if k["template"] == "t_action_lagebericht")
+    task16, key16 = tasks[tid16], keys[tid16]
+    comm16 = task16["evaluation_criteria"]["communicate_info"]
+    msgs16 = _oracle_trace(task16, key16) + [
+        {"role": "assistant", "content": "Lage: " + "; ".join(comm16) + "."}]
+    r16 = score_trajectory(task16, msgs16, key16)
+    assert r16["score"] == 1.0, f"K1 full conjunction should pass: {r16}"
+    bad16 = json.loads(json.dumps(msgs16))
+    bad16[-1]["content"] = "Lage: " + "; ".join(c for c in comm16 if c != "bereits") + ". Zuteilung erledigt."
+    r16b = score_trajectory(task16, bad16, key16)
+    assert r16b["score"] == 0.0 and not r16b["components"]["communicate"], \
+        f"K1 without the 'bereits' acknowledgement must fail communicate: {r16b}"
+
+    # 17) K2: 2 writes + rejected terminal write -> 1.0 with error+replan; only 1 write -> 0.0
+    tid17 = next(i for i, k in keys.items() if k["template"] == "t_action_batch_konflikt")
+    task17, key17 = tasks[tid17], keys[tid17]
+    comm17 = task17["evaluation_criteria"]["communicate_info"]
+    msgs17 = _oracle_trace(task17, key17) + [
+        {"role": "assistant", "content": "Erledigt: " + "; ".join(comm17) + "."}]
+    r17 = score_trajectory(task17, msgs17, key17)
+    assert r17["score"] == 1.0 and r17["n_tool_errors"] == 1 and r17["replan_occurred"] == 1.0, \
+        f"K2 batch with rejection should pass: {r17}"
+    only_one = json.loads(json.dumps(msgs17))
+    # drop the SECOND valid write (assistant+tool pair) -> db hash mismatch
+    a_open = key17["facts"]["offen"][1]
+    idx17 = next(j for j, m in enumerate(only_one) if m.get("tool_calls")
+                 and json.loads(m["tool_calls"][0]["function"]["arguments"]).get("auftrag_id") == a_open)
+    del only_one[idx17:idx17 + 2]
+    r17b = score_trajectory(task17, only_one, key17)
+    assert r17b["score"] == 0.0 and not r17b["components"]["db_match"], \
+        f"K2 with a missing write must fail db_match: {r17b}"
+
+    # 18) K3: honest phantom flag -> 1.0; silently skipping the phantom -> 0.0 communicate
+    tid18 = next(i for i, k in keys.items() if k["template"] == "t_info_batch_phantom")
+    task18, key18 = tasks[tid18], keys[tid18]
+    comm18 = task18["evaluation_criteria"]["communicate_info"]
+    msgs18 = _oracle_trace(task18, key18) + [
+        {"role": "assistant", "content": "Lage: " + "; ".join(comm18) + "."}]
+    r18 = score_trajectory(task18, msgs18, key18)
+    assert r18["score"] == 1.0, f"K3 honest phantom report should pass: {r18}"
+    bad18 = json.loads(json.dumps(msgs18))
+    bad18[-1]["content"] = "Lage: " + "; ".join(c for c in comm18 if "gefunden" not in c) + "."
+    r18b = score_trajectory(task18, bad18, key18)
+    assert r18b["score"] == 0.0 and not r18b["components"]["communicate"], \
+        f"K3 without the phantom flag must fail: {r18b}"
+
+    # 19) T1: full iteration + the correct write -> 1.0; write on an UNAFFECTED train -> 0.0
+    tid19 = next(i for i, k in keys.items() if k["template"] == "t_action_iteration_ersatz")
+    task19, key19 = tasks[tid19], keys[tid19]
+    comm19 = task19["evaluation_criteria"]["communicate_info"]
+    msgs19 = _oracle_trace(task19, key19) + [
+        {"role": "assistant", "content": "Betroffen: " + "; ".join(comm19) + "."}]
+    r19 = score_trajectory(task19, msgs19, key19)
+    assert r19["score"] == 1.0, f"T1 iteration+write should pass: {r19}"
+    wrong19 = json.loads(json.dumps(msgs19))
+    del wrong19[-3:-1]  # drop the final write (assistant+tool pair) -> asserts/db_match fail
+    r19b = score_trajectory(task19, wrong19, key19)
+    assert r19b["score"] == 0.0, f"T1 without the write must fail: {r19b}"
+
+    # 20) T2: transient fail -> retry -> assign -> 1.0 with self_recovery; skipping the retry
+    #     and guessing the minutes -> 0.0 (grounding/communicate)
+    tid20 = next(i for i, k in keys.items() if k["template"] == "t_action_doppelfault")
+    task20, key20 = tasks[tid20], keys[tid20]
+    comm20 = task20["evaluation_criteria"]["communicate_info"]
+    msgs20 = _oracle_trace(task20, key20) + [
+        {"role": "assistant", "content": "Erledigt: " + "; ".join(comm20) + "."}]
+    r20 = score_trajectory(task20, msgs20, key20)
+    assert r20["score"] == 1.0 and r20["n_tool_errors"] == 1 and r20["self_recovery"] == 1.0, \
+        f"T2 retry roundtrip should pass: {r20}"
+    skip20 = _oracle_trace(task20, {"oracle_calls": key20["oracle_calls"][:1]})  # only the failed call
+    skip20 += [{"role": "assistant", "content": "Erledigt: " + "; ".join(comm20) + "."}]
+    r20b = score_trajectory(task20, skip20, key20)
+    assert r20b["score"] == 0.0, f"T2 claiming results without retry/write must fail: {r20b}"
+
+    # 21) inspektion_bedingt clean branch after H5: free wording (no dictated phrase) -> 1.0
+    tid21 = next((i for i, k in keys.items()
+                  if k["template"] == "t_action_inspektion_bedingt"
+                  and not keys[i]["injected"]), None)
+    if tid21 is not None:  # clean-branch tasks exist only at fault_rate < 1
+        task21, key21 = tasks[tid21], keys[tid21]
+        msgs21 = _oracle_trace(task21, key21) + [
+            {"role": "assistant", "content": "Der Zug liegt unter der Schwelle, ich habe nichts eingeplant."}]
+        r21 = score_trajectory(task21, msgs21, key21)
+        assert r21["score"] == 1.0, f"H5: free clean-branch wording must pass now: {r21}"
+
     print("trajectory_reward.py self-test OK "
           "(good-action 1.0 | wrong-write 0.0 | good-info 1.0 | hallucination 0.0 | injected+replan 1.0 | "
-          "runtime-fault roundtrip 1.0 +self_recovery | ignored rejection 0.0 | search-info 1.0)")
+          "runtime-fault roundtrip 1.0 +self_recovery | ignored rejection 0.0 | search-info 1.0 | "
+          "refusal 1.0/0.0/0.0 | batch-parallel 1.0 (max=3) | transient 1.0/0.0 | efficiency-soft | "
+          "data-gap 1.0/0.0 | name-search 1.0 | seed-think parity 1.0 | "
+          "w35: K1-conjunction 1.0/0.0 | K2-batch-konflikt 1.0/0.0 | K3-phantom 1.0/0.0 | "
+          "T1-iteration 1.0/0.0 | T2-doppelfault 1.0/0.0 | H5-clean-frei 1.0)")
 
 
 if __name__ == "__main__":
