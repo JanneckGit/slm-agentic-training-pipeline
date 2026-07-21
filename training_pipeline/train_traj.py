@@ -8,6 +8,9 @@ SQL run_lora_sft path); reuses config[training].lora + the TRL/PEFT stack in the
 Pre-tokenizes each trace with build_masked_labels (labels=-100 off assistant spans), drops over-length,
 trains with a plain HF Trainer + TrajSFTCollator, saves the LoRA adapter (+ tokenizer + chat template).
 
+Assistant turns BEFORE the last user message are masked too (the template renders them think-less) —
+opt out with --train-context-turns. The per-leg line in the startup log shows what that costs each leg.
+
 Usage (training container):
     python3 training_pipeline/train_traj.py --config config/pipeline_config.yaml \
         --data data/final/sft_mix_chat.jsonl --model Qwen/Qwen3-4B \
@@ -88,6 +91,9 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=None, help="smoke: override config gradient_accumulation_steps")
     ap.add_argument("--neftune", type=float, default=None,
                     help="NEFTune noise alpha (noisy input embeddings, train-time only, no serving cost); None=off")
+    ap.add_argument("--train-context-turns", action="store_true",
+                    help="opt-out: also take gradient on assistant turns BEFORE the last user message. "
+                         "Those render think-less (Qwen3 template) — only for A/B measurements.")
     ap.add_argument("--save-epoch-adapters", action="store_true",
                     help="save adapter+tok to <out>_ep{N} at each epoch end (for epoch-1-vs-2 checkpoint selection)")
     ap.add_argument("--max-samples", type=int, default=None, help="smoke: cap #examples")
@@ -119,13 +125,21 @@ def main():
         tok.pad_token, tok.pad_token_id = tok.eos_token, tok.eos_token_id
 
     # pre-tokenize with assistant-only masks (shared by train + val)
+    final_turns_only = not args.train_context_turns
+    logger.info(f"context-turn masking: {'ON' if final_turns_only else 'OFF (--train-context-turns)'} — "
+                f"gradient only on assistant turns after the last user message")
+
     def pretokenize(path, cap=None):
         exs = [json.loads(l) for l in open(path) if l.strip()]
         if cap:
             exs = exs[:cap]
-        feats, dropped, mask_frac, srcs = [], 0, [], Counter()  # srcs -> per-leg composition for MLflow
+        # per-leg accounting: without it the effect of the masking is invisible (a single global mean
+        # hides that db_bahn is untouched while AReaL loses ~78% of its trained tokens).
+        feats, dropped, mask_frac, srcs = [], 0, [], Counter()
+        legs = {}
         for ex in exs:
-            ids, labels = build_masked_labels(tok, ex["messages"], max_len=args.max_seq_len)
+            ids, labels = build_masked_labels(tok, ex["messages"], max_len=args.max_seq_len,
+                                              final_turns_only=final_turns_only)
             if len(ids) >= args.max_seq_len:      # truncated -> mask likely broken, drop
                 dropped += 1
                 continue
@@ -133,17 +147,36 @@ def main():
                 dropped += 1
                 continue
             feats.append({"input_ids": ids, "labels": labels, "length": len(ids)})  # length -> group_by_length
-            srcs[(ex.get("_meta") or {}).get("mix_source", "unknown")] += 1
-            mask_frac.append(sum(1 for l in labels if l != -100) / len(labels))
-        return feats, dropped, (sum(mask_frac) / max(1, len(mask_frac))), srcs
+            src = (ex.get("_meta") or {}).get("mix_source", "unknown")
+            srcs[src] += 1
+            trained = sum(1 for l in labels if l != -100)
+            mask_frac.append(trained / len(labels))
+            st = legs.setdefault(src, Counter())
+            st["n"] += 1
+            st["fwd"] += len(ids)
+            st["trained"] += trained
+            # DIAGNOSTIC ONLY (no behaviour change): a last assistant turn without its own <think> gets
+            # Qwen3's canonical empty "<think>\n\n</think>" wrapper (template `loop.last` branch).
+            tail = ex["messages"][-1]
+            if tail.get("role") == "assistant" and "<think>" not in (tail.get("content") or ""):
+                st["empty_think_wrapper"] += 1
+        return feats, dropped, (sum(mask_frac) / max(1, len(mask_frac))), srcs, legs
 
-    feats, dropped, frac, mix_counts = pretokenize(args.data, args.max_samples)
+    def log_legs(tag, legs):
+        tot = max(1, sum(s["trained"] for s in legs.values()))
+        for src, s in sorted(legs.items()):
+            logger.info(f"  [{tag}] {src:8s} n={s['n']:6d} fwd={s['fwd']:10d} trained={s['trained']:9d} "
+                        f"({100*s['trained']/s['fwd']:4.1f}% of own fwd, {100*s['trained']/tot:4.1f}% of gradient) "
+                        f"empty-think-wrapper={s['empty_think_wrapper']}")
+
+    feats, dropped, frac, mix_counts, legs = pretokenize(args.data, args.max_samples)
     logger.info(f"train examples -> {len(feats)} (dropped {dropped}); mean assistant-token frac {frac:.0%}; "
                 f"mix {dict(mix_counts)}")
+    log_legs("train", legs)
     ds = Dataset.from_list(feats)
     eval_ds, n_val = None, 0
     if args.val_file and Path(args.val_file).exists():
-        vfeats, vdrop, vfrac, _ = pretokenize(args.val_file, args.max_samples)
+        vfeats, vdrop, vfrac, _, _ = pretokenize(args.val_file, args.max_samples)
         eval_ds, n_val = Dataset.from_list(vfeats), len(vfeats)
         logger.info(f"val examples -> {len(vfeats)} (dropped {vdrop}); frac {vfrac:.0%}")
 
@@ -192,8 +225,10 @@ def main():
         extra = {"lora_r": lora_cfg.get("r", 16), "lora_alpha": lora_cfg.get("alpha", 32),
                  "lora_targets": len(lora.target_modules), "base_model": args.model,
                  "data_file": args.data, "train_n": len(feats), "val_n": n_val,
-                 "max_seq_len": args.max_seq_len, "hardware": os.environ.get("HW_TAG", "GB10/sm_121")}
+                 "max_seq_len": args.max_seq_len, "hardware": os.environ.get("HW_TAG", "GB10/sm_121"),
+                 "final_turns_only": final_turns_only}
         extra.update({f"mix_{k}": v for k, v in mix_counts.items()})  # per-source composition of the mix
+        extra.update({f"trained_tok_{k}": s["trained"] for k, s in legs.items()})  # gradient share per leg
         callbacks.append(MlflowExtraParams(extra))
     trainer = Trainer(model=model, args=ta, train_dataset=ds, eval_dataset=eval_ds,
                       data_collator=TrajSFTCollator(tok), callbacks=callbacks)

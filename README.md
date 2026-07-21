@@ -251,7 +251,7 @@ data_pipeline/                   raw data -> training jsonl
 
 training_pipeline/               Stage 1 SFT · Stage 2 verl seams
 ├── train_traj.py                LoRA SFT
-├── collator_multiturn.py        assistant-only loss mask
+├── collator_multiturn.py        assistant-only loss mask (final turns)
 ├── build_grpo_pool.py           rl_train subset -> verl parquet
 ├── grpo_db_bahn_tools.py        the tau2 tools as verl BaseTools
 └── grpo_tool_config.yaml        verl tool registry
