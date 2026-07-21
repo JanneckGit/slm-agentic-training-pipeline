@@ -34,21 +34,21 @@ them.
 
 ```mermaid
 flowchart TD
-    subgraph SDG["Grounded synthesis — the core of this repo"]
-        A["gtfs.de timetables CC-BY-4.0<br/>+ sha256-seeded synthetic tables"] -->|seed_worldstate.py| B["frozen BahnDB world-state<br/>db.json, seed 42"]
-        B --> C["tau2-bench domain 'db_bahn'<br/>13 German tools READ+WRITE, policy.md<br/>runtime-registered — tau2 source untouched"]
-        C -->|gen_tasks.py| D["15,388 German tasks · 48 templates<br/>by-construction answer keys<br/>INFO · ACTION · REFUSAL, fault-injected"]
-        D -->|rollout.py| E["teacher solves vs REAL tools<br/>thinking inline, parallel calls<br/>branch-on-fail · k=2 top-up · B2 harvest"]
-        E -->|trajectory_reward.py| F{"deterministic verifier<br/>DB-hash · grounding · anti-hallucination"}
+    T["ToolACE"] -->|convert_toolace.py| MIX
+    subgraph SDG["Grounded synthesis"]
+        A["gtfs.de timetables CC-BY-4.0<br/>+ seeded synthetic tables"] -->|seed_worldstate.py| B["frozen world-state<br/>db.json, seed 42"]
+        B --> C["tau2-bench domain 'db_bahn'<br/>13 German tools + policy.md"]
+        C -->|gen_tasks.py| D["15,388 tasks · 48 templates<br/>by-construction answer keys"]
+        D -->|rollout.py| E["teacher solves vs REAL tools<br/>thinking-native"]
+        E -->|trajectory_reward.py| F{"deterministic verifier"}
         F -->|"accepted() traces"| G["format_traj_for_training.py<br/>db_traces_chat.jsonl"]
     end
-    T["ToolACE"] -->|convert_toolace.py| MIX
-    R["AReaL τ²"] -->|convert_areal.py| MIX
     G --> MIX["build_sft_mix.py"]
+    R["AReaL τ²"] -->|convert_areal.py| MIX
     MIX --> M["sft_mix_chat.jsonl + val"]
     M -->|"train_traj.py + collator_multiturn.py"| H["Stage 1 — LoRA Qwen3-4B<br/>assistant-only loss mask"]
     H -->|merge_adapter.py| S["merged student → vLLM"]
-    S -->|"rollout.py on heldout_eval"| EV["in-domain eval, verifier-scored"]
+    S -->|ops/eval_heldout.sh| EV["in-domain eval, verifier-scored"]
     S -->|"bfcl generate / evaluate"| OOD["OOD benchmark — BFCL v4"]
     H -->|ops/grpo_smoke.sh| RL["Stage 2 — GRPO/verl<br/>same tools, reward = the verifier<br/>pool: rl_train (960)"]
     RL -->|"LoRA ckpt → merge_adapter.py"| S
@@ -148,9 +148,24 @@ docker compose -f docker/docker-compose.yml run --rm -T training \
 ```bash
 bash ops/teacher_bakeoff.sh     # compare teacher candidates on bakeoff_dev
 bash ops/gen_traces.sh          # serve winner -> thinking rollout over sft_train (k=1 branch-on-fail)
-                                #   -> k=2 top-up -> format -> data/final/db_traces_chat.jsonl
-                                #   (defaults: ctx 20480, concurrency 8; ~2-2.5 days)
+                                #   -> k=2 top-up -> format -> data/final/
+                                #      db_traces_chat.jsonl                  (the SFT input)
+                                #      db_failed-for-SFT_rl-candidates.jsonl (tasks in no trace ->
+                                #                                            Stage-2 pool candidates)
+                                #   (defaults: ctx 20480, concurrency 48, 72 h cap; ~41 h on GB10)
 ```
+
+`gen_traces.sh` runs 40+ hours — start it detached, with the watchdog next to it:
+
+```bash
+tmux new-session -d -s sdg -c "$PWD"
+tmux send-keys -t sdg:0.0 'bash ops/gen_traces.sh > logs/gen_traces.log 2>&1' Enter
+tmux split-window -t sdg:0 -v -c "$PWD" \; send-keys 'ops/watch_gen.sh' Enter
+```
+
+`ops/watch_gen.sh` writes progress, rate, ETA and server health to `logs/gen_watch.log` every 10 min
+and flags a stall if the trace file stops growing for 30 min. The rollout itself is resume-safe:
+rerunning the script continues where it stopped.
 
 **Mix + train** (`build_sft_mix.py` needs `db_traces_chat.jsonl` from the step above):
 
@@ -164,6 +179,17 @@ bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft -> merge x2 -> AFTER-e
                                 #   -> checkpoint-selection (ep1 vs ep2)
 bash ops/grpo_smoke.sh          # Stage 2: verl tool-agent loop vs the real db_bahn tools
 ```
+
+**In-domain eval, standalone** — any model (base, merged checkpoint, experiment), single-shot over the
+480 `heldout_eval` tasks, printing a per-template yield table:
+
+```bash
+bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think
+python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]   # re-report / delta
+```
+
+`traj_sft_pipeline.sh` calls the same script for the BEFORE and both AFTER evals, so those numbers are
+comparable by construction.
 
 **OOD benchmark (BFCL v4)** — external harness in its own venv, identical seed-42 IDs per model. It
 sends the `Qwen3-4B-Instruct-2507` handler name in the payload, so the served-name **alias is
@@ -232,11 +258,13 @@ training_pipeline/               Stage 1 SFT · Stage 2 verl seams
 evaluation/
 ├── trajectory_reward.py         the verifier = the Stage-2 reward
 ├── grpo_reward.py               verl seam: episode text -> messages
+├── eval_report.py               per-template yield table, optional baseline delta
 └── benchmarks/bfcl/             seed-42 sample IDs + generator
 
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
-ops/                             the four run scripts
+ops/                             teacher_bakeoff · gen_traces · watch_gen · eval_heldout ·
+                                 traj_sft_pipeline · grpo_smoke
 docker/                          GB10 sm_121 stack
 config/pipeline_config.yaml      the single config
 data/, archive/                  [gitignored]
