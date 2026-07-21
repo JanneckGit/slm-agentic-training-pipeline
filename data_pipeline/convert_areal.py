@@ -7,7 +7,19 @@ AReaL ships 33,531 per-turn rows: each row = {messages: prior context, answer: t
 ~12 rows of one dialog share a growing context. We REASSEMBLE one full episode per dialog (last row's
 messages + its answer) so every dialog is trained ONCE (no 12x prefix duplication).
 
+NOTE the cost of that fold: the Qwen3 template keeps <think> only for assistant turns AFTER the last user
+message, so in a reassembled multi-turn dialog 78% of the assistant turns render think-less. Per-turn
+expansion would preserve them but costs 9.8x forward tokens on this leg (measured). We keep the fold and
+mask the context turns out of the loss instead — see training_pipeline/collator_multiturn.py
+(final_turns_only). Expansion stays available as a sampled knob if the tau2 eval shows multi-turn weakness.
+
+Two legs only: airline + retail. TELECOM IS DROPPED (2026-07-22) — it is structurally think-less
+(94.8% of its turns carry no reasoning), the all-correct filter eats almost only telecom (500->180),
+and 333/500 of its tasks are verbatim official tau2-bench task ids (7 of them in the test set) =
+eval contamination.
+
 Pipeline per episode:
+  0. Domain filter: skip SKIP_DOMAINS (telecom).
   1. EPISODE-LEVEL correctness filter: keep only dialogs where EVERY turn has metadata.correct == 1.
   2. Reassemble: messages(last row) + [answer as final assistant].
   3. Reasoning -> `<think>…</think>` prefix in content (Qwen3 native; template drops a separate field).
@@ -15,9 +27,27 @@ Pipeline per episode:
      matched tool_call_id (by order after their assistant turn).
   5. Inject the domain's tau2 tool schemas into the system prompt (db_bahn <tools> style) — AReaL policies
      ship WITHOUT tool defs, so the student would otherwise call unseen tool names.
-  6. Option-A trim @max-len: if the episode exceeds the budget, cut at the last assistant turn WITHOUT
+  6. sanitize_system(): strip the PARALLEL-CALL BAN from the airline prompt (see below).
+  7. Option-A trim @max-len: if the episode exceeds the budget, cut at the last assistant turn WITHOUT
      tool_calls (= a final message = clean sub-task boundary) whose token prefix fits. Never ends on an
      open tool_call; nothing is dropped unless even the first sub-task exceeds the budget.
+     Runs AFTER the sanitizer so the trim measures the final text (the shorter prompt keeps more turns).
+
+PROMPT SURGERY (sanitize_system, 2026-07-22) — why the airline prompt is edited:
+AReaL's airline system prompt bans parallel tool calls twice (an own `CRITICAL RULES` block AND the
+official policy sentence), while its own trajectories show >=2 calls per turn in 1,324 airline turns.
+db_bahn instructs the exact opposite in 100% of its rows ("bundle independent queries") and lives it in
+6,376 turns. The student does not learn "one call" or "many calls" from that — it learns that
+instructions about call count are unreliable. That is the axis on which ep2 lost 9/20 BFCL parallel
+cases (single-call attractor).
+
+The ban is NOT a tau2-bench requirement: the official `AGENT_INSTRUCTION` (tau2/agent/llm_agent.py) says
+nothing about call count, the harness executes multiple calls per turn natively (_execute_tool_calls
+loops, MultiToolMessage exists for exactly this), and no reward component counts tool calls. AReaL even
+deleted the clause from the *retail* policy themselves and only forgot airline. So we do not invent a
+sentence — we put airline on the wording that already exists in the corpus (= retail's = the official
+one). Rule B ("never a message AND a tool call in the same turn") is REAL and stays: a mixed message is
+routed to the environment, so its text never reaches the user simulator.
 
 Runs in the TRAINING container (needs the Qwen3-4B tokenizer for the exact trim). Reads the tool schemas
 from data/raw/areal/tau2_tools_blocks.json (pre-dumped from the tau2 package, which lives only in .venv-tau2).
@@ -39,10 +69,79 @@ from data_pipeline.common import STUDENT_MODEL_DEFAULT, TOOLS_BLOCK_TMPL, args_d
 
 TOOLS_SUFFIX = "\n\n" + TOOLS_BLOCK_TMPL
 
+SKIP_DOMAINS = ("telecom",)  # think-less by construction + contaminates the official tau2 test set
+
+# --- sanitize_system: exact literals, verified against the raw file (one variant per domain) -----------
+# TARGET = tau2's official AGENT_INSTRUCTION, which retail already carries byte-identically (11,395 rows)
+# and which the eval harness itself builds. No hand-written text.
+AGENT_INSTRUCTION_BLOCK = (
+    "<instructions>\n"
+    "You are a customer service agent that helps the user according to the <policy> provided below.\n"
+    "In each turn you can either:\n"
+    "- Send a message to the user.\n"
+    "- Make a tool call.\n"
+    "You cannot do both at the same time.\n"
+    "\n"
+    "Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.\n"
+    "</instructions>"
+)
+# SOURCE = AReaL's own addition on top of the airline prompt (12,842 rows, exactly one variant)
+AIRLINE_INSTRUCTION_BLOCK = (
+    "<instructions>\n"
+    "You are a customer service agent that helps the user according to the <policy> provided below.\n"
+    "\n"
+    "CRITICAL RULES (you MUST follow these):\n"
+    "1. In each turn, you can ONLY do ONE of these:\n"
+    "   - Send a message to the user, OR\n"
+    "   - Make exactly ONE tool call\n"
+    "2. You CANNOT make multiple tool calls in a single turn - only ONE tool call per turn!\n"
+    "3. You CANNOT send a message and make a tool call at the same time.\n"
+    "\n"
+    "Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.\n"
+    "</instructions>"
+)
+# The policy sentence bundles BOTH rules; drop the leading parallel-ban clause, keep rule B — this is
+# verbatim the cut AReaL made in their own retail policy ("...at a time, and if you take" -> "If you take").
+PARALLEL_CLAUSE = "You should only make one tool call at a time, and if you make a tool call,"
+PARALLEL_CLAUSE_FIXED = "If you make a tool call,"
+# Post-condition: none of these may survive in ANY emitted system prompt (3rd = the official retail wording,
+# which AReaL already stripped — guards against a future raw-data refresh reintroducing it).
+BANNED_PHRASES = ("only ONE tool call per turn", "only make one tool call at a time",
+                  "at most make one tool call at a time")
+
 
 def domain_of(dialog_id: str) -> str:
     head = dialog_id.split("_")[0]
     return head if head in ("airline", "retail") else "telecom"  # telecom ids are numeric
+
+
+def sanitize_system(content: str, dom: str, stats=None) -> str:
+    """Remove the parallel-call ban from the system prompt; keep rule B. Literal replacements only —
+    a missing/duplicated pattern is a HARD ERROR, so a raw-data change can never make this a silent no-op."""
+    if dom == "airline":
+        for src, dst, tag in ((AIRLINE_INSTRUCTION_BLOCK, AGENT_INSTRUCTION_BLOCK, "instructions"),
+                              (PARALLEL_CLAUSE, PARALLEL_CLAUSE_FIXED, "policy")):
+            n = content.count(src)
+            if n != 1:
+                raise ValueError(f"sanitize_system[{dom}/{tag}]: expected exactly 1 occurrence, found {n}")
+            content = content.replace(src, dst)
+            if stats is not None:
+                stats[f"sanitized_{dom}_{tag}"] += 1
+    for phrase in BANNED_PHRASES:                       # post-condition, checked for EVERY domain
+        if phrase in content:
+            raise ValueError(f"sanitize_system[{dom}]: parallel-call ban survived: {phrase!r}")
+    if AGENT_INSTRUCTION_BLOCK not in content:          # rule B must still be stated
+        raise ValueError(f"sanitize_system[{dom}]: official <instructions> block missing after sanitize")
+    return content
+
+
+def assert_target_matches_corpus(last_row: dict) -> None:
+    """G0: the TARGET literal must equal the <instructions> block retail actually ships, so a typo in the
+    constant above cannot slip through. Called once with any retail row."""
+    src = last_row["messages"][0]["content"]
+    i, j = src.index("<instructions>"), src.index("</instructions>") + len("</instructions>")
+    if src[i:j] != AGENT_INSTRUCTION_BLOCK:
+        raise ValueError("G0 FAILED: AGENT_INSTRUCTION_BLOCK != retail's <instructions> block in the raw data")
 
 
 def norm_tool_calls(tcs, ctr):
@@ -149,9 +248,18 @@ def main():
     full_ok = [d for d, cs in flags.items() if all(c == 1 for c in cs)]
 
     out, stats = [], defaultdict(int)
+    retail_row = next((last_row[d] for d in sorted(full_ok) if domain_of(d) == "retail"), None)
+    if retail_row is None:
+        raise ValueError("G0 FAILED: no retail dialog in the raw data to verify the target literal against")
+    assert_target_matches_corpus(retail_row)
+
     for did in sorted(full_ok):
         dom = domain_of(did)
+        if dom in SKIP_DOMAINS:
+            stats[f"skipped_{dom}"] += 1
+            continue
         msgs = build_messages(last_row[did], tools_blocks[dom])
+        msgs[0]["content"] = sanitize_system(msgs[0]["content"], dom, stats)  # BEFORE the trim
         kept, trimmed = trim_option_a(tok, msgs, args.max_seq_len)
         if kept is None:
             stats["dropped_overlength"] += 1
@@ -164,8 +272,10 @@ def main():
 
     write_jsonl(out, args.out)
     print(f"AReaL: {len(flags)} dialogs, {len(full_ok)} full-correct -> {len(out)} episodes "
-          f"(dropped {stats['dropped_overlength']} overlength, trimmed {stats['trimmed']}) -> {args.out}")
+          f"(skipped {sum(stats[f'skipped_{d}'] for d in SKIP_DOMAINS)} in {list(SKIP_DOMAINS)}, "
+          f"dropped {stats['dropped_overlength']} overlength, trimmed {stats['trimmed']}) -> {args.out}")
     print("  domains:", {k[4:]: v for k, v in sorted(stats.items()) if k.startswith("dom_")})
+    print("  sanitized:", {k: v for k, v in sorted(stats.items()) if k.startswith("sanitized_")})
 
 
 if __name__ == "__main__":

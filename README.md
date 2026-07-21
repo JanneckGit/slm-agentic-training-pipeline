@@ -20,8 +20,8 @@ tool sandbox.
 Two training stages, both grounded in the same domain:
 
 1. **Stage 1 — SFT (LoRA)** on a **3-leg mix**: public tool-calling breadth (ToolACE), τ²-bench
-   dialogue flows (AReaL), and — the core of this repo — **self-synthesized, verifier-gated German
-   DB trajectories with native thinking**.
+   dialogue flows (AReaL — airline + retail; telecom dropped), and — the core of this repo —
+   **self-synthesized, verifier-gated German DB trajectories with native thinking**.
 2. **Stage 2 — GRPO/verl RL** against the same db_bahn tools, reward = the same deterministic
    trajectory verifier, tasks from the `rl_train` split of the same pool.
 
@@ -172,7 +172,8 @@ rerunning the script continues where it stopped.
 ```bash
 PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # bracket-DSL -> toolace_chat.jsonl
 docker compose -f docker/docker-compose.yml run --rm -T training \
-  python3 data_pipeline/convert_areal.py                  # per-turn rows -> episodes -> areal_chat.jsonl
+  python3 data_pipeline/convert_areal.py                  # per-turn rows -> episodes (airline+retail,
+                                                          #   telecom dropped, parallel-ban stripped)
 PYTHONPATH=. python3 data_pipeline/build_sft_mix.py       # -> sft_mix_chat.jsonl + sft_mix_val.jsonl
 
 bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft -> merge x2 -> AFTER-eval x2
@@ -243,7 +244,7 @@ data_pipeline/                   raw data -> training jsonl
 ├── prepare_agentic_data.py      fetch ToolACE + AReaL
 ├── validate_areal.py            schema / integrity / referential checks
 ├── convert_toolace.py           bracket-DSL -> chat
-├── convert_areal.py             per-turn rows -> episodes
+├── convert_areal.py             per-turn rows -> episodes (airline+retail; strips the parallel-call ban)
 ├── format_traj_for_training.py  rollouts -> chat, split-aware gates
 ├── build_sft_mix.py             3-leg mix + stratified val split
 └── common.py                    shared helpers
