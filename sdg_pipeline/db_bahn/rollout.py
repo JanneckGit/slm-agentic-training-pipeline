@@ -509,7 +509,10 @@ def solve_task(task: dict, key: dict, make_call, args, teacher_cfg) -> dict:
     mode = "direct" if accepted(best) else None
 
     if not is_oracle:
-        for _ in range(args.max_regen + 1):
+        # range(N), NOT range(N+1): --max-regen is "re-sample a failed rollout up to N times", so 0
+        # must mean exactly one attempt (what an eval wants). The old +1 made --max-regen 0 still fire
+        # one restart; the argparse default moved 1 -> 2 so the generation path is unchanged.
+        for _ in range(args.max_regen):
             if accepted(best):
                 break
             if branch_on and n_branch < args.branch_attempts:  # branch-first: recovery before restart
@@ -559,7 +562,8 @@ def main():
                     help="don't send chat_template_kwargs (mistral tokenizer mode)")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=10)
-    ap.add_argument("--max-regen", type=int, default=1, help="re-sample a failed rollout up to N times")
+    ap.add_argument("--max-regen", type=int, default=2, help="re-sample a failed rollout up to N times "
+                                                            "(0 = single shot, for evals)")
     ap.add_argument("--branch-on-fail", action="store_true",
                     help="A1: on a failed rollout, keep the gold-path prefix and resample only the tail")
     ap.add_argument("--branch-attempts", type=int, default=2,

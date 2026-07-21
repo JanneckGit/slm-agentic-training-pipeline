@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 COMPOSE="docker compose -f docker/docker-compose.yml"
-TAU2PY=${TAU2PY:-$(pwd)/.venv-tau2/bin/python}
+export TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}   # exportiert: ops/eval_heldout.sh erbt den Override
 # host eval writes to the SAME physical store as the training container (../mlruns == /app/mlruns)
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"
 BASE="Qwen/Qwen3-4B"   # dense, text-only, thinking student (verl-GRPO-proven; NOT the MM hybrid 3.5)
@@ -14,42 +14,16 @@ MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged"
 MERGED_CTR="/app/data/final/checkpoints/db_bahn_traj_merged"
 ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
 
-serve() {  # $1=model $2=served-name-model $3=gpu_util
-  # wave 3.5: ctx 20480 (inline <think> grows the dialogs — same window as generation).
-  # NO --gdn-prefill-backend here: this script serves only standard transformers (base 4B /
-  # merged students); the GDN flag belongs to the hybrid teacher in ops/gen_traces.sh.
-  $COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
-  VLLM_MODEL="$1" VLLM_GPU_UTIL="${3:-0.85}" VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
-    VLLM_EXTRA_ARGS="--max-num-seqs 16" \
-    $COMPOSE --profile vllm up -d vllm >>logs/traj_sft.log 2>&1
-  for _ in $(seq 90); do curl -sf localhost:8000/health >/dev/null 2>&1 && return 0; \
-    docker ps --format '{{.Names}}' | grep -q text2sql_vllm_teacher || return 1; sleep 10; done
-  curl -sf localhost:8000/health >/dev/null 2>&1
-}
-
-eval_heldout() {  # $1=served-model $2=label $3=outfile
-  # concurrency 16 must match serve()'s --max-num-seqs 16 (a higher client conc would just queue server-side).
-  # wave 3.5 THINK eval (fair vs. the base+think baselines): thinking ON, 3072/turn, max-turns 15
-  # (the depth classes need up to 13 calls). Sampling = the STUDENT recipe from the Qwen3-4B card
-  # (temp 0.6 / presence 0) — NOT the config default, which now carries the Qwen3.6 TEACHER recipe
-  # (temp 1.0 / presence 1.5); without these flags the wrong recipe would silently apply.
-  timeout 21600 env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
-    sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
-    --split heldout_eval --k 1 --api-base http://localhost:8000/v1 --model "$1" --teacher-name "$2" \
-    --enable-thinking --temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0.0 \
-    --max-turns 15 --max-tokens-per-turn 3072 --max-regen 1 --concurrency 16 \
-    --mlflow --mlflow-run-name "$2" \
-    --output "$3" 2>&1 | tail -6
-}
+# Serve + Eval + Report liegen in ops/eval_heldout.sh — EINE Quelle fuer BEFORE und AFTER, damit die
+# Zahlen per Konstruktion vergleichbar sind. Dieses Skript ruft es nur auf; Teardown und `rm -f` der
+# Ausgabedatei gehoeren dort hin (sonst faende das Training keinen freien Speicher, bzw. ein zweiter
+# Lauf wuerde in die JSONL des vorigen Checkpoints hinein-resumen).
 
 echo "==== PHASE 6 START $(date) ===="
 
 echo "== [1/4] BEFORE-eval: base $BASE on heldout_eval =="
-rm -f data/generated/db_traces_heldout_before.jsonl
-if serve "$BASE" "$BASE" 0.85; then
-  eval_heldout "$BASE" "before_base_4b" "data/generated/db_traces_heldout_before.jsonl"
-else echo "== BEFORE serve FAILED"; docker logs text2sql_vllm_teacher --tail 30 >>logs/traj_sft.log 2>&1; fi
-$COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
+bash ops/eval_heldout.sh "$BASE" "before_base_4b" "data/generated/db_traces_heldout_before.jsonl" \
+  || echo "== BEFORE-eval FAILED — weiter mit dem Training, aber ohne Vergleichsbasis"
 
 DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 3-leg SFT mix (db_bahn + AReaL + ToolACE)
 VAL=${VAL:-data/final/sft_mix_val.jsonl}         # held-out val split (eval_loss, never in gradient)
@@ -72,14 +46,14 @@ done
 
 echo "== [4/4] AFTER-eval: eval BOTH epochs on heldout_eval, keep the higher verified_yield =="
 for EP in 1 2; do
-  OUT="data/generated/db_traces_heldout_after_ep${EP}.jsonl"; rm -f "$OUT"
-  if serve "${MERGED_CTR}/ep${EP}" "${MERGED_CTR}/ep${EP}" 0.85; then
-    eval_heldout "${MERGED_CTR}/ep${EP}" "after_ep${EP}" "$OUT"
-  else echo "== AFTER ep${EP} serve FAILED"; docker logs text2sql_vllm_teacher --tail 30 >>logs/traj_sft.log 2>&1; fi
-  $COMPOSE --profile vllm down vllm >/dev/null 2>&1; sleep 3
+  bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_ep${EP}" \
+    "data/generated/db_traces_heldout_after_ep${EP}.jsonl" \
+    || echo "== AFTER-eval ep${EP} FAILED"
 done
 
-# checkpoint selection: compare verified_yield (fraction score.score==1.0), promote the winner (tie -> ep2).
+# checkpoint selection: same accept gate as the eval report (score==1.0 AND not truncated AND not
+# degenerate) — a bare score==1.0 would prefer the checkpoint that produces MORE think-loops, and with
+# single-shot evals those gates finally fire. Tie -> ep2.
 WINNER=$(python3 - "data/generated/db_traces_heldout_after_ep1.jsonl" "data/generated/db_traces_heldout_after_ep2.jsonl" <<'PY'
 import json, sys
 def vyield(p):
@@ -89,7 +63,10 @@ def vyield(p):
             line = line.strip()
             if not line: continue
             r = json.loads(line); n += 1
-            if (r.get("score") or {}).get("score") == 1.0: y += 1
+            d = r.get("degen") or {}
+            if ((r.get("score") or {}).get("score") == 1.0 and not r.get("truncated")
+                    and d.get("think_ngram_dup_ratio", 0.0) <= 0.5
+                    and d.get("max_think_chars", 0) <= 12000): y += 1
     except FileNotFoundError:
         return -1.0, 0, 0
     return (y / n if n else 0.0), y, n
