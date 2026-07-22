@@ -9,8 +9,10 @@
 # --max-regen 1 = bis zu 3 Versuche mit best-of-Auswahl; sie sind mit diesen NICHT vergleichbar.
 #
 # Env-Overrides (Defaults in Klammern):
-#   SPLIT (heldout_eval)  EVAL_CONC (24)  ROLLOUT_TIMEOUT_S (1800)  EVAL_TIMEOUT (21600)
-#   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  TAU2PY  MLFLOW_EXPERIMENT (db_bahn_traj_eval)
+#   SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)  EVAL_TIMEOUT (21600)
+#   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  VLLM_EXTRA  TAU2PY
+#   MLFLOW_EXPERIMENT (db_bahn_traj_eval)
+#   TEMPERATURE (0.6)  TOP_P (0.95)  TOP_K (20)  MIN_P (0)  PRESENCE_PENALTY (0.0)
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -26,6 +28,22 @@ OUT=${3:-data/generated/db_traces_${SPLIT}_${LABEL}.jsonl}
 # 21 = der bindende (kleinere) Fall, deckt damit jedes SLM bis ~10B ab, ohne ans Limit zu gehen.
 # Neues Modell? Einmal servieren und `docker logs text2sql_vllm_teacher | grep 'Maximum concurrency'`.
 EVAL_CONC=${EVAL_CONC:-21}
+
+# Sampling — Default ist das Qwen3-STUDENTEN-Rezept (Model-Card Qwen3-4B). Andere Modellfamilien
+# haben andere Empfehlungen und muessen sie beim Aufruf ueberschreiben, z. B. Qwen3.5 general:
+#   TEMPERATURE=1.0 PRESENCE_PENALTY=1.5 bash ops/eval_heldout.sh Qwen/Qwen3.5-4B base_qwen3.5-4b
+# Wer hier nichts setzt, misst mit dem Qwen3-Rezept — bei einer fremden Familie also potenziell
+# die Fehlkonfiguration statt der Faehigkeit.
+TEMPERATURE=${TEMPERATURE:-0.6}
+TOP_P=${TOP_P:-0.95}
+TOP_K=${TOP_K:-20}
+MIN_P=${MIN_P:-0}
+PRESENCE_PENALTY=${PRESENCE_PENALTY:-0.0}
+# zusaetzliche vLLM-Flags, z. B. --language-model-only bei multimodalen Modellen (Qwen3.5): laedt
+# den Vision-Encoder nicht mit und gibt KV-Pool frei. NICHT --reasoning-parser setzen — der schoebe
+# das Think in ein eigenes Feld, waehrend rollout.py es INLINE aus dem Content parst.
+VLLM_EXTRA=${VLLM_EXTRA:-}
+
 mkdir -p data/generated logs
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Training-Container
 
@@ -37,13 +55,15 @@ teardown() { $COMPOSE --profile vllm down vllm >/dev/null 2>&1; }
 trap teardown EXIT
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — $(date '+%F %T') ===="
+echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY"
+echo "   serving : conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'"
 teardown; sleep 3
 
 # NUR Standard-Transformer hier (Base 4B / merged Student) -> kein --gdn-prefill-backend,
 # der gehoert zum hybriden Teacher in ops/gen_traces.sh.
 VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" \
   VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
-  VLLM_EXTRA_ARGS="--max-num-seqs $EVAL_CONC" \
+  VLLM_EXTRA_ARGS="--max-num-seqs $EVAL_CONC $VLLM_EXTRA" \
   $COMPOSE --profile vllm up -d vllm >>logs/eval_heldout.log 2>&1
 
 for _ in $(seq 180); do
@@ -73,7 +93,8 @@ rm -f "$OUT"
 timeout "${EVAL_TIMEOUT:-21600}" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
   --split "$SPLIT" --k 1 --api-base http://localhost:8000/v1 --model "$MODEL" --teacher-name "$LABEL" \
-  --enable-thinking --temperature 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0.0 \
+  --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
+  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
   --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "$LABEL" \
