@@ -4,10 +4,10 @@ data_pipeline/build_sft_mix.py
 Assemble the 3-leg SFT mix from the three converted chat files into ONE shuffled training set + a held-out
 val split (never in the gradient) for the overfit detector.
 
-Legs (all already in the unified db_bahn chat format):
-  - db_bahn : data/final/db_traces_chat.jsonl        (verified German DB traces; core, up-weighted by count)
-  - AReaL   : data/generated/areal_chat.jsonl         (tau2 dialogue + policy, 3 domains — the dialogue half)
-  - ToolACE : data/generated/toolace_chat.jsonl       (API-schema breadth + irrelevance)
+Legs (all already in the unified db_bahn chat format), all under data/generated/legs/:
+  - db_bahn : db_traces_chat.jsonl        (verified German DB traces; core, up-weighted by count)
+  - AReaL   : areal_chat.jsonl            (tau2 dialogue + policy, 2 domains — the dialogue half)
+  - ToolACE : toolace_chat.jsonl          (API-schema breadth + irrelevance)
 
 Filters here:
   - db_bahn: drop the ~10 "flail" traces with an identical consecutive tool call (name+args repeated back to
@@ -27,9 +27,9 @@ from collections import Counter
 from data_pipeline.common import write_jsonl
 
 LEGS = {
-    "db_bahn": "data/final/db_traces_chat.jsonl",
-    "areal": "data/generated/areal_chat.jsonl",
-    "toolace": "data/generated/toolace_chat.jsonl",
+    "db_bahn": "data/generated/legs/db_traces_chat.jsonl",
+    "areal": "data/generated/legs/areal_chat.jsonl",
+    "toolace": "data/generated/legs/toolace_chat.jsonl",
 }
 
 

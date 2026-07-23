@@ -257,9 +257,9 @@ def filter_raw(raw_path: str, out_path: str) -> tuple[int, int, int, Counter]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/pipeline_config.yaml")
-    ap.add_argument("--preselect", default="data/generated/toolace_preselect.jsonl")
-    ap.add_argument("--raw", default="data/generated/toolace_backfill_raw.jsonl")
-    ap.add_argument("--out", default="data/generated/toolace_chat.jsonl")
+    ap.add_argument("--preselect", default="data/generated/sdg/toolace_preselect.jsonl")
+    ap.add_argument("--raw", default="data/generated/sdg/toolace_backfill_raw.jsonl")
+    ap.add_argument("--out", default="data/generated/legs/toolace_chat.jsonl")
     ap.add_argument("--limit", type=int, default=None, help="smoke: first N records after shuffling")
     ap.add_argument("--per-class", type=int, default=None, help="pilot: N records per sel_class")
     ap.add_argument("--classes", default=None, help="comma-separated sel_class filter (with --per-class)")

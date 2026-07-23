@@ -45,7 +45,7 @@ for i in "${!CANDIDATES[@]}"; do
   [ "$i" -lt "$START" ] && continue
   IFS='|' read -r SHORT MODEL EXTRA GPU_UTIL MAXLEN OMIT CAND_MAXTOK <<<"${CANDIDATES[$i]}"
   CAND_MAXTOK=${CAND_MAXTOK:-$MAXTOK}
-  TRACE="data/generated/db_traces_bakeoff_dev_${SHORT}.jsonl"
+  TRACE="data/generated/sdg/db_traces_bakeoff_dev_${SHORT}.jsonl"
   LOG="logs/bakeoff_${SHORT}.log"
 
   # resume: skip candidates that already have all records

@@ -22,7 +22,7 @@ TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 MODEL=${1:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 LABEL=${2:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 SPLIT=${SPLIT:-heldout_eval}
-OUT=${3:-data/generated/db_traces_${SPLIT}_${LABEL}.jsonl}
+OUT=${3:-data/generated/eval/db_traces_${SPLIT}_${LABEL}.jsonl}
 # 75 % der von vLLM gemeldeten "Maximum concurrency", gemessen 2026-07-21 bei ctx 20480 / util 0.85:
 #   Qwen3-4B  KV 663.424 Tok -> 32,39x -> 24     Qwen3-8B  KV 594.048 Tok -> 29,01x -> 21
 # 21 = der bindende (kleinere) Fall, deckt damit jedes SLM bis ~10B ab, ohne ans Limit zu gehen.
@@ -44,7 +44,7 @@ PRESENCE_PENALTY=${PRESENCE_PENALTY:-0.0}
 # das Think in ein eigenes Feld, waehrend rollout.py es INLINE aus dem Content parst.
 VLLM_EXTRA=${VLLM_EXTRA:-}
 
-mkdir -p data/generated logs
+mkdir -p data/generated/eval logs
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Training-Container
 
 # Dieses Skript ist EIGENTUEMER von Teardown und rm -f (beides lag frueher im Aufrufer):

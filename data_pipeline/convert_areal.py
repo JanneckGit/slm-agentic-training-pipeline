@@ -56,7 +56,7 @@ one <tools>…</tools> block per domain sits verbatim in each record's system pr
 
 Usage (training container):
     python3 data_pipeline/convert_areal.py --max-seq-len 12288 \
-        --out data/generated/areal_chat.jsonl
+        --out data/generated/legs/areal_chat.jsonl
 """
 
 import argparse
@@ -229,7 +229,7 @@ def main():
     ap.add_argument("--tools", default="data/raw/areal/tau2_tools_blocks.json")
     ap.add_argument("--model", default=STUDENT_MODEL_DEFAULT)
     ap.add_argument("--max-seq-len", type=int, default=12288)
-    ap.add_argument("--out", default="data/generated/areal_chat.jsonl")
+    ap.add_argument("--out", default="data/generated/legs/areal_chat.jsonl")
     args = ap.parse_args()
 
     tools_blocks = json.load(open(args.tools))

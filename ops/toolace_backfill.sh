@@ -25,12 +25,12 @@ TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 
 TEACHER=${TEACHER:-"Qwen/Qwen3.6-35B-A3B"}
 CONCURRENCY=${CONCURRENCY:-48}          # Server --max-num-seqs folgt diesem Wert
-PRESELECT=${PRESELECT:-data/generated/toolace_preselect.jsonl}
-RAW=${RAW:-data/generated/toolace_backfill_raw.jsonl}
-OUT=${OUT:-data/generated/toolace_chat.jsonl}
+PRESELECT=${PRESELECT:-data/generated/sdg/toolace_preselect.jsonl}
+RAW=${RAW:-data/generated/sdg/toolace_backfill_raw.jsonl}
+OUT=${OUT:-data/generated/legs/toolace_chat.jsonl}
 SEED=${SEED:-42}
 
-mkdir -p data/generated logs
+mkdir -p data/generated/legs data/generated/sdg logs
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie Training-Container + UI
 
 # Teardown gehoert diesem Skript: ohne ihn haelt vLLM 0.85 x 128 GB und jedes Folgetraining verhungert.

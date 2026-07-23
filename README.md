@@ -148,10 +148,10 @@ docker compose -f docker/docker-compose.yml run --rm -T training \
 ```bash
 bash ops/teacher_bakeoff.sh     # compare teacher candidates on bakeoff_dev
 bash ops/gen_traces.sh          # serve winner -> thinking rollout over sft_train (k=1 branch-on-fail)
-                                #   -> k=2 top-up -> format -> data/final/
-                                #      db_traces_chat.jsonl                  (the SFT input)
-                                #      db_failed-for-SFT_rl-candidates.jsonl (tasks in no trace ->
-                                #                                            Stage-2 pool candidates)
+                                #   -> k=2 top-up -> format ->
+                                #      data/generated/legs/db_traces_chat.jsonl        (the SFT input)
+                                #      data/generated/sdg/db_failed-for-SFT_rl-candidates.jsonl
+                                #                       (tasks in no trace -> Stage-2 pool candidates)
                                 #   (defaults: ctx 20480, concurrency 48, 72 h cap; ~41 h on GB10)
 ```
 
@@ -206,7 +206,7 @@ VLLM_MODEL="Qwen/Qwen3-4B" VLLM_MAX_MODEL_LEN=32768 VLLM_GPU_UTIL=0.85 \
   VLLM_EXTRA_ARGS="--max-num-seqs 16 --served-model-name Qwen/Qwen3-4B-Instruct-2507" \
   docker compose -f docker/docker-compose.yml --profile vllm up -d vllm
 
-export BFCL_PROJECT_ROOT=$PWD/data/generated/bfcl_quickrun/base LOCAL_SERVER_PORT=8000
+export BFCL_PROJECT_ROOT=$PWD/data/generated/eval/bfcl_quickrun/base LOCAL_SERVER_PORT=8000
 mkdir -p $BFCL_PROJECT_ROOT && cp evaluation/benchmarks/bfcl/mt.json $BFCL_PROJECT_ROOT/test_case_ids_to_generate.json
 .venv-bfcl/bin/bfcl generate --model Qwen/Qwen3-4B-Instruct-2507-FC --run-ids --skip-server-setup \
   --temperature 0.6 --num-threads 16

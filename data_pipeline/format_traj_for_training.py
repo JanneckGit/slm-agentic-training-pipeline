@@ -3,8 +3,8 @@ data_pipeline/format_traj_for_training.py
 =========================================
 Phase 5 of Plan (B): convert VERIFIED db_bahn trajectories into the multi-turn chat training JSONL.
 
-Input : data/generated/db_traces_sft_train_<teacher>.jsonl (rollout records with score + messages)
-Output: data/final/db_traces_chat.jsonl — one {"messages": [...], "_meta": {...}} per line.
+Input : data/generated/sdg/db_traces_sft_train_<teacher>.jsonl (rollout records with score + messages)
+Output: data/generated/legs/db_traces_chat.jsonl — one {"messages": [...], "_meta": {...}} per line.
 
 Keeps ONLY verified (score==1.0) records. Messages stay OpenAI-style (system with embedded tool schemas,
 user ticket, assistant turns with content "<plan>…</plan>" + tool_calls, role:"tool" observations, final
@@ -20,10 +20,10 @@ bare task_id against tasks.json / answer_keys.json, which hold all splits).
 
 Usage:
     PYTHONPATH=. python3 data_pipeline/format_traj_for_training.py \
-        --input data/generated/db_traces_sft_train_q36-35b-a3b.jsonl \
-        --output data/final/db_traces_chat.jsonl \
+        --input data/generated/sdg/db_traces_sft_train_q36-35b-a3b.jsonl \
+        --output data/generated/legs/db_traces_chat.jsonl \
         --split-file data/raw/db_sandbox/split_tasks.json --split sft_train \
-        --dropped-out data/final/db_failed-for-SFT_rl-candidates.jsonl
+        --dropped-out data/generated/sdg/db_failed-for-SFT_rl-candidates.jsonl
 """
 
 import argparse
@@ -97,8 +97,8 @@ def convert(rec: dict) -> dict | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/generated/db_traces_sft_train_q36-35b-a3b.jsonl")
-    ap.add_argument("--output", default="data/final/db_traces_chat.jsonl")
+    ap.add_argument("--input", default="data/generated/sdg/db_traces_sft_train_q36-35b-a3b.jsonl")
+    ap.add_argument("--output", default="data/generated/legs/db_traces_chat.jsonl")
     ap.add_argument("--split-file", default=None,
                     help="split_tasks.json; if set, keep only records whose task_id is in --split")
     ap.add_argument("--split", default="sft_train",

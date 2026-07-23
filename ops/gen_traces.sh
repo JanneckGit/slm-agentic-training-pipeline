@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ops/gen_traces.sh — Welle-2 Trace-Generierung (Etappe 3, DATEN NUR — kein Training/Eval).
 # Serve Sieger-Teacher -> rollout sft_train (k=1, branch-on-fail) -> k=2 Top-up NUR auf den in
-# Pass 1 gescheiterten Tasks -> format_traj -> data/final/db_traces_chat.jsonl.
+# Pass 1 gescheiterten Tasks -> format_traj -> data/generated/legs/db_traces_chat.jsonl.
 # Alles nach MLflow (Experiment db_bahn_traj_gen) + weiterhin ins Trace-JSONL (Quelle der Wahrheit).
 #
 # LÄUFT MEHRERE STUNDEN — detached starten, z. B.:
@@ -36,14 +36,14 @@ MAX_TURNS=${MAX_TURNS:-14}                        # wave-3: iteration chains + t
 CONCURRENCY=${CONCURRENCY:-48}                    # server --max-num-seqs folgt diesem Wert
 EXP="db_bahn_traj_gen"
 
-TRACE="data/generated/db_traces_${SPLIT}_${SHORT}.jsonl"
-FAILED="data/generated/_topup_failed_ids.txt"
-CHAT="data/final/db_traces_chat.jsonl"
+TRACE="data/generated/sdg/db_traces_${SPLIT}_${SHORT}.jsonl"
+FAILED="data/generated/sdg/_topup_failed_ids.txt"
+CHAT="data/generated/legs/db_traces_chat.jsonl"
 # Split-Tasks, die es in KEINE Chat-Trace geschafft haben -> trainiert-ungesehen, damit Kandidaten
 # fuer den Stage-2-GRPO-Pool (build_grpo_pool.py loest eine blanke task_id gegen tasks/answer_keys auf).
-FAILED_RL="data/final/db_failed-for-SFT_rl-candidates.jsonl"
+FAILED_RL="data/generated/sdg/db_failed-for-SFT_rl-candidates.jsonl"
 SPLITF="data/raw/db_sandbox/split_tasks.json"
-mkdir -p data/generated data/final logs
+mkdir -p data/generated/legs data/generated/sdg data/final logs
 # host eval/gen writes to the SAME physical store the training container mounts (../mlruns)
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"
 

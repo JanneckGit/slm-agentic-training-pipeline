@@ -4,7 +4,7 @@ data_pipeline/convert_toolace.py
 Convert ToolACE (ShareGPT, bracket-DSL tool calls) into the unified db_bahn chat format — STAGE 1 of the
 ToolACE leg. The output is a PRESELECTION with gold calls and no thinking; the thinking is generated
 afterwards by data_pipeline/backfill_toolace_think.py, which verifies every generation against these gold
-calls and only then writes data/generated/toolace_chat.jsonl for the mix.
+calls and only then writes data/generated/legs/toolace_chat.jsonl for the mix.
 
 ToolACE's value = API-SCHEMA BREADTH (26,507 distinct tools -> generalization to unseen schemas, pays into
 BFCL) + IRRELEVANCE rows ("if none of the functions can be used, point it out") + a large reservoir of
@@ -33,7 +33,7 @@ parallel — and then filled randomly from the single pool, catching 43% of the 
 1,757 in the mix, 2,300 left on the floor. That is the direct repair material for the BFCL parallel
 regression (ep2 lost 9/20), so it now comes first.
 
-Usage:  PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # -> data/generated/toolace_preselect.jsonl
+Usage:  PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # -> data/generated/sdg/toolace_preselect.jsonl
 """
 
 import argparse
@@ -238,7 +238,7 @@ def main():
     ap.add_argument("--n-plain-single", type=int, default=500,
                     help="plain 1-call rows kept so the simple one-call shape is not unlearned")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", default="data/generated/toolace_preselect.jsonl")
+    ap.add_argument("--out", default="data/generated/sdg/toolace_preselect.jsonl")
     args = ap.parse_args()
 
     parallel, irrelevance, multi, plain_single, skipped = [], [], [], [], 0

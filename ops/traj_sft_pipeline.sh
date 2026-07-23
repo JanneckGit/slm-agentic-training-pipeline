@@ -22,7 +22,7 @@ ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
 echo "==== PHASE 6 START $(date) ===="
 
 echo "== [1/4] BEFORE-eval: base $BASE on heldout_eval =="
-bash ops/eval_heldout.sh "$BASE" "before_base_4b" "data/generated/db_traces_heldout_before.jsonl" \
+bash ops/eval_heldout.sh "$BASE" "before_base_4b" "data/generated/eval/db_traces_heldout_before.jsonl" \
   || echo "== BEFORE-eval FAILED — weiter mit dem Training, aber ohne Vergleichsbasis"
 
 DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 3-leg SFT mix (db_bahn + AReaL + ToolACE)
@@ -47,14 +47,14 @@ done
 echo "== [4/4] AFTER-eval: eval BOTH epochs on heldout_eval, keep the higher verified_yield =="
 for EP in 1 2; do
   bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_ep${EP}" \
-    "data/generated/db_traces_heldout_after_ep${EP}.jsonl" \
+    "data/generated/eval/db_traces_heldout_after_ep${EP}.jsonl" \
     || echo "== AFTER-eval ep${EP} FAILED"
 done
 
 # checkpoint selection: same accept gate as the eval report (score==1.0 AND not truncated AND not
 # degenerate) — a bare score==1.0 would prefer the checkpoint that produces MORE think-loops, and with
 # single-shot evals those gates finally fire. Tie -> ep2.
-WINNER=$(python3 - "data/generated/db_traces_heldout_after_ep1.jsonl" "data/generated/db_traces_heldout_after_ep2.jsonl" <<'PY'
+WINNER=$(python3 - "data/generated/eval/db_traces_heldout_after_ep1.jsonl" "data/generated/eval/db_traces_heldout_after_ep2.jsonl" <<'PY'
 import json, sys
 def vyield(p):
     n = y = 0
@@ -82,7 +82,7 @@ echo "== checkpoint selection: EPOCH $WINNER wins -> 'selected' symlinks =="
 $COMPOSE run --rm -T training bash -c "
   ln -sfn 'ep${WINNER}' '${MERGED_CTR}/selected' &&
   ln -sfn 'ep${WINNER}' '/app/${ADAPTER}/selected' && echo 'selected -> ep${WINNER} (merged + adapter)'" 2>&1 | tail -1
-cp -f "data/generated/db_traces_heldout_after_ep${WINNER}.jsonl" data/generated/db_traces_heldout_after.jsonl
+cp -f "data/generated/eval/db_traces_heldout_after_ep${WINNER}.jsonl" data/generated/eval/db_traces_heldout_after.jsonl
 echo "   servable model: ${MERGED_HOST}/selected   |   adapter: ${ADAPTER}/selected"
 
 echo "==== PHASE 6 DONE $(date) ===="

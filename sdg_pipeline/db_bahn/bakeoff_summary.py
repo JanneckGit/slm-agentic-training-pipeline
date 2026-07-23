@@ -1,7 +1,7 @@
 """
 sdg_pipeline/db_bahn/bakeoff_summary.py
 =======================================
-Aggregate all bake-off trace files (data/generated/db_traces_bakeoff_dev_*.jsonl) into per-teacher
+Aggregate all bake-off trace files (data/generated/sdg/db_traces_bakeoff_dev_*.jsonl) into per-teacher
 metrics and print/update the markdown table for docs/teacher-bakeoff.md.
 
 Metrics per teacher (the plan's protocol): verified-yield %, German-quality proxy, replan-rate on
@@ -31,7 +31,7 @@ def german_score(text: str) -> bool:
 
 def main():
     rows = {}
-    for path in sorted(glob.glob("data/generated/db_traces_bakeoff_dev_*.jsonl")):
+    for path in sorted(glob.glob("data/generated/sdg/db_traces_bakeoff_dev_*.jsonl")):
         for line in open(path):
             try:
                 r = json.loads(line)

@@ -11,9 +11,9 @@ single flip moves the number by 10 pp — a bare percentage would fake a precisi
 Plain python3 (no tau2 needed, no repo imports).
 
 Usage:
-    python3 evaluation/eval_report.py --input data/generated/db_traces_heldout_base_think.jsonl
-    python3 evaluation/eval_report.py --input  data/generated/db_traces_heldout_after_ep2.jsonl \
-                                      --baseline data/generated/db_traces_heldout_before.jsonl
+    python3 evaluation/eval_report.py --input data/generated/eval/db_traces_heldout_base_think.jsonl
+    python3 evaluation/eval_report.py --input  data/generated/eval/db_traces_heldout_after_ep2.jsonl \
+                                      --baseline data/generated/eval/db_traces_heldout_before.jsonl
 """
 
 import argparse

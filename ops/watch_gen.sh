@@ -20,7 +20,7 @@ STALL_TICKS=${STALL_TICKS:-3}
 TARGET=${TARGET:-13948}
 SHORT=${SHORT:-"q36-35b-a3b-w3"}
 SPLIT=${SPLIT:-"sft_train"}
-TRACE="data/generated/db_traces_${SPLIT}_${SHORT}.jsonl"
+TRACE="data/generated/sdg/db_traces_${SPLIT}_${SHORT}.jsonl"
 MAINLOG=${MAINLOG:-"logs/gen_traces.w35.log"}
 WATCHLOG="logs/gen_watch.log"
 mkdir -p logs

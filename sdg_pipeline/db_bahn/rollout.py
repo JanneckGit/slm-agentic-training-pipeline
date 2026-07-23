@@ -619,7 +619,7 @@ def main():
     teacher_label = args.teacher_name or ("oracle" if args.dry_run else
                                           "oracle_broken" if args.dry_run_broken else
                                           resolve_teacher(config, args.api_base, args.model)["model"])
-    out_path = Path(args.output or (Path("data/generated") /
+    out_path = Path(args.output or (Path("data/generated/sdg") /
                                     f"db_traces_{args.split}_{teacher_label.replace('/', '_')}.jsonl"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
