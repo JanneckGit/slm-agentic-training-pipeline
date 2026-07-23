@@ -34,7 +34,7 @@ them.
 
 ```mermaid
 flowchart TD
-    T["ToolACE"] -->|convert_toolace.py| MIX
+    T["ToolACE"] -->|"convert_toolace.py + backfill_toolace_think.py"| MIX
     subgraph SDG["Grounded synthesis"]
         A["gtfs.de timetables CC-BY-4.0<br/>+ seeded synthetic tables"] -->|seed_worldstate.py| B["frozen world-state<br/>db.json, seed 42"]
         B --> C["tau2-bench domain 'db_bahn'<br/>13 German tools + policy.md"]
@@ -170,7 +170,9 @@ rerunning the script continues where it stopped.
 **Mix + train** (`build_sft_mix.py` needs `db_traces_chat.jsonl` from the step above):
 
 ```bash
-PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # bracket-DSL -> toolace_chat.jsonl
+PYTHONPATH=. python3 data_pipeline/convert_toolace.py     # bracket-DSL -> toolace_preselect.jsonl
+bash ops/toolace_backfill.sh                              # teacher generates thinking, gold-verified
+                                                          #   -> toolace_chat.jsonl  (GPU, ~11 h)
 docker compose -f docker/docker-compose.yml run --rm -T training \
   python3 data_pipeline/convert_areal.py                  # per-turn rows -> episodes (airline+retail,
                                                           #   telecom dropped, parallel-ban stripped)
@@ -243,7 +245,8 @@ sdg_pipeline/db_bahn/            grounded synthesis
 data_pipeline/                   raw data -> training jsonl
 ├── prepare_agentic_data.py      fetch ToolACE + AReaL
 ├── validate_areal.py            schema / integrity / referential checks
-├── convert_toolace.py           bracket-DSL -> chat
+├── convert_toolace.py           bracket-DSL -> preselection (parallel-first, gold calls)
+├── backfill_toolace_think.py    teacher generates thinking, verified against the gold call
 ├── convert_areal.py             per-turn rows -> episodes (airline+retail; strips the parallel-call ban)
 ├── format_traj_for_training.py  rollouts -> chat, split-aware gates
 ├── build_sft_mix.py             3-leg mix + stratified val split
