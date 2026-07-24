@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# ops/traj_sft_pipeline.sh — Phase 6 (Plan B): BEFORE-eval -> traj_sft train -> merge -> AFTER-eval.
+# ops/traj_sft_pipeline.sh — Phase 6 (Plan B): traj_sft train -> merge -> AFTER-eval.
+# Der BEFORE-Eval liegt NICHT mehr hier: ops/build_sft_data.sh erzeugt ihn (skip-if-exists) und
+# nutzt ihn doppelt — als Vergleichsbasis UND als Quelle der db_bahn-Template-Caps im Mix.
 # Sequential (GB10 has no MIG). Eval = rollout.py on the heldout_eval tasks through the same verifier
-# (before = base Qwen3-4B, after = merged student). Idempotent-ish; logs to logs/traj_sft.log.
+# (before = Basis aus build_sft_data.sh, after = merged student). Logs to logs/traj_sft.log.
+# BASE wird HART gegen das Mix-Manifest gegatet (sft_mix_manifest.json traegt den vollen
+# Modellstring aus build_sft_data.sh) — Training auf dem Mix eines anderen Modells bricht ab.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -14,27 +18,40 @@ MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged"
 MERGED_CTR="/app/data/final/checkpoints/db_bahn_traj_merged"
 ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
 
-# Serve + Eval + Report liegen in ops/eval_heldout.sh — EINE Quelle fuer BEFORE und AFTER, damit die
-# Zahlen per Konstruktion vergleichbar sind. Dieses Skript ruft es nur auf; Teardown und `rm -f` der
-# Ausgabedatei gehoeren dort hin (sonst faende das Training keinen freien Speicher, bzw. ein zweiter
-# Lauf wuerde in die JSONL des vorigen Checkpoints hinein-resumen).
+# Serve + Eval + Report liegen in ops/eval_heldout.sh — EINE Quelle fuer BEFORE (via
+# build_sft_data.sh) und AFTER, damit die Zahlen per Konstruktion vergleichbar sind. Dieses Skript
+# ruft es nur fuer AFTER auf; Teardown und `rm -f` der Ausgabedatei gehoeren dort hin (sonst faende
+# das Training keinen freien Speicher, bzw. ein zweiter Lauf wuerde hinein-resumen).
 
 echo "==== PHASE 6 START $(date) ===="
 
-echo "== [1/4] BEFORE-eval: base $BASE on heldout_eval =="
-bash ops/eval_heldout.sh "$BASE" "before_base_4b" "data/generated/eval/db_traces_heldout_before.jsonl" \
-  || echo "== BEFORE-eval FAILED — weiter mit dem Training, aber ohne Vergleichsbasis"
-
-DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 3-leg SFT mix (db_bahn + AReaL + ToolACE)
+DATA=${DATA:-data/final/sft_mix_chat.jsonl}     # 3-leg SFT mix (db_bahn gekappt + AReaL + ToolACE)
 VAL=${VAL:-data/final/sft_mix_val.jsonl}         # held-out val split (eval_loss, never in gradient)
-echo "== [2/4] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, 2 epochs, LoRA @12288) =="
+BEFORE=data/generated/eval/db_traces_heldout_before.jsonl
+EXPECTED=$(python3 -c 'import json;print(len(json.load(open("data/raw/db_sandbox/split_tasks.json"))["heldout_eval"]))')
+if ! { [ -f "$BEFORE" ] && [ "$(wc -l < "$BEFORE")" -ge "$EXPECTED" ] && [ -s "$DATA" ] && [ -s "$VAL" ]; }; then
+  echo "ABORT: Vorbedingung fehlt ($BEFORE >=$EXPECTED Zeilen + $DATA + $VAL) — erst: bash ops/build_sft_data.sh"
+  exit 1
+fi
+# Modell-Gate: der Mix traegt seine Identitaet im Manifest — BASE muss exakt dazu passen
+MANIFEST=data/final/sft_mix_manifest.json
+MIX_MODEL=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("model") or "")' "$MANIFEST" 2>/dev/null || true)
+if [ "$MIX_MODEL" != "$BASE" ]; then
+  echo "ABORT: Mix-Manifest-Modell '${MIX_MODEL:-<fehlt>}' != BASE '$BASE' — Mix fuer dieses Modell bauen: bash ops/build_sft_data.sh"
+  exit 1
+fi
+MIX_LABEL=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("label") or "?")' "$MANIFEST")
+echo "   BEFORE-Basis: $(readlink -f "$BEFORE")"
+echo "   Mix: $(readlink -f "$DATA") (Modell $MIX_MODEL, Label $MIX_LABEL)"
+
+echo "== [1/3] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, 2 epochs, LoRA @12288) =="
 # --save-epoch-adapters -> ${ADAPTER}_ep1 + _ep2 for checkpoint selection; --neftune 5 = noisy-embedding reg.
 $COMPOSE run --rm -T training python3 training_pipeline/train_traj.py \
   --config config/pipeline_config.yaml --data "$DATA" --val-file "$VAL" \
   --model "$BASE" --out "$ADAPTER" --epochs 2 --max-seq-len 12288 \
   --attn flash_attention_2 --liger --neftune 5 --save-epoch-adapters --eval-steps 300 2>&1 | grep -vE "Copyright|NVIDIA|reserved|GOVERNING|found at|PyTorch|Idiap|Google|Caffe|Facebook|Deepmind|NEC|NYU|Yangqing|Various|====" | tail -20
 
-echo "== [3/4] MERGE both epoch adapters -> ${MERGED_HOST}/ep{1,2} (sharded) =="
+echo "== [2/3] MERGE both epoch adapters -> ${MERGED_HOST}/ep{1,2} (sharded) =="
 # one folder per run: <adapter>/ep{1,2} -> <merged>/ep{1,2}; the winner gets a 'selected' symlink below.
 # merge_adapter.py hard-aborts on a no-op merge or a save mismatch -> a green merge here is verified.
 for EP in 1 2; do
@@ -44,7 +61,7 @@ for EP in 1 2; do
     --config config/pipeline_config.yaml 2>&1 | tail -4
 done
 
-echo "== [4/4] AFTER-eval: eval BOTH epochs on heldout_eval, keep the higher verified_yield =="
+echo "== [3/3] AFTER-eval: eval BOTH epochs on heldout_eval, keep the higher verified_yield =="
 for EP in 1 2; do
   bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_ep${EP}" \
     "data/generated/eval/db_traces_heldout_after_ep${EP}.jsonl" \
