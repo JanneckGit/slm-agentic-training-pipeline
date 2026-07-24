@@ -87,6 +87,9 @@ def main():
                     help="attention impl; falls back to sdpa if it fails to load (e.g. FA2 unbuilt on sm_121)")
     ap.add_argument("--liger", action="store_true",
                     help="fused linear cross-entropy (Liger) -> no full-seq logit tensor; unlocks micro_batch>4 @12k")
+    ap.add_argument("--grad-checkpointing", default="on", choices=["on", "off"],
+                    help="recompute activations in the backward pass to save memory (default on). "
+                         "off -> ~20-30%% faster if it fits (128GB unified) — throughput knob, no quality effect.")
     ap.add_argument("--micro-batch", type=int, default=None, help="smoke: override config micro_batch_size")
     ap.add_argument("--grad-accum", type=int, default=None, help="smoke: override config gradient_accumulation_steps")
     ap.add_argument("--neftune", type=float, default=None,
@@ -211,13 +214,19 @@ def main():
         gradient_accumulation_steps=args.grad_accum or t_cfg.get("gradient_accumulation_steps", 4),
         learning_rate=float(t_cfg.get("learning_rate", 2.0e-4)),
         lr_scheduler_type=t_cfg.get("lr_scheduler", "cosine"), warmup_ratio=0.03,
-        bf16=True, gradient_checkpointing=True, logging_steps=5, save_strategy="no",
+        bf16=True, gradient_checkpointing=(args.grad_checkpointing == "on"), logging_steps=5,
+        save_strategy="no",  # logging_steps is a print only — no runtime cost; eval/save are off
         # transformers 5.x: the group_by_length bool became train_sampling_strategy. Homogeneous-length
         # batches -> micro_batch>1 doesn't pad to 12k on mixed batches (LengthGroupedSampler + "length" col).
         train_sampling_strategy="group_by_length", length_column_name="length",
         eval_strategy=("steps" if eval_ds is not None else "no"), eval_steps=args.eval_steps,
         per_device_eval_batch_size=1, use_liger_kernel=args.liger, neftune_noise_alpha=args.neftune,
         report_to=report_to, run_name=run_name, seed=seed)
+    # echo the EFFECTIVE knobs (read back from ta, not args) — proves what actually reached the trainer
+    logger.info(f"[cfg] gradient_checkpointing={ta.gradient_checkpointing} "
+                f"micro_batch={ta.per_device_train_batch_size} grad_accum={ta.gradient_accumulation_steps} "
+                f"(eff {ta.per_device_train_batch_size * ta.gradient_accumulation_steps}) attn={args.attn} "
+                f"liger={ta.use_liger_kernel} neftune={ta.neftune_noise_alpha} max_steps={ta.max_steps}")
     callbacks = []
     if args.save_epoch_adapters:
         callbacks.append(EpochAdapterSaver(model, tok, args.out))
