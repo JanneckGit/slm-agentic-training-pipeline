@@ -61,7 +61,7 @@ data:
 
 # -----------------------------------------------------------------------------
 # TRAINING (traj_sft — Stage 1). train_traj.py reads training.lora.* plus the four
-# hyperparameters below as CLI fallbacks. The ACTUAL run recipe (epochs 2, micro 8,
+# hyperparameters below as CLI fallbacks. The ACTUAL run recipe (epochs 3, micro 8,
 # --max-seq-len 12288, FA2 + Liger + NEFTune) is launched by ops/traj_sft_pipeline.sh.
 # -----------------------------------------------------------------------------
 training:

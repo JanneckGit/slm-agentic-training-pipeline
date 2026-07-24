@@ -14,7 +14,7 @@ opt out with --train-context-turns. The per-leg line in the startup log shows wh
 Usage (training container):
     python3 training_pipeline/train_traj.py --config config/pipeline_config.yaml \
         --data data/final/sft_mix_chat.jsonl --model Qwen/Qwen3-4B \
-        --out data/final/checkpoints/db_bahn_traj_lora --epochs 2 --max-seq-len 12288
+        --out data/final/checkpoints/db_bahn_traj_lora --epochs 3 --max-seq-len 12288
 """
 
 import argparse
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 class EpochAdapterSaver(TrainerCallback):
     """Save the LoRA adapter (+ tokenizer/chat_template) at each epoch end -> <out>/ep{N}, so the pipeline can
-    eval epoch-1 vs epoch-2 (rollout verified_yield) and keep the better one (checkpoint selection).
+    eval every epoch (rollout verified_yield) and keep the best one (checkpoint selection).
 
     Layout: ONE folder per run instead of sibling _ep1/_ep2/_ckpt dirs —
         <out>/ep1/ · <out>/ep2/ · <out>/selected -> ep{winner}   (symlink, set after the eval picks)
@@ -79,7 +79,7 @@ def main():
     ap.add_argument("--data", default="data/final/sft_mix_chat.jsonl")  # the 3-leg Stage-1 mix
     ap.add_argument("--model", default=STUDENT_MODEL_DEFAULT)  # dense, text-only, thinking (NOT the MM hybrid 3.5)
     ap.add_argument("--out", default="data/final/checkpoints/db_bahn_traj_lora")
-    ap.add_argument("--epochs", type=float, default=2.0)
+    ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--max-seq-len", type=int, default=12288)  # 3-leg mix: db_bahn<=5.9k, AReaL trimmed@12288
     ap.add_argument("--val-file", default=None, help="held-out val JSONL -> eval_loss (never in gradient)")
     ap.add_argument("--eval-steps", type=int, default=300)  # overfit-diag only (no early-stop) -> few eval points suffice
@@ -98,7 +98,7 @@ def main():
                     help="opt-out: also take gradient on assistant turns BEFORE the last user message. "
                          "Those render think-less (Qwen3 template) — only for A/B measurements.")
     ap.add_argument("--save-epoch-adapters", action="store_true",
-                    help="save adapter+tok to <out>_ep{N} at each epoch end (for epoch-1-vs-2 checkpoint selection)")
+                    help="save adapter+tok to <out>_ep{N} at each epoch end (for per-epoch checkpoint selection)")
     ap.add_argument("--max-samples", type=int, default=None, help="smoke: cap #examples")
     ap.add_argument("--max-steps", type=int, default=-1, help="smoke: cap steps")
     ap.add_argument("--run-name", default=None, help="MLflow run name (default: traj_sft_<model>_<epochs>ep)")

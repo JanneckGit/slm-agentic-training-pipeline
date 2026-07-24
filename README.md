@@ -199,8 +199,8 @@ bash ops/build_sft_data.sh                                # base-eval (skip-if-e
                                                           #   (bare build_sft_mix.py refuses to write
                                                           #   through the canonical symlinks)
 
-bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x2 -> AFTER-eval x2
-                                #   -> checkpoint-selection (ep1 vs ep2)
+bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x3 -> AFTER-eval x3
+                                #   -> checkpoint-selection (best of ep1-3)
 bash ops/grpo_smoke.sh          # Stage 2: verl tool-agent loop vs the real db_bahn tools
 ```
 
@@ -244,7 +244,7 @@ What `ops/traj_sft_pipeline.sh` launches:
 | LoRA | **r=32 / α=64**, all 7 linear modules | capacity for a broad task (3 domains + tools + German) |
 | Seq len | **12,288** | AReaL episodes run long; truncating them costs quality |
 | Batch | micro **8** × accum **2** = **eff. 16** | micro 16 was tested → *slower* (padding/saturation) |
-| Epochs | **2**, cosine, lr 2e-4, warmup 3 % | + checkpoint-selection ep1-vs-ep2 |
+| Epochs | **3**, cosine, lr 2e-4, warmup 3 % | capped mix has fewer steps/epoch; checkpoint-selection picks the best of ep1–3 |
 | Speed | **FA2** + **Liger** (fused CE) + `group_by_length` | Liger is **required** for micro > 4 @ 12k (removes the 55 GB fp32 logit tensor) |
 | Regularization | **NEFTune α=5** | noisy input embeddings, train-time only ([arXiv:2310.05914](https://arxiv.org/abs/2310.05914)) |
 | Eval | held-out val + `eval_steps 300` | overfit diagnostic only — the real judge is the rollout `verified_yield` |

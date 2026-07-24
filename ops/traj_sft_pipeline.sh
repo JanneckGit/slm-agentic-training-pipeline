@@ -14,6 +14,7 @@ export TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}   # exportiert: ops/eval_he
 # host eval writes to the SAME physical store as the training container (../mlruns == /app/mlruns)
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"
 BASE="Qwen/Qwen3-4B"   # dense, text-only, thinking student (verl-GRPO-proven; NOT the MM hybrid 3.5)
+EPOCHS=${EPOCHS:-3}    # gekappter Mix (~12.1k) -> weniger Steps je Epoche; ckpt-Selection waehlt ueber ep1..N
 MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged"
 MERGED_CTR="/app/data/final/checkpoints/db_bahn_traj_merged"
 ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
@@ -44,25 +45,25 @@ MIX_LABEL=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("
 echo "   BEFORE-Basis: $(readlink -f "$BEFORE")"
 echo "   Mix: $(readlink -f "$DATA") (Modell $MIX_MODEL, Label $MIX_LABEL)"
 
-echo "== [1/3] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, 2 epochs, LoRA @12288) =="
-# --save-epoch-adapters -> ${ADAPTER}_ep1 + _ep2 for checkpoint selection; --neftune 5 = noisy-embedding reg.
+echo "== [1/3] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, $EPOCHS epochs, LoRA @12288) =="
+# --save-epoch-adapters -> ${ADAPTER}/ep{1..N} for checkpoint selection; --neftune 5 = noisy-embedding reg.
 $COMPOSE run --rm -T training python3 training_pipeline/train_traj.py \
   --config config/pipeline_config.yaml --data "$DATA" --val-file "$VAL" \
-  --model "$BASE" --out "$ADAPTER" --epochs 2 --max-seq-len 12288 \
+  --model "$BASE" --out "$ADAPTER" --epochs "$EPOCHS" --max-seq-len 12288 \
   --attn flash_attention_2 --liger --neftune 5 --save-epoch-adapters --eval-steps 300 2>&1 | grep -vE "Copyright|NVIDIA|reserved|GOVERNING|found at|PyTorch|Idiap|Google|Caffe|Facebook|Deepmind|NEC|NYU|Yangqing|Various|====" | tail -20
 
-echo "== [2/3] MERGE both epoch adapters -> ${MERGED_HOST}/ep{1,2} (sharded) =="
-# one folder per run: <adapter>/ep{1,2} -> <merged>/ep{1,2}; the winner gets a 'selected' symlink below.
+echo "== [2/3] MERGE all $EPOCHS epoch adapters -> ${MERGED_HOST}/ep{1..$EPOCHS} (sharded) =="
+# one folder per run: <adapter>/ep{N} -> <merged>/ep{N}; the winner gets a 'selected' symlink below.
 # merge_adapter.py hard-aborts on a no-op merge or a save mismatch -> a green merge here is verified.
-for EP in 1 2; do
+for EP in $(seq 1 "$EPOCHS"); do
   echo "-- merge epoch $EP --"
   $COMPOSE run --rm -T training python3 serving/merge_adapter.py \
     --adapter-path "${ADAPTER}/ep${EP}" --output-path "${MERGED_HOST}/ep${EP}" \
     --config config/pipeline_config.yaml 2>&1 | tail -4
 done
 
-echo "== [3/3] AFTER-eval: eval BOTH epochs on heldout_eval, keep the higher verified_yield =="
-for EP in 1 2; do
+echo "== [3/3] AFTER-eval: eval ALL $EPOCHS epochs on heldout_eval, keep the highest verified_yield =="
+for EP in $(seq 1 "$EPOCHS"); do
   bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_ep${EP}" \
     "data/generated/eval/db_traces_heldout_after_ep${EP}.jsonl" \
     || echo "== AFTER-eval ep${EP} FAILED"
@@ -70,9 +71,9 @@ done
 
 # checkpoint selection: same accept gate as the eval report (score==1.0 AND not truncated AND not
 # degenerate) — a bare score==1.0 would prefer the checkpoint that produces MORE think-loops, and with
-# single-shot evals those gates finally fire. Tie -> ep2.
-WINNER=$(python3 - "data/generated/eval/db_traces_heldout_after_ep1.jsonl" "data/generated/eval/db_traces_heldout_after_ep2.jsonl" <<'PY'
-import json, sys
+# single-shot evals those gates finally fire. Tie -> hoechste Epoche.
+WINNER=$(EPOCHS="$EPOCHS" python3 - <<'PY'
+import json, os, sys
 def vyield(p):
     n = y = 0
     try:
@@ -87,12 +88,14 @@ def vyield(p):
     except FileNotFoundError:
         return -1.0, 0, 0
     return (y / n if n else 0.0), y, n
-y1, c1, n1 = vyield(sys.argv[1]); y2, c2, n2 = vyield(sys.argv[2])
-sys.stderr.write(f"ep1 verified_yield={y1:.3f} ({c1}/{n1})  |  ep2 verified_yield={y2:.3f} ({c2}/{n2})\n")
-print(2 if y2 >= y1 else 1)
+eps = range(1, int(os.environ["EPOCHS"]) + 1)
+res = {ep: vyield(f"data/generated/eval/db_traces_heldout_after_ep{ep}.jsonl") for ep in eps}
+sys.stderr.write("  |  ".join(f"ep{ep} verified_yield={res[ep][0]:.3f} ({res[ep][1]}/{res[ep][2]})"
+                              for ep in eps) + "\n")
+print(max(eps, key=lambda ep: (res[ep][0], ep)))
 PY
 )
-WINNER=${WINNER:-2}
+WINNER=${WINNER:-$EPOCHS}
 echo "== checkpoint selection: EPOCH $WINNER wins -> 'selected' symlinks =="
 # 'selected' means "the candidate the eval picked" — in BOTH folders: the servable model and the adapter.
 # in-container (root) -> handles root-owned dirs; relative targets resolve inside the mounted tree.
