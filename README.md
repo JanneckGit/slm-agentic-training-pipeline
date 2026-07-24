@@ -29,34 +29,37 @@ Two training stages, both grounded in the same domain:
 
 Generate tasks whose correct answer is **known by construction**, let a strong teacher solve them
 against the *real* tools with thinking enabled, and keep only trajectories a deterministic verifier
-confirms. Those verified German trajectories are mixed with two public legs before the student sees
-them.
+confirms. Before the student sees them, the verified German trajectories are **capped per template
+by what the base model already solves** (a heldout base-eval drives band caps, automated in
+`ops/build_sft_data.sh`) and mixed with two public legs.
 
 ```mermaid
 flowchart TD
-    T["ToolACE"] -->|"convert_toolace.py + backfill_toolace_think.py"| MIX
-    subgraph SDG["Grounded synthesis"]
-        A["gtfs.de timetables CC-BY-4.0<br/>+ seeded synthetic tables"] -->|seed_worldstate.py| B["frozen world-state<br/>db.json, seed 42"]
-        B --> C["tau2-bench domain 'db_bahn'<br/>13 German tools + policy.md"]
-        C -->|gen_tasks.py| D["15,388 tasks · 48 templates<br/>by-construction answer keys"]
-        D -->|rollout.py| E["teacher solves vs REAL tools<br/>thinking-native"]
-        E -->|trajectory_reward.py| F{"deterministic verifier"}
-        F -->|"accepted() traces"| G["format_traj_for_training.py<br/>db_traces_chat.jsonl"]
-    end
-    G --> MIX["build_sft_mix.py"]
-    R["AReaL τ²"] -->|convert_areal.py| MIX
-    MIX --> M["sft_mix_chat.jsonl + val"]
-    M -->|"train_traj.py + collator_multiturn.py"| H["Stage 1 — LoRA Qwen3-4B<br/>assistant-only loss mask"]
-    H -->|merge_adapter.py| S["merged student → vLLM"]
-    S -->|ops/eval_heldout.sh| EV["in-domain eval, verifier-scored"]
-    S -->|"bfcl generate / evaluate"| OOD["OOD benchmark — BFCL v4"]
-    H -->|ops/grpo_smoke.sh| RL["Stage 2 — GRPO/verl<br/>same tools, reward = the verifier<br/>pool: rl_train (960)"]
-    RL -->|"LoRA ckpt → merge_adapter.py"| S
+    TASKS["db_bahn task pool<br/>48 templates · frozen world · answer keys by construction"]
+    TASKS -->|"ops/gen_traces.sh<br/>teacher vs real tools, verifier-gated"| TRACES["accepted teacher traces<br/>(db leg)"]
+    TOOLACE["ToolACE leg"]
+    AREAL["AReaL τ² leg"]
+    TASKS ~~~ TOOLACE
+    TASKS ~~~ AREAL
+    TRACES -->|"ops/build_sft_data.sh<br/>base-model eval on heldout, skip-if-exists"| EVAL["BEFORE-eval<br/>→ per-template caps"]
+    TOOLACE ~~~ EVAL
+    AREAL ~~~ EVAL
+    EVAL -->|caps| MIX["SFT mix + manifest<br/>(db leg capped)"]
+    TOOLACE --> MIX
+    AREAL --> MIX
+    MIX -->|"ops/traj_sft_pipeline.sh<br/>model-gate · train · merge"| SFT["Stage 1 — LoRA SFT"]
+    SFT -->|ops/grpo_smoke.sh| RL["Stage 2 — GRPO/verl"]
+    SFT -->|merge_adapter.py| STUDENT["merged student"]
+    RL -->|merge_adapter.py| STUDENT
+    STUDENT --> AFTER["AFTER-eval"]
+    STUDENT --> BFCL["OOD — BFCL v4"]
+    EVAL -.->|"baseline Δ"| AFTER
 ```
 
 ## The db_bahn domain
 
-- **Frozen world-state.** Real [gtfs.de](https://gtfs.de) *de_fv* timetables (CC-BY-4.0) plus
+- **Frozen world-state.** Real [gtfs.de](https://gtfs.de) *de_fv* timetables (© gtfs.de /
+  DELFI e.V., CC-BY-4.0; snapshot committed under `data/raw/db_sandbox/gtfs_de_fv/`) plus
   `sha256`-seeded synthetic tables (vehicles, staff, shifts, maintenance) → one byte-reproducible
   `db.json` (seed 42).
 - **A τ²-bench domain, `db_bahn`.** 13 German tools with a German `policy.md`, *runtime-registered*
@@ -95,22 +98,36 @@ template** — so every class is individually measurable and equally represented
 |-------|-------|------|---------|
 | `sft_train` | 13,948 | rest | teacher rollouts → SFT traces |
 | `rl_train` | 960 | 20 / template | Stage-2 GRPO pool |
-| `heldout_eval` | 480 | 10 / template | before/after held-out eval |
+| `heldout_eval` | 480 | 10 / template | before/after held-out eval + source of the db-leg caps |
 | `bakeoff_dev` | 48 | 1 / template | smoke/dev subset (⊆ `sft_train`) |
 
 ## Setup
 
-Prereqs: Docker + Compose (services `sdg`, `training`, `vllm`, `grpo`, `mlflow`) and a **Python
-≥ 3.12 venv for τ²-bench** (its `requires-python >=3.12`; the pinned training stack stays isolated).
+Prereqs: **Docker + Compose with the NVIDIA Container Toolkit** (the compose services reserve GPUs
+via `driver: nvidia`; services `sdg`, `training`, `vllm`, `grpo`, `mlflow`), a host `python3` ≥ 3.12,
+and a **Python ≥ 3.12 venv for τ²-bench** (its `requires-python >=3.12`; the pinned training stack
+stays isolated in the containers). Host-side data scripts are stdlib-only — no pip install on the
+host.
 
 ```bash
 python3.12 -m venv .venv-tau2
-git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench   # pin commit 1901a30
+git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench
+git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may have drifted
 ./.venv-tau2/bin/pip install /tmp/tau2-bench
 ```
 
-All `ops/` scripts use `.venv-tau2/` by default (override with `TAU2PY=/path/to/python`).
-`config/pipeline_config.yaml` is the single config — no secrets needed (the teacher is local vLLM).
+Rollout/eval scripts default to `.venv-tau2/` (override with `TAU2PY=/path/to/python`); the data
+chain (`ops/build_sft_data.sh`) runs on host `python3`. A third venv exists only for the optional
+BFCL benchmark (see the OOD section). `config/pipeline_config.yaml` is the single config — no
+secrets needed: the teacher is local vLLM and all models are public. The first serve pulls weights
+into the `hf_cache` volume (bind path set at the bottom of `docker/docker-compose.yml`, default
+`/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB.
+
+**Data prerequisites.** The GTFS snapshot ships with the repo (`data/raw/db_sandbox/gtfs_de_fv/` —
+frozen gtfs.de *de_fv* feed of 2026-06-27, 2.8 MB, © gtfs.de / DELFI e.V., CC-BY-4.0). It anchors
+the byte-reproducible golden hashes (`db.json`, task pool); a fresh feed would be a different
+world with different hashes. The two public legs are fetched by `prepare_agentic_data.py` (step 0
+below); everything else under `data/` is generated by the pipeline.
 
 **Import convention:** scripts import the shared `data_pipeline/common.py`, so host invocations need
 the repo root on the path — prefix with `PYTHONPATH=.` (as the examples do), or install once via
@@ -176,9 +193,13 @@ bash ops/toolace_backfill.sh                              # teacher generates th
 docker compose -f docker/docker-compose.yml run --rm -T training \
   python3 data_pipeline/convert_areal.py                  # per-turn rows -> episodes (airline+retail,
                                                           #   telecom dropped, parallel-ban stripped)
-PYTHONPATH=. python3 data_pipeline/build_sft_mix.py       # -> sft_mix_chat.jsonl + sft_mix_val.jsonl
+bash ops/build_sft_data.sh                                # base-eval (skip-if-exists) -> per-template
+                                                          #   caps -> sft_mix_chat/val_<label>.jsonl
+                                                          #   + canonical symlinks + manifest
+                                                          #   (bare build_sft_mix.py refuses to write
+                                                          #   through the canonical symlinks)
 
-bash ops/traj_sft_pipeline.sh   # BEFORE-eval -> traj_sft -> merge x2 -> AFTER-eval x2
+bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x2 -> AFTER-eval x2
                                 #   -> checkpoint-selection (ep1 vs ep2)
 bash ops/grpo_smoke.sh          # Stage 2: verl tool-agent loop vs the real db_bahn tools
 ```
@@ -191,8 +212,8 @@ bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think
 python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]   # re-report / delta
 ```
 
-`traj_sft_pipeline.sh` calls the same script for the BEFORE and both AFTER evals, so those numbers are
-comparable by construction.
+`build_sft_data.sh` (BEFORE, reused as caps source) and `traj_sft_pipeline.sh` (both AFTER evals)
+call this same script, so those numbers are comparable by construction.
 
 **OOD benchmark (BFCL v4)** — external harness in its own venv, identical seed-42 IDs per model. It
 sends the `Qwen3-4B-Instruct-2507` handler name in the payload, so the served-name **alias is
@@ -249,7 +270,8 @@ data_pipeline/                   raw data -> training jsonl
 ├── backfill_toolace_think.py    teacher generates thinking, verified against the gold call
 ├── convert_areal.py             per-turn rows -> episodes (airline+retail; strips the parallel-call ban)
 ├── format_traj_for_training.py  rollouts -> chat, split-aware gates
-├── build_sft_mix.py             3-leg mix + stratified val split
+├── derive_db_caps.py            heldout base-eval -> per-template caps (model-aware downweighting)
+├── build_sft_mix.py             3-leg mix (db capped via --db-caps) + stratified val split + manifest
 └── common.py                    shared helpers
 
 training_pipeline/               Stage 1 SFT · Stage 2 verl seams
@@ -267,8 +289,8 @@ evaluation/
 
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
-ops/                             teacher_bakeoff · gen_traces · watch_gen · eval_heldout ·
-                                 traj_sft_pipeline · grpo_smoke
+ops/                             teacher_bakeoff · gen_traces · watch_gen · toolace_backfill ·
+                                 eval_heldout · build_sft_data · traj_sft_pipeline · grpo_smoke
 docker/                          GB10 sm_121 stack
 config/pipeline_config.yaml      the single config
 data/, archive/                  [gitignored]
