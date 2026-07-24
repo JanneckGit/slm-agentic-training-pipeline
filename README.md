@@ -110,6 +110,11 @@ stays isolated in the containers). Host-side data scripts are stdlib-only — no
 host.
 
 ```bash
+# clone this repo (full clone — ships the frozen GTFS snapshot + golden hashes)
+git clone https://github.com/JanneckGit/slm-agentic-training-pipeline.git
+cd slm-agentic-training-pipeline
+
+# τ²-bench dependency, isolated in its own venv (the git clone below is tau2-bench, not this repo)
 python3.12 -m venv .venv-tau2
 git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench
 git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may have drifted
