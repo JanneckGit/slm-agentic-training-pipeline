@@ -8,7 +8,15 @@ config/pipeline_config.local.yaml
 .env*
 
 # Data (too large for git – use DVC or just document paths)
-data/raw/
+# Exception chain: the frozen GTFS snapshot (2.8 MB, CC-BY-4.0) IS committed — it anchors the
+# byte-reproducible golden hashes and the original feed is no longer publicly available.
+# gitignore quirk: exceptions under an ignored DIRECTORY never fire, hence un-ignore each level
+# and re-ignore its contents with '*'.
+!data/raw/
+data/raw/*
+!data/raw/db_sandbox/
+data/raw/db_sandbox/*
+!data/raw/db_sandbox/gtfs_de_fv/
 data/generated/
 data/final/
 data/evaluation/
