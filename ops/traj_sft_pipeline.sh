@@ -15,9 +15,8 @@ export TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}   # exportiert: ops/eval_he
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"
 BASE="Qwen/Qwen3-4B"   # dense, text-only, thinking student (verl-GRPO-proven; NOT the MM hybrid 3.5)
 EPOCHS=${EPOCHS:-3}    # gekappter Mix (~12.1k) -> weniger Steps je Epoche; ckpt-Selection waehlt ueber ep1..N
-MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged"
-MERGED_CTR="/app/data/final/checkpoints/db_bahn_traj_merged"
-ADAPTER="data/final/checkpoints/db_bahn_traj_lora"
+# Checkpoint-/After-Pfade tragen das Modell-Label (aus dem Mix-Manifest) -> unten definiert,
+# sobald MIX_LABEL gelesen ist. Ein zweites Modell/Mix ueberschreibt so nicht mehr denselben Ordner.
 
 # Serve + Eval + Report liegen in ops/eval_heldout.sh — EINE Quelle fuer BEFORE (via
 # build_sft_data.sh) und AFTER, damit die Zahlen per Konstruktion vergleichbar sind. Dieses Skript
@@ -45,6 +44,14 @@ MIX_LABEL=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("
 echo "   BEFORE-Basis: $(readlink -f "$BEFORE")"
 echo "   Mix: $(readlink -f "$DATA") (Modell $MIX_MODEL, Label $MIX_LABEL)"
 
+# Checkpoint-/After-Pfade tragen das Modell-Label (Lineage; base_-Praefix entfaellt): base_qwen3-4b -> qwen3-4b
+CKPT_LABEL="${MIX_LABEL#base_}"
+MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged_${CKPT_LABEL}"
+MERGED_CTR="/app/${MERGED_HOST}"
+ADAPTER="data/final/checkpoints/db_bahn_traj_lora_${CKPT_LABEL}"
+AFTER="data/generated/eval/db_traces_heldout_after_${CKPT_LABEL}"   # + _ep{N}.jsonl bzw. .jsonl
+echo "   Checkpoints: ${MERGED_HOST} + ${ADAPTER}  |  After: ${AFTER}_ep{N}.jsonl"
+
 echo "== [1/3] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, $EPOCHS epochs, LoRA @12288) =="
 # --save-epoch-adapters -> ${ADAPTER}/ep{1..N} for checkpoint selection; --neftune 5 = noisy-embedding reg.
 $COMPOSE run --rm -T training python3 training_pipeline/train_traj.py \
@@ -64,15 +71,15 @@ done
 
 echo "== [3/3] AFTER-eval: eval ALL $EPOCHS epochs on heldout_eval, keep the highest verified_yield =="
 for EP in $(seq 1 "$EPOCHS"); do
-  bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_ep${EP}" \
-    "data/generated/eval/db_traces_heldout_after_ep${EP}.jsonl" \
+  bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_${CKPT_LABEL}_ep${EP}" \
+    "${AFTER}_ep${EP}.jsonl" \
     || echo "== AFTER-eval ep${EP} FAILED"
 done
 
 # checkpoint selection: same accept gate as the eval report (score==1.0 AND not truncated AND not
 # degenerate) — a bare score==1.0 would prefer the checkpoint that produces MORE think-loops, and with
 # single-shot evals those gates finally fire. Tie -> hoechste Epoche.
-WINNER=$(EPOCHS="$EPOCHS" python3 - <<'PY'
+WINNER=$(EPOCHS="$EPOCHS" AFTER="$AFTER" python3 - <<'PY'
 import json, os, sys
 def vyield(p):
     n = y = 0
@@ -89,7 +96,8 @@ def vyield(p):
         return -1.0, 0, 0
     return (y / n if n else 0.0), y, n
 eps = range(1, int(os.environ["EPOCHS"]) + 1)
-res = {ep: vyield(f"data/generated/eval/db_traces_heldout_after_ep{ep}.jsonl") for ep in eps}
+base = os.environ["AFTER"]
+res = {ep: vyield(f"{base}_ep{ep}.jsonl") for ep in eps}
 sys.stderr.write("  |  ".join(f"ep{ep} verified_yield={res[ep][0]:.3f} ({res[ep][1]}/{res[ep][2]})"
                               for ep in eps) + "\n")
 print(max(eps, key=lambda ep: (res[ep][0], ep)))
@@ -102,7 +110,7 @@ echo "== checkpoint selection: EPOCH $WINNER wins -> 'selected' symlinks =="
 $COMPOSE run --rm -T training bash -c "
   ln -sfn 'ep${WINNER}' '${MERGED_CTR}/selected' &&
   ln -sfn 'ep${WINNER}' '/app/${ADAPTER}/selected' && echo 'selected -> ep${WINNER} (merged + adapter)'" 2>&1 | tail -1
-cp -f "data/generated/eval/db_traces_heldout_after_ep${WINNER}.jsonl" data/generated/eval/db_traces_heldout_after.jsonl
+cp -f "${AFTER}_ep${WINNER}.jsonl" "${AFTER}.jsonl"
 echo "   servable model: ${MERGED_HOST}/selected   |   adapter: ${ADAPTER}/selected"
 
 echo "==== PHASE 6 DONE $(date) ===="
