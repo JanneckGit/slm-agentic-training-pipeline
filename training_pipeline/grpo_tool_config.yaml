@@ -23,6 +23,9 @@ tools:
     config: {type: native, tool_name: mitarbeiter_suchen}
   - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
     config: {type: native, tool_name: wartung_liste}
+  # --- Derived read (joins two trips + their live delays) ---
+  - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
+    config: {type: native, tool_name: anschluss_pruefen}
   # --- Write (rule-gated: rejections force a replan) ---
   - class_name: "training_pipeline.grpo_db_bahn_tools.DbBahnTool"
     config: {type: native, tool_name: wartung_einplanen}
