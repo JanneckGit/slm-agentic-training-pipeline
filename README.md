@@ -220,24 +220,35 @@ python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]
 `build_sft_data.sh` (BEFORE, reused as caps source) and `traj_sft_pipeline.sh` (both AFTER evals)
 call this same script, so those numbers are comparable by construction.
 
-**OOD benchmark (BFCL v4)** — external harness in its own venv, identical seed-42 IDs per model. It
-sends the `Qwen3-4B-Instruct-2507` handler name in the payload, so the served-name **alias is
-mandatory**:
+**OOD benchmark (BFCL v4)** — external harness in its own venv, driven by one ops script per model.
+Setup is **two steps** (the `numpy` upgrade is not optional — without it `faiss` fails to import on
+aarch64/py3.12 and the whole `memory` group drops out):
 
 ```bash
 python3.12 -m venv .venv-bfcl && .venv-bfcl/bin/pip install -r evaluation/benchmarks/bfcl/requirements.txt
-.venv-bfcl/bin/python evaluation/benchmarks/bfcl/make_sample_ids.py
-
-VLLM_MODEL="Qwen/Qwen3-4B" VLLM_MAX_MODEL_LEN=32768 VLLM_GPU_UTIL=0.85 \
-  VLLM_EXTRA_ARGS="--max-num-seqs 16 --served-model-name Qwen/Qwen3-4B-Instruct-2507" \
-  docker compose -f docker/docker-compose.yml --profile vllm up -d vllm
-
-export BFCL_PROJECT_ROOT=$PWD/data/generated/eval/bfcl_quickrun/base LOCAL_SERVER_PORT=8000
-mkdir -p $BFCL_PROJECT_ROOT && cp evaluation/benchmarks/bfcl/mt.json $BFCL_PROJECT_ROOT/test_case_ids_to_generate.json
-.venv-bfcl/bin/bfcl generate --model Qwen/Qwen3-4B-Instruct-2507-FC --run-ids --skip-server-setup \
-  --temperature 0.6 --num-threads 16
-.venv-bfcl/bin/bfcl evaluate --model Qwen/Qwen3-4B-Instruct-2507-FC --partial-eval --test-category <cats>
+.venv-bfcl/bin/pip install "numpy>=2.0"
 ```
+
+```bash
+bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base                                    # 5,017 scored items
+bash ops/eval_bfcl.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3 qwen3-4b_sft-ep3
+BFCL_CATEGORIES=non_live bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base           # group by group
+
+python3 evaluation/benchmarks/bfcl/bfcl_report.py --run data/generated/eval/bfcl/qwen3-4b_sft-ep3 \
+                                                  --baseline data/generated/eval/bfcl/qwen3-4b_base
+```
+
+One run directory per model under `data/generated/eval/bfcl/<label>/` (model first, so `ls` groups a
+model's runs), each with a `run_manifest.json` carrying the resolved checkpoint, its fingerprint and
+the sampling actually used. `preflight.py` refuses to serve anything until deps, registry key,
+sampling recipe and context window check out; `bfcl_report.py` separates a model's context limit from
+a retryable connection drop instead of scoring both as failure.
+
+**Resume is the normal case** — rerunning the same command continues where it stopped, so run it in
+tmux and fetch groups one at a time (`BFCL_CATEGORIES=non_live`, then `live`, `multi_turn`,
+`memory`). Budget **16–40 h per model**: the wide end is `memory`, whose entries serialize on
+`depends_on`, so concurrency does not help inside a chain — start that group last and watch the first
+hour.
 
 ## Training recipe (Stage 1)
 
@@ -290,7 +301,11 @@ evaluation/
 ├── trajectory_reward.py         the verifier = the Stage-2 reward
 ├── grpo_reward.py               verl seam: episode text -> messages
 ├── eval_report.py               per-template yield table, optional baseline delta
-└── benchmarks/bfcl/             seed-42 sample IDs + generator
+└── benchmarks/bfcl/             BFCL v4 harness glue
+    ├── preflight.py             CPU-only gate (deps, registry, sampling, context) + run manifest
+    ├── bfcl_report.py           per-category table + delta + think%/zero_input/at_cap diagnostics
+    ├── log_mlflow.py            scores -> MLflow experiment bfcl_eval
+    └── make_smoke_ids.py        deterministic ID lists for smokes and probes
 
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
