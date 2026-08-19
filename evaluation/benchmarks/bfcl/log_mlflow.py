@@ -30,7 +30,9 @@ def main() -> int:
     m = json.loads(manifest_path.read_text())
 
     metrics, correct, total = {}, 0, 0
-    for f in sorted(a.run.glob("score/*/*/BFCL_v4_*_score.json")):
+    # Recursive on purpose: the memory categories nest THREE levels deep
+    # (score/<model>/agentic/memory/<backend>/...) — a two-level glob drops them silently.
+    for f in sorted(a.run.glob("score/**/BFCL_v4_*_score.json")):
         cat = f.name[len("BFCL_v4_"):-len("_score.json")]
         with f.open() as fh:
             head = json.loads(fh.readline())
@@ -59,12 +61,19 @@ def main() -> int:
             "temperature": (m.get("sampling") or {}).get("temperature"),
             "generation_config": json.dumps(m.get("generation_config")),
             "max_model_len": (m.get("serving") or {}).get("max_model_len"),
-            "num_threads": (m.get("serving") or {}).get("num_threads"),
+            # fast/slow seit dem Concurrency-Split; Fallback auf den Alt-Key fuer alte Manifeste
+            "num_threads_fast": (m.get("serving") or {}).get("num_threads_fast",
+                                                             (m.get("serving") or {}).get("num_threads")),
+            "num_threads_slow": (m.get("serving") or {}).get("num_threads_slow",
+                                                             (m.get("serving") or {}).get("num_threads")),
             "bfcl_version": m.get("bfcl_version"),
             "repo_commit": m.get("repo_commit"),
             "categories": ",".join(m.get("categories") or []),
             "categories_skipped": ",".join(m.get("categories_skipped") or []),
             "items_planned": m.get("items_total"),
+            "registry_injected": (m.get("registry") or {}).get("injected"),
+            "display_name": (m.get("registry") or {}).get("display_name"),
+            "run_ids_file": m.get("run_ids_file"),
         })
         mlflow.log_metrics(metrics)
         mlflow.log_artifact(str(manifest_path))

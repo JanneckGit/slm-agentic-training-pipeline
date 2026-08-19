@@ -18,6 +18,15 @@ Usage:
     .venv-bfcl/bin/python evaluation/benchmarks/bfcl/make_smoke_ids.py \
         --category memory_vector --n 1 --out /tmp/probe_memvec.json
 
+    # EXACT ids (validated against the loader; memory ids pull their prereqs in automatically)
+    .venv-bfcl/bin/python evaluation/benchmarks/bfcl/make_smoke_ids.py \
+        --category multi_turn_long_context \
+        --ids multi_turn_long_context_66,multi_turn_long_context_123 --out /tmp/ctxprobe.json
+
+    # several categories in one file: category:count pairs
+    .venv-bfcl/bin/python evaluation/benchmarks/bfcl/make_smoke_ids.py \
+        --spec simple_python:2,live_simple:1,memory_kv:1 --out /tmp/crossgroup.json
+
 Ids are drawn from the datasets of the *installed* bfcl_eval package (no network). The output
 format is what bfcl expects as `test_case_ids_to_generate.json`: {"<category>": ["<id>", ...]}.
 """
@@ -65,6 +74,38 @@ def memory_ids(cat: str, n: int) -> list[str]:
     return list(dict.fromkeys(ids))   # dedupe, keep order
 
 
+def exact_ids(cat: str, wanted: list[str]) -> list[str]:
+    """Hand-picked ids, validated against the loader — never trust ids from the raw files.
+
+    For memory categories the named REAL entries additionally pull in their `depends_on` prereqs
+    (the same trap as in memory_ids: without them the entry runs against an empty memory).
+    """
+    entries = {e["id"]: e for e in category_entries(cat)}
+    missing = [i for i in wanted if i not in entries]
+    if missing:
+        raise SystemExit(f"category '{cat}': unknown ids {missing} — ids must come from "
+                         "load_dataset_entry(), not from the raw files (backend prefixes!)")
+    ids = []
+    for i in wanted:
+        ids.extend(entries[i].get("depends_on") or [])
+        ids.append(i)
+    return list(dict.fromkeys(ids))
+
+
+def parse_spec(spec: str) -> dict[str, int]:
+    """'simple_python:2,live_simple:1' -> {'simple_python': 2, 'live_simple': 1}"""
+    out = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        cat, _, n = part.partition(":")
+        if not n.isdigit():
+            raise SystemExit(f"--spec entry '{part}' is not category:count")
+        out[cat] = int(n)
+    return out
+
+
 def pick(counts: dict[str, int]) -> dict[str, list[str]]:
     """Seed-42 selection per category. Fresh RNG per call -> category order does not matter."""
     out = {}
@@ -85,12 +126,23 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--category", help="a single category instead of the standard smoke")
     ap.add_argument("--n", type=int, default=2, help="number of ids with --category (default 2)")
+    ap.add_argument("--ids", help="comma list of EXACT ids (requires --category); validated")
+    ap.add_argument("--spec", help="category:count[,category:count...] — several categories at once")
     ap.add_argument("--out", type=Path, help="target file (default: smoke.json next to this script)")
     a = ap.parse_args()
 
-    counts = {a.category: a.n} if a.category else SMOKE_COUNTS
+    if a.ids and not a.category:
+        raise SystemExit("--ids requires --category")
+    if a.spec and (a.ids or a.category):
+        raise SystemExit("--spec replaces --category/--ids — pick one form")
+
     out = a.out or (Path(__file__).parent / "smoke.json")
-    content = pick(counts)
+    if a.ids:
+        content = {a.category: exact_ids(a.category, [i.strip() for i in a.ids.split(",") if i.strip()])}
+    elif a.spec:
+        content = pick(parse_spec(a.spec))
+    else:
+        content = pick({a.category: a.n} if a.category else SMOKE_COUNTS)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(content, indent=1) + "\n")

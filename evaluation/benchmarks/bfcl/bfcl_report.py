@@ -152,6 +152,10 @@ def main() -> int:
         m = json.loads(manifest.read_text())
         print(f"Run       : {m.get('label')}  ({m.get('model')})")
         print(f"Checkpoint: {m.get('model_dir_resolved') or '—'}  fp={m.get('model_fingerprint') or '—'}")
+        reg = m.get("registry") or {}
+        print(f"Registry  : {m.get('model_key')} -> alias '{m.get('model_alias')}'"
+              f"{'  (injected)' if reg.get('injected') else ''}"
+              f" · max_model_len {(m.get('serving') or {}).get('max_model_len')}")
         print(f"bfcl {m.get('bfcl_version')} · repo {m.get('repo_commit')} · {m.get('created_utc')}")
         # Planned vs actually produced categories. Without this reconciliation a category that
         # produced NOTHING simply drops out of the table — and the report looks clean. That is
