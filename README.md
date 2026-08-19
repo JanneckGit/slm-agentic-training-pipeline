@@ -221,18 +221,21 @@ python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]
 call this same script, so those numbers are comparable by construction.
 
 **OOD benchmark (BFCL v4)** — external harness in its own venv, driven by one ops script per model.
-Setup is **two steps** (the `numpy` upgrade is not optional — without it `faiss` fails to import on
-aarch64/py3.12 and the whole `memory` group drops out):
+Setup is **three steps** (the `numpy` upgrade is not optional — without it `faiss` fails to import on
+aarch64/py3.12 and the whole `memory` group drops out; step three feeds `memory_vector` — the
+preflight gates it):
 
 ```bash
 python3.12 -m venv .venv-bfcl && .venv-bfcl/bin/pip install -r evaluation/benchmarks/bfcl/requirements.txt
 .venv-bfcl/bin/pip install "numpy>=2.0"
+docker compose -f docker/docker-compose.yml run --rm -T sdg python3 -c \
+  "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"
 ```
 
 ```bash
-bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base                                    # 5,017 scored items
+bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base            # 20 of 22 scoring categories, 5,017 items
 bash ops/eval_bfcl.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3 qwen3-4b_sft-ep3
-BFCL_CATEGORIES=non_live bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base           # group by group
+BFCL_CATEGORIES=non_live bash ops/eval_bfcl.sh Qwen/Qwen3-4B qwen3-4b_base           # optional: single group
 
 python3 evaluation/benchmarks/bfcl/bfcl_report.py --run data/generated/eval/bfcl/qwen3-4b_sft-ep3 \
                                                   --baseline data/generated/eval/bfcl/qwen3-4b_base
@@ -240,15 +243,15 @@ python3 evaluation/benchmarks/bfcl/bfcl_report.py --run data/generated/eval/bfcl
 
 One run directory per model under `data/generated/eval/bfcl/<label>/` (model first, so `ls` groups a
 model's runs), each with a `run_manifest.json` carrying the resolved checkpoint, its fingerprint and
-the sampling actually used. `preflight.py` refuses to serve anything until deps, registry key,
-sampling recipe and context window check out; `bfcl_report.py` separates a model's context limit from
-a retryable connection drop instead of scoring both as failure.
+the sampling actually used. `preflight.py` injects a per-model registry entry so bfcl budgets
+`max_tokens` against the served model's true context window, and refuses to serve until deps,
+sampling recipe, label, embedding model and both sides of the context window check out;
+`bfcl_report.py` separates a model's context limit from a retryable connection drop instead of
+scoring both as failure.
 
-**Resume is the normal case** — rerunning the same command continues where it stopped, so run it in
-tmux and fetch groups one at a time (`BFCL_CATEGORIES=non_live`, then `live`, `multi_turn`,
-`memory`). Budget **16–40 h per model**: the wide end is `memory`, whose entries serialize on
-`depends_on`, so concurrency does not help inside a chain — start that group last and watch the first
-hour.
+**One invocation runs everything** — the script splits concurrency per group (48 for the short-item
+categories, 21 for the chain-bound ones; measured, env-overridable). Budget **~6–9 h per model**;
+resume is the same command — run it in tmux.
 
 ## Training recipe (Stage 1)
 
@@ -303,6 +306,8 @@ evaluation/
 ├── eval_report.py               per-template yield table, optional baseline delta
 └── benchmarks/bfcl/             BFCL v4 harness glue
     ├── preflight.py             CPU-only gate (deps, registry, sampling, context) + run manifest
+    ├── registry_inject.py       runtime registry entry per served model
+    ├── run_bfcl.py              injection shim around the bfcl CLI
     ├── bfcl_report.py           per-category table + delta + think%/zero_input/at_cap diagnostics
     ├── log_mlflow.py            scores -> MLflow experiment bfcl_eval
     └── make_smoke_ids.py        deterministic ID lists for smokes and probes
@@ -310,7 +315,7 @@ evaluation/
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
 ops/                             teacher_bakeoff · gen_traces · watch_gen · toolace_backfill ·
-                                 eval_heldout · build_sft_data · traj_sft_pipeline · grpo_smoke
+                                 eval_heldout · eval_bfcl · build_sft_data · traj_sft_pipeline · grpo_smoke
 docker/                          GB10 sm_121 stack
 config/pipeline_config.yaml      the single config
 data/, archive/                  [gitignored]
