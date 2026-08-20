@@ -1,0 +1,92 @@
+# =============================================================================
+# tau2-bench — eingefrorene Benchmark-Definition (Quelle der Wahrheit).
+#
+# ops/eval_tau2.sh und preflight.py lesen NUR von hier. Der User-Sim ist Teil der
+# Benchmark-Definition: model/llm_args/seed/trials aendern = neue Messreihe, die
+# mit allen bisherigen Laeufen unvergleichbar ist (Frozen-Sim-Gate im Preflight;
+# Override nur via TAU2_ALLOW_SIM_CHANGE=1).
+#
+# Sampling-Mechanik (verifiziert): tau2 sendet `temperature` EXPLIZIT (Default 0.0
+# = Loop-Gefahr bei denkenden Qwen) -> die llm_args hier ERSETZEN das pro Rolle.
+# Nicht gesendete Parameter (top_p/top_k) zieht vLLM aus der generation_config des
+# jeweils servierten Modells — expected_generation_config wird als Gate geprueft,
+# top_k NIE ueber litellm senden (kein OpenAI-Standard-Param).
+# =============================================================================
+
+tau2_version: "1.0.1"
+tau2_commit: "fc0055dc4e0a316c3f83133267fbd6faaa770992"   # Tag v1.0.1 (peeled)
+
+agent:
+  # Modell kommt als CLI-Arg (ops/eval_tau2.sh MODEL LABEL) — hier nur das Rezept.
+  llm_args:
+    temperature: 0.6            # Studenten-Rezept (wie eval_heldout/BFCL)
+  expected_generation_config: { temperature: 0.6, top_p: 0.95, top_k: 20 }
+  max_model_len: 32768          # Gate: <= max_position_embeddings des Modells (Qwen3-4B/8B: 40960)
+  max_num_seqs: 16
+  tool_call_parser: hermes      # Qwen3-4B/8B/ep3 = hermes-JSON-Dialekt (verifiziert)
+  reasoning_parser: qwen3
+
+user_sim:
+  model: "Qwen/Qwen3.6-35B-A3B" # EINGEFROREN ueber alle Modellstaende (SDG-Teacher)
+  llm_args:
+    temperature: 1.0            # offizielles Thinking-Rezept der Model Card (S3-validiert;
+    presence_penalty: 1.5       #  0.6-nahe-greedy loopte beim Teacher)
+  expected_generation_config: { temperature: 1.0, top_p: 0.95, top_k: 20 }
+  max_model_len: 20480          # SDG-Serving-Stand
+  max_num_seqs: 16
+  extra_args: "--gdn-prefill-backend triton"   # Hybrid-GDN, wie ops/gen_traces.sh serve()
+  tool_call_parser: qwen3_xml   # Qwen3.6 spricht das <function=…>-XML, NICHT hermes (Smoke-Befund!)
+  reasoning_parser: qwen3
+
+# GPU-Utils werden NICHT mehr fest vergeben, sondern vom Preflight aus der Modellgroesse
+# berechnet (Auto-Sizing): agent_base = (Gewichte + overhead + kv_target)/119;
+# sim = clamp(cap − agent_base, sim_util_min, sim_util_max); agent = cap − sim
+# (Restluft geht an den Agenten — KV-Seiten materialisieren lazy, Reserve kostet nichts).
+# Damit laeuft `ops/eval_tau2.sh Qwen/Qwen3-8B …` ohne Gefummel. Env-Overrides
+# VLLM_GPU_UTIL / VLLM_USER_GPU_UTIL schlagen weiterhin alles.
+autosize:
+  total_cap: 0.86        # FINAL (Cap-Leiter 2026-08-20): 0.88 brachte −15 % Durchsatz statt
+                         # Gewinn (8B/MC12: 11,6 -> 9,8 Ep/h) bei 0 Preemptions ueberall ->
+                         # Speicher ist NICHT der Engpass (Bandbreite ist es); 0.90 damit
+                         # sinnlos und nicht geklettert. Puffer bei 0.86/0.88: avail-Min 6-8 GB.
+  agent_kv_target_gb: 12 # KV-Ziel des Agenten (~82k Tokens; 4B-Basis ~0.18, 8B ~0.25)
+  agent_overhead_gb: 1.0 # CUDA-Graphen/Profiling (v0.21 zieht das vor dem KV ab)
+  sim_util_max: 0.64     # bewaehrt (15,6x KV @20480)
+  sim_util_min: 0.61     # Janneck-Vorgabe; 0.58 = KV −0,11 GB (gemessen), 0.60 waere Kante
+  total_mem_gb: 119      # GB10 unified
+
+nl_judge:
+  # Nur retail (112/114 Tasks mit NL_ASSERTION im reward_basis). Laeuft auf der
+  # user_sim-Instanz (Port 8001). Der Shim (run_tau2.py) patcht die tau2-Konstanten
+  # DEFAULT_LLM_NL_ASSERTIONS(+_ARGS) hierauf — sonst wuerde gpt-4.1 gerufen.
+  model: "Qwen/Qwen3.6-35B-A3B"
+  llm_args:
+    temperature: 0.0
+
+run:
+  num_trials: 4        # offizieller Leaderboard-Standard (docs/leaderboard-submission.md:22)
+  seed: 300            # tau2-Default, explizit gepinnt
+  max_steps: 200
+  max_errors: 10
+  max_concurrency: 12  # Fallback — der Preflight empfiehlt modellabhaengig (Sweep 2026-08-20,
+                       # identische 16/12-Task-Listen, steps100): 4B: 17,3/18,5/15,1 Ep/h
+                       # @ MC 8/12/16 -> Optimum 12; 8B: 12,3/11,6 @ 8/12 -> Optimum 8.
+                       # 0 KV-Preemptions ueberall = Bandbreite limitiert, nicht Speicher.
+
+# Reihenfolge = Lauf-Reihenfolge. telecom/banking = strikte Held-outs,
+# airline/retail = "domain-familiar, task-disjunkt" (AReaL-Welt im SFT — Sternchen im Report).
+domains:
+  telecom:           { task_set: telecom,           task_split: base, expected_tasks: 114 }
+  airline:           { task_set: airline,           task_split: base, expected_tasks: 50 }
+  banking_knowledge: { task_set: banking_knowledge, task_split: null, expected_tasks: 97,
+                       retrieval_config: bm25_grep }   # offline; Leaderboard-Default `alltools` braeuchte API-Keys
+  retail:            { task_set: retail,            task_split: base, expected_tasks: 114,
+                       needs_nl_judge: true }
+
+# Smoke-/Eich-Domaene (nicht Teil des Volllauf-Scopes). Das Gate prueft STRUKTURELLE
+# Harness-Signale (alle action_checks matchen, env_assertions met, keine error/infra/ctx-
+# Terminations, kein Think-Leak, User-Sim setzt eigene Tool-Calls ab) — NICHT ⌀reward=1:
+# der GT-Agent kennt keine COMMUNICATE-Formulierungen und der Sim darf die Welt legal
+# variieren (mock-⌀ war 0.75 bei perfekt funktionierender Harness, Smoke 2026-08-19).
+oracle:
+  domain: mock

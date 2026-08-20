@@ -1,0 +1,24 @@
+# tau2-bench harness venv (.venv-tau2bench) — Setup (Stand 2026-08-19):
+#
+#   git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench
+#   python3.12 -m venv .venv-tau2bench
+#   .venv-tau2bench/bin/pip install ./data/raw/tau2-bench
+#   .venv-tau2bench/bin/pip install rank_bm25   # banking_knowledge-Retrieval; tau2 deklariert
+#                                               # die Dependency NICHT (Laufzeit-Import im
+#                                               # bm25-Indexer) — Preflight-Gate retrieval-deps
+#
+# Warum Install aus dem lokalen Checkout statt einer Zeile hier: derselbe gepinnte
+# Checkout ist Code-Quelle UND Datenquelle (TAU2_DATA_DIR=data/raw/tau2-bench/data —
+# tau2s Loader haengen selbst tau2/domains/… an).
+# Ein Stand fuer beides = kein Drift zwischen Paketversion und Task-Daten. Der
+# Preflight gated den Checkout-Commit (v1.0.1 = fc0055dc4e0a316c3f83133267fbd6faaa770992)
+# und die Paketversion (1.0.1) hart.
+#
+# v1.0.1 ist Pflicht, nicht Kosmetik: das Release aendert das banking_knowledge-Grading
+# (CHANGELOG: Scores <1.0.1 vs. >=1.0.1 dort NICHT vergleichbar).
+#
+# Bewusst getrennt von .venv-tau2 (tau2 1.0.0): das nutzen validate_areal + der
+# (bald neu gebaute) GRPO-Code als Bibliothek — Benchmark-Harness und Trainingscode
+# teilen sich kein venv (BFCL-Konvention).
+#
+# Diese Datei ist Doku/Reproduzierbarkeit; sie wird nicht direkt pip-installiert.
