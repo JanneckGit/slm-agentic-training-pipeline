@@ -199,6 +199,61 @@ services:
       start_period: 120s   # vLLM takes a while to load
 
   # ---------------------------------------------------------------------------
+  # Second vLLM instance (port 8001): tau2-bench user-simulator / NL-judge model.
+  # tau2 needs agent AND user LLM live in the SAME episode (dual control), which
+  # the single `vllm` service cannot provide (fixed port 8000, torn down by every
+  # ops script). Separate service so BFCL/heldout/SDG serving stays untouched.
+  # GPU budget: both instances see the whole GB10 card -> VLLM_GPU_UTIL (agent)
+  # + VLLM_USER_GPU_UTIL must stay <= ~0.85 total (the validated single-model
+  # ceiling). Defaults here assume 35B-A3B sim + 4B agent.
+  # ---------------------------------------------------------------------------
+  vllm-user:
+    image: vllm/vllm-openai:latest
+    container_name: text2sql_vllm_user
+    profiles: ["vllm-user"]
+
+    volumes:
+      - hf_cache:/data/hf_cache
+      - ../data:/app/data
+
+    environment:
+      - HF_HOME=/data/hf_cache
+      - HF_TOKEN=${HF_TOKEN}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      # same GB10 sm_121 FlashInfer sampler race as on the vllm service (vLLM #43885)
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+
+    command: >
+      --model ${VLLM_USER_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      --dtype bfloat16
+      --max-model-len ${VLLM_USER_MAX_MODEL_LEN:-20480}
+      --gpu-memory-utilization ${VLLM_USER_GPU_UTIL:-0.64}
+      --served-model-name ${VLLM_USER_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      ${VLLM_USER_EXTRA_ARGS:-}
+      --host 0.0.0.0
+      --port 8001
+
+    ports:
+      - "8001:8001"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    shm_size: '16gb'
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s   # 35B weights take longer to load than the 4B agent
+
+  # ---------------------------------------------------------------------------
   # Optional: MLflow Tracking UI
   # ---------------------------------------------------------------------------
   # View training runs at http://localhost:5000
