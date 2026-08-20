@@ -53,6 +53,7 @@ flowchart TD
     RL -->|merge_adapter.py| STUDENT
     STUDENT --> AFTER["AFTER-eval"]
     STUDENT --> BFCL["OOD — BFCL v4"]
+    STUDENT --> TAU2["OOD — τ²-bench"]
     EVAL -.->|"baseline Δ"| AFTER
 ```
 
@@ -104,7 +105,7 @@ template** — so every class is individually measurable and equally represented
 ## Setup
 
 Prereqs: **Docker + Compose with the NVIDIA Container Toolkit** (the compose services reserve GPUs
-via `driver: nvidia`; services `sdg`, `training`, `vllm`, `grpo`, `mlflow`), a host `python3` ≥ 3.12,
+via `driver: nvidia`; services `sdg`, `training`, `vllm`, `vllm-user`, `grpo`, `mlflow`), a host `python3` ≥ 3.12,
 and a **Python ≥ 3.12 venv for τ²-bench** (its `requires-python >=3.12`; the pinned training stack
 stays isolated in the containers). Host-side data scripts are stdlib-only — no pip install on the
 host.
@@ -114,7 +115,8 @@ host.
 git clone https://github.com/JanneckGit/slm-agentic-training-pipeline.git
 cd slm-agentic-training-pipeline
 
-# τ²-bench dependency, isolated in its own venv (the git clone below is tau2-bench, not this repo)
+# τ²-bench dependency, isolated in its own venv (the git clone below is tau2-bench, not this repo;
+# runtime dep of the db_bahn domain — the τ²-bench OOD benchmark pins its own newer checkout, see OOD section)
 python3.12 -m venv .venv-tau2
 git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench
 git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may have drifted
@@ -122,8 +124,8 @@ git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may 
 ```
 
 Rollout/eval scripts default to `.venv-tau2/` (override with `TAU2PY=/path/to/python`); the data
-chain (`ops/build_sft_data.sh`) runs on host `python3`. A third venv exists only for the optional
-BFCL benchmark (see the OOD section). `config/pipeline_config.yaml` is the single config — no
+chain (`ops/build_sft_data.sh`) runs on host `python3`. Two more venvs exist only for the optional
+OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections). `config/pipeline_config.yaml` is the single config — no
 secrets needed: the teacher is local vLLM and all models are public. The first serve pulls weights
 into the `hf_cache` volume (bind path set at the bottom of `docker/docker-compose.yml`, default
 `/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB.
@@ -253,6 +255,36 @@ scoring both as failure.
 categories, 21 for the chain-bound ones; measured, env-overridable). Budget **~6–9 h per model**;
 resume is the same command — run it in tmux.
 
+**OOD benchmark (τ²-bench)** — the main before/after yardstick around GRPO: multi-turn
+conversations against an LLM user simulator (dual control), pass^k over 4 trials. Setup is one
+pinned checkout serving as both package source and task data (`TAU2_DATA_DIR`); the preflight
+gates commit, task counts and a data fingerprint:
+
+```bash
+git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench
+python3.12 -m venv .venv-tau2bench && .venv-tau2bench/bin/pip install ./data/raw/tau2-bench
+.venv-tau2bench/bin/pip install rank_bm25    # banking retrieval — tau2 doesn't declare it; the preflight gates it
+```
+
+```bash
+bash ops/eval_tau2.sh Qwen/Qwen3-4B qwen3-4b_base                    # all 4 domains × 4 trials (375 tasks)
+bash ops/eval_tau2.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/selected qwen3-4b_sft-ep3
+bash ops/eval_tau2.sh Qwen/Qwen3-4B qwen3-4b_base telecom            # optional: single domain
+```
+
+Everything else is automatic: the preflight **auto-sizes GPU budgets and concurrency from the
+agent model's weight size** (4B → 0.22/0.64 @ MC 12, 8B → 0.25/0.61 @ MC 8 — swept; an 8B run
+needs no extra flags), serves agent (:8000) and the frozen user simulator Qwen3.6-35B-A3B (:8001)
+sequentially with per-model tool parsers, calibrates the harness via a ground-truth agent on
+`mock`, and resumes with the same command. Scoring is deterministic except retail, whose NL
+assertions are judged by the local simulator model (shim — no paid APIs anywhere).
+telecom + banking_knowledge are the strict held-outs; airline/retail share the AReaL SFT world
+(tasks measured disjoint) and are reported with an asterisk. Results land in
+`data/generated/eval/tau2/<label>/` + MLflow (`tau2_eval`); absolute scores are not
+leaderboard-comparable (local user sim) — the Base↔ep3 delta is the measurement. Budget
+**~4.5–5.5 days per model** for the full set (telecom alone ≈ 1.5–2 days); details and traps in
+`docs/tau2-benchmark.md`.
+
 ## Training recipe (Stage 1)
 
 What `ops/traj_sft_pipeline.sh` launches:
@@ -304,18 +336,27 @@ evaluation/
 ├── trajectory_reward.py         the verifier = the Stage-2 reward
 ├── grpo_reward.py               verl seam: episode text -> messages
 ├── eval_report.py               per-template yield table, optional baseline delta
-└── benchmarks/bfcl/             BFCL v4 harness glue
-    ├── preflight.py             CPU-only gate (deps, registry, sampling, context) + run manifest
-    ├── registry_inject.py       runtime registry entry per served model
-    ├── run_bfcl.py              injection shim around the bfcl CLI
-    ├── bfcl_report.py           per-category table + delta + think%/zero_input/at_cap diagnostics
-    ├── log_mlflow.py            scores -> MLflow experiment bfcl_eval
-    └── make_smoke_ids.py        deterministic ID lists for smokes and probes
+├── benchmarks/bfcl/             BFCL v4 harness glue
+│   ├── preflight.py             CPU-only gate (deps, registry, sampling, context) + run manifest
+│   ├── registry_inject.py       runtime registry entry per served model
+│   ├── run_bfcl.py              injection shim around the bfcl CLI
+│   ├── bfcl_report.py           per-category table + delta + think%/zero_input/at_cap diagnostics
+│   ├── log_mlflow.py            scores -> MLflow experiment bfcl_eval
+│   └── make_smoke_ids.py        deterministic ID lists for smokes and probes
+└── benchmarks/tau2/             τ²-bench harness glue
+    ├── benchmark_config.yaml    frozen benchmark definition (user sim, sampling, trials, autosize)
+    ├── preflight.py             CPU-only gates (pins, task counts, keys, frozen sim) + GPU auto-sizing + run manifest
+    ├── run_tau2.py              shim: patches the NL-judge constants to local endpoints, then the tau2 CLI
+    ├── tau2_report.py           pass^k (official formula) + component rates + error taxonomy + think-leak gate
+    ├── log_mlflow.py            metrics -> MLflow experiment tau2_eval
+    ├── check_disjoint.py        AReaL SFT leg vs official tasks — contamination gate
+    ├── data_fingerprint.txt     pinned sha of the task data
+    └── requirements.txt         setup notes (install = the pinned checkout itself)
 
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
 ops/                             teacher_bakeoff · gen_traces · watch_gen · toolace_backfill ·
-                                 eval_heldout · eval_bfcl · build_sft_data · traj_sft_pipeline · grpo_smoke
+                                 eval_heldout · eval_bfcl · eval_tau2 · build_sft_data · traj_sft_pipeline · grpo_smoke
 docker/                          GB10 sm_121 stack
 config/pipeline_config.yaml      the single config
 data/, archive/                  [gitignored]
@@ -325,7 +366,11 @@ data/, archive/                  [gitignored]
 
 Mandatory on this box: FlashInfer sampler off (top-k/top-p race), `--gdn-prefill-backend triton`
 **for the hybrid-GDN teacher only** (never for the dense 4B student), sharded merges
-(`max_shard_size=5GB`), no MIG → serve one model at a time. For Stage 2 additionally:
+(`max_shard_size=5GB`), no MIG → one model at a time — **except the τ²-bench dual-serving pair**
+(agent + user sim), which budget-splits the card via preflight auto-sizing and must start
+sequentially. Tool parsers differ per Qwen generation (`hermes` for Qwen3-4B/8B, `qwen3_xml` for
+Qwen3.6), and `--reasoning-parser` is mandatory for τ² but forbidden for BFCL/heldout (they parse
+`<think>` client-side). For Stage 2 additionally:
 `load_format=auto` (else the rollout serves random weights), `attn_implementation=sdpa` (FA2 fails
 the actor forward on sm_121) and `rollout.agent.default_agent_loop=tool_agent` (`multi_turn.enable`
 alone is a no-op). All applied in the `ops/` scripts.
