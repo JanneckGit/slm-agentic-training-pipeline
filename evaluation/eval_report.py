@@ -8,6 +8,12 @@ score==1.0 AND not truncated AND not degenerate.
 Counts are shown next to the percentage on purpose: heldout_eval has 10 rollouts per template, so a
 single flip moves the number by 10 pp — a bare percentage would fake a precision that is not there.
 
+k > 1 (since 2026-09-02, ops/eval_heldout.sh default K=4): `yield` is then the MEAN over all
+task×sample rollouts (= a lower-noise pass@1, comparable to the old k=1 files), and an extra
+`pass^k` column counts a task only if ALL k of its samples are accepted (consistency measure, the
+same pass^k τ²-bench reports). Tasks with fewer than k samples (interrupted run) are excluded from
+pass^k and reported as a WARNING. With k=1 the output is byte-identical to the pre-k version.
+
 Plain python3 (no tau2 needed, no repo imports).
 
 Usage:
@@ -34,8 +40,9 @@ def accepted(rec: dict) -> bool:
 
 
 def load(path: str) -> dict:
-    """-> {template: {n, ok, turns, calls}} plus file-level counters."""
-    per = defaultdict(lambda: {"n": 0, "ok": 0, "turns": 0, "calls": 0})
+    """-> {template: {n, ok, turns, calls, tasks}} plus file-level counters.
+    `tasks` maps task_id -> list of accepted-flags (one per sample) for the pass^k view."""
+    per = defaultdict(lambda: {"n": 0, "ok": 0, "turns": 0, "calls": 0, "tasks": defaultdict(list)})
     meta = {"n": 0, "truncated": 0, "degen": 0, "finish": Counter(), "seen": set(), "dups": 0}
     for line in open(path):
         line = line.strip()
@@ -49,16 +56,36 @@ def load(path: str) -> dict:
         e = per[r.get("template", "?")]
         sc = r.get("score") or {}
         d = r.get("degen") or {}
+        acc = accepted(r)
         e["n"] += 1
-        e["ok"] += accepted(r)
+        e["ok"] += acc
         e["turns"] += sc.get("turns_used", 0)
         e["calls"] += sc.get("n_tool_calls", 0)
+        e["tasks"][r.get("task_id")].append(acc)
         meta["n"] += 1
         meta["truncated"] += bool(r.get("truncated"))
         meta["degen"] += (d.get("think_ngram_dup_ratio", 0.0) > DEGEN_MAX_DUP8_RATIO
                           or d.get("max_think_chars", 0) > DEGEN_MAX_THINK_CHARS)
         meta["finish"][str(r.get("finish_reason", "?")).split(":")[0]] += 1
+    _add_passk(per, meta)
     return {"per": per, "meta": meta}
+
+
+def _add_passk(per: dict, meta: dict) -> None:
+    """k = the largest sample count any task has. Per template: n_tasks (complete ones), passk_ok
+    (all k samples accepted), incomplete (fewer than k samples -> excluded)."""
+    k = max((len(v) for e in per.values() for v in e["tasks"].values()), default=1)
+    meta["k"] = k
+    meta["incomplete"] = 0
+    for e in per.values():
+        e["n_tasks"] = e["passk_ok"] = e["incomplete"] = 0
+        for flags in e["tasks"].values():
+            if len(flags) < k:
+                e["incomplete"] += 1
+                continue
+            e["n_tasks"] += 1
+            e["passk_ok"] += all(flags)
+        meta["incomplete"] += e["incomplete"]
 
 
 def pct(ok: int, n: int) -> str:
@@ -75,6 +102,10 @@ def main():
     cur = load(args.input)
     base = load(args.baseline) if args.baseline else None
     per, meta = cur["per"], cur["meta"]
+    k = meta["k"]
+    base_k = base["meta"]["k"] if base else 1
+    show_passk = k > 1
+    show_base_passk = show_passk and base_k > 1
 
     tot_ok = sum(e["ok"] for e in per.values())
     print(f"\n{args.input}")
@@ -86,17 +117,36 @@ def main():
         print(f"\nTOTAL  {pct(tot_ok, meta['n'])}   baseline {pct(b_ok, b['n'])}   Δ {delta:+.1f} pp")
     else:
         print(f"\nTOTAL  {pct(tot_ok, meta['n'])}")
+    if show_passk:
+        pk_ok = sum(e["passk_ok"] for e in per.values())
+        pk_n = sum(e["n_tasks"] for e in per.values())
+        line = f"pass^{k} {pct(pk_ok, pk_n)}   (yield above = mean over {k} samples/task)"
+        if show_base_passk:
+            bk_ok = sum(e["passk_ok"] for e in base["per"].values())
+            bk_n = sum(e["n_tasks"] for e in base["per"].values())
+            d = 100 * pk_ok / max(1, pk_n) - 100 * bk_ok / max(1, bk_n)
+            line = f"pass^{k} {pct(pk_ok, pk_n)}   baseline {pct(bk_ok, bk_n)}   Δ {d:+.1f} pp"
+        elif base:
+            line += f"  [baseline is k={base_k}: no pass^k delta]"
+        print(line)
     print(f"       truncated {meta['truncated']}   degenerate {meta['degen']}")
 
-    off = {k: v for k, v in meta["finish"].items() if k != "final_answer"}
+    off = {k_: v for k_, v in meta["finish"].items() if k_ != "final_answer"}
     if off:  # infra failures look exactly like model failures in the yield — surface them
         print(f"       finish_reason != final_answer: {dict(off)}")
     if meta["dups"]:
         print(f"       WARNING {meta['dups']} duplicate (task_id, sample_idx) — resumed into a stale file?")
+    if meta["incomplete"]:
+        print(f"       WARNING {meta['incomplete']} task(s) with fewer than k={k} samples — "
+              f"excluded from pass^{k} (interrupted run?)")
 
     hdr = f"\n{'Template':34s} {'yield':>16s}"
     if base:
         hdr += f" {'baseline':>16s} {'Δ pp':>7s}"
+    if show_passk:
+        hdr += f" {f'pass^{k}':>16s}"
+        if show_base_passk:
+            hdr += f" {'base pass^k':>16s} {'Δ pp':>7s}"
     hdr += f" {'turns':>6s} {'calls':>6s}"
     print(hdr)
     print("-" * len(hdr.strip()))
@@ -118,6 +168,15 @@ def main():
                 row += f" {pct(b['ok'], b['n']):>16s} {d:>+7.1f}"
             else:
                 row += f" {'–':>16s} {'–':>7s}"
+        if show_passk:
+            row += f" {pct(e['passk_ok'], e['n_tasks']):>16s}"
+            if show_base_passk:
+                b = base["per"].get(t)
+                if b and b["n_tasks"]:
+                    d = 100 * e["passk_ok"] / max(1, e["n_tasks"]) - 100 * b["passk_ok"] / b["n_tasks"]
+                    row += f" {pct(b['passk_ok'], b['n_tasks']):>16s} {d:>+7.1f}"
+                else:
+                    row += f" {'–':>16s} {'–':>7s}"
         row += f" {e['turns'] / max(1, e['n']):>6.1f} {e['calls'] / max(1, e['n']):>6.1f}"
         print(row)
     print()

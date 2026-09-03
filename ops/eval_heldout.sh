@@ -5,11 +5,20 @@
 #   bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think
 #   bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_traj_merged/ep2 after_ep2
 #
-# SINGLE-SHOT (--max-regen 0): genau EIN Versuch pro Aufgabe. Aeltere Heldout-Zahlen entstanden mit
+# SINGLE-SHOT (--max-regen 0): genau EIN Versuch pro Rollout. Aeltere Heldout-Zahlen entstanden mit
 # --max-regen 1 = bis zu 3 Versuche mit best-of-Auswahl; sie sind mit diesen NICHT vergleichbar.
 #
+# K ROLLOUTS PRO TASK (Default 4, seit 2026-09-02): eval_report.py liefert daraus pass^k (Task zaehlt
+# nur, wenn ALLE k Samples bestehen) UND den Mittelwert ueber k (= rauschaermerer pass@1, vergleichbar
+# mit den alten k=1-Dateien). Bei K != 1 haengt der Dateiname `_k<K>` an, damit der rm -f unten
+# keine k=1-Datei desselben Labels ueberschreibt. K=1 reproduziert das alte Verhalten 1:1.
+# Korridor-Messung fuer den RL-Pool = derselbe Aufruf mit RL-Sampling (temp 1.0) auf dem RL-Split:
+#   SPLIT=rl_train K=8 TEMPERATURE=1.0 MLFLOW_EXPERIMENT=db_bahn_rl_corridor \
+#     bash ops/eval_heldout.sh <ep3-merged> ep3_corridor      # ~5 h; danach corridor_from_traces.py
+#
 # Env-Overrides (Defaults in Klammern):
-#   SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)  EVAL_TIMEOUT (21600)
+#   K (4)  SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)
+#   EVAL_TIMEOUT (5400 * K = 1,5 h je Rollout-Runde; deckt heldout k=4 und rl_train k=8 ab)
 #   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  VLLM_EXTRA  TAU2PY
 #   MLFLOW_EXPERIMENT (db_bahn_traj_eval)
 #   TEMPERATURE (0.6)  TOP_P (0.95)  TOP_K (20)  MIN_P (0)  PRESENCE_PENALTY (0.0)
@@ -22,7 +31,11 @@ TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 MODEL=${1:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 LABEL=${2:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 SPLIT=${SPLIT:-heldout_eval}
-OUT=${3:-data/generated/eval/db_traces_${SPLIT}_${LABEL}.jsonl}
+K=${K:-4}
+case "$K" in ''|*[!0-9]*|0) echo "K muss eine positive Ganzzahl sein, ist '$K'"; exit 2;; esac
+KSUF=""; [ "$K" -ne 1 ] && KSUF="_k${K}"
+OUT=${3:-data/generated/eval/db_traces_${SPLIT}_${LABEL}${KSUF}.jsonl}
+EVAL_TIMEOUT=${EVAL_TIMEOUT:-$((5400 * K))}
 # 75 % der von vLLM gemeldeten "Maximum concurrency", gemessen 2026-07-21 bei ctx 20480 / util 0.85:
 #   Qwen3-4B  KV 663.424 Tok -> 32,39x -> 24     Qwen3-8B  KV 594.048 Tok -> 29,01x -> 21
 # 21 = der bindende (kleinere) Fall, deckt damit jedes SLM bis ~10B ab, ohne ans Limit zu gehen.
@@ -54,9 +67,10 @@ export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Trai
 teardown() { $COMPOSE --profile vllm down vllm >/dev/null 2>&1; }
 trap teardown EXIT
 
-echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — $(date '+%F %T') ===="
+echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
 echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY"
 echo "   serving : conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'"
+echo "   limits  : eval_timeout=${EVAL_TIMEOUT}s rollout_timeout=${ROLLOUT_TIMEOUT_S:-1800}s -> $OUT"
 teardown; sleep 3
 
 # NUR Standard-Transformer hier (Base 4B / merged Student) -> kein --gdn-prefill-backend,
@@ -90,9 +104,9 @@ rm -f "$OUT"
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /
 # presence 1.5), nicht das Studenten-Rezept. Fehlt ein Flag, wird still falsch evaluiert.
 # --max-regen 0 = genau ein Versuch (siehe rollout.py solve_task).
-timeout "${EVAL_TIMEOUT:-21600}" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
+timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
-  --split "$SPLIT" --k 1 --api-base http://localhost:8000/v1 --model "$MODEL" --teacher-name "$LABEL" \
+  --split "$SPLIT" --k "$K" --api-base http://localhost:8000/v1 --model "$MODEL" --teacher-name "$LABEL" \
   --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
   --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
