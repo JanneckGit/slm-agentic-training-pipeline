@@ -88,12 +88,10 @@ training:
   lr_scheduler: "cosine"
 
 # -----------------------------------------------------------------------------
-# GRPO (Stage 2) — REMOVED 2026-07-15: the SQL-era verl runner + its config were
-# deleted; the agentic rebuild (reward = evaluation/trajectory_reward.py:compute_score,
-# data = rl_train split + AReaL RL tasks) will define fresh keys here.
-# Validated GB10/verl load-bearing flags: load_format=auto, FlashInfer sampler off,
-# rep-pen source patch — all applied in ops/grpo_smoke.sh.
-# Frozen stack: image text2sql-grpo:verl (+ docker/Dockerfile.grpo as rebuild recipe).
+# GRPO (Stage 2) — lives in config/grpo_db_bahn.yaml (profiles smoke / r1), rendered into verl flags by
+# training_pipeline/grpo_config.py and run via ops/grpo_run.sh (preflight -> verl). Reward =
+# evaluation/trajectory_reward.py through evaluation/grpo_reward.py; pool = training_pipeline/build_grpo_pool.py
+# from the corridor measurement (ops/eval_heldout.sh SPLIT=rl_train K=8). Nothing Stage-2 is read from this file.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
