@@ -23,7 +23,9 @@ Two training stages, both grounded in the same domain:
    dialogue flows (AReaL — airline + retail; telecom dropped), and — the core of this repo —
    **self-synthesized, verifier-gated German DB trajectories with native thinking**.
 2. **Stage 2 — GRPO/verl RL** against the same db_bahn tools, reward = the same deterministic
-   trajectory verifier, tasks from the `rl_train` split of the same pool.
+   trajectory verifier. The pool is measured, not assumed: every `rl_train` task is rolled 8× with the
+   SFT model, the templates it does not solve consistently form the pool, and a ledger re-weights the
+   tasks while training. Success metric: heldout **pass^4**.
 
 ## Architecture
 
@@ -31,7 +33,9 @@ Generate tasks whose correct answer is **known by construction**, let a strong t
 against the *real* tools with thinking enabled, and keep only trajectories a deterministic verifier
 confirms. Before the student sees them, the verified German trajectories are **capped per template
 by what the base model already solves** (a heldout base-eval drives band caps, automated in
-`ops/build_sft_data.sh`) and mixed with two public legs.
+`ops/build_sft_data.sh`) and mixed with two public legs. Stage 2 then measures where the SFT model
+still wavers, builds the RL pool from exactly those templates, trains with GRPO against the real tools
+and is judged by the same heldout eval.
 
 ```mermaid
 flowchart TD
@@ -48,10 +52,11 @@ flowchart TD
     TOOLACE --> MIX
     AREAL --> MIX
     MIX -->|"ops/traj_sft_pipeline.sh<br/>model-gate · train · merge"| SFT["Stage 1 — LoRA SFT"]
-    SFT -->|ops/grpo_smoke.sh| RL["Stage 2 — GRPO/verl"]
+    SFT -->|"eval_heldout.sh SPLIT=rl_train K=8<br/>corridor_from_traces.py · build_grpo_pool.py"| POOL["RL pool<br/>(templates with unsolved tasks)"]
+    POOL -->|"ops/grpo_run.sh r1<br/>verl tool-agent loop · ledger sampler"| RL["Stage 2 — GRPO/verl"]
     SFT -->|merge_adapter.py| STUDENT["merged student"]
-    RL -->|merge_adapter.py| STUDENT
-    STUDENT --> AFTER["AFTER-eval"]
+    RL -->|"grpo_metrics.py --select<br/>ops/grpo_export.sh"| STUDENT
+    STUDENT --> AFTER["AFTER-eval (pass^4)"]
     STUDENT --> BFCL["OOD — BFCL v4"]
     STUDENT --> TAU2["OOD — τ²-bench"]
     EVAL -.->|"baseline Δ"| AFTER
@@ -93,19 +98,20 @@ flowchart TD
 | Write (rule-gated) | 3 | `wartung_einplanen`, `crew_zuweisen`, `wartung_status_setzen` |
 
 **Splits** (from `gen_tasks.py`; disjoint by construction, HARD-FAIL-checked; **uniform per
-template** — so every class is individually measurable and equally represented in RL)
+template** — so every class is individually measurable)
 
 | Split | Tasks | Rule | Purpose |
 |-------|-------|------|---------|
 | `sft_train` | 13,948 | rest | teacher rollouts → SFT traces |
-| `rl_train` | 960 | 20 / template | Stage-2 GRPO pool |
-| `heldout_eval` | 480 | 10 / template | before/after held-out eval + source of the db-leg caps |
+| `rl_train` | 960 | 20 / template | corridor measurement (8 rollouts / task) → Stage-2 pool |
+| `heldout_eval` | 480 | 10 / template | before/after pass^4 eval (K=4) + source of the db-leg caps + verl validation set |
 | `bakeoff_dev` | 48 | 1 / template | smoke/dev subset (⊆ `sft_train`) |
 
 ## Setup
 
 Prereqs: **Docker + Compose with the NVIDIA Container Toolkit** (the compose services reserve GPUs
-via `driver: nvidia`; services `sdg`, `training`, `vllm`, `vllm-user`, `grpo`, `mlflow`), a host `python3` ≥ 3.12,
+via `driver: nvidia`; services `sdg`, `training`, `vllm`, `vllm-user`, `grpo`, `mlflow`; Stage 2 runs in
+the frozen verl image `agentic-grpo:verl`, recipe `docker/Dockerfile.grpo-agentic`), a host `python3` ≥ 3.12,
 and a **Python ≥ 3.12 venv for τ²-bench** (its `requires-python >=3.12`; the pinned training stack
 stays isolated in the containers). Host-side data scripts are stdlib-only — no pip install on the
 host.
@@ -125,8 +131,9 @@ git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may 
 
 Rollout/eval scripts default to `.venv-tau2/` (override with `TAU2PY=/path/to/python`); the data
 chain (`ops/build_sft_data.sh`) runs on host `python3`. Two more venvs exist only for the optional
-OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections). `config/pipeline_config.yaml` is the single config — no
-secrets needed: the teacher is local vLLM and all models are public. The first serve pulls weights
+OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections). Two configs, no secrets:
+`config/pipeline_config.yaml` (SDG / SFT / eval) and `config/grpo_db_bahn.yaml` (Stage 2) — the teacher
+is local vLLM and all models are public. The first serve pulls weights
 into the `hf_cache` volume (bind path set at the bottom of `docker/docker-compose.yml`, default
 `/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB.
 
@@ -175,7 +182,8 @@ bash ops/gen_traces.sh          # serve winner -> thinking rollout over sft_trai
                                 #   -> k=2 top-up -> format ->
                                 #      data/generated/legs/db_traces_chat.jsonl        (the SFT input)
                                 #      data/generated/sdg/db_failed-for-SFT_rl-candidates.jsonl
-                                #                       (tasks in no trace -> Stage-2 pool candidates)
+                                #                       (tasks in no verified trace — diagnostic only; the
+                                #                        Stage-2 pool comes from the corridor measurement)
                                 #   (defaults: ctx 20480, concurrency 48, 72 h cap; ~41 h on GB10)
 ```
 
@@ -208,15 +216,36 @@ bash ops/build_sft_data.sh                                # base-eval (skip-if-e
 
 bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x3 -> AFTER-eval x3
                                 #   -> checkpoint-selection (best of ep1-3)
-bash ops/grpo_smoke.sh          # Stage 2: verl tool-agent loop vs the real db_bahn tools
 ```
 
-**In-domain eval, standalone** — any model (base, merged checkpoint, experiment), single-shot over the
-480 `heldout_eval` tasks, printing a per-template yield table:
+**Stage 2 — GRPO (verl)** — every knob lives in `config/grpo_db_bahn.yaml` (profiles `smoke`, `r1`).
+The preflight runs inside the container and blocks on pool, init fingerprint, tool registry, flags,
+reward-parser round-trip, prompt length and run state. Ledger, sampler state and dumps land in
+`data/final/grpo/runs/<run>/`, verl checkpoints in `data/final/grpo/verl_ckpt/<run>/`:
 
 ```bash
-bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think
-python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]   # re-report / delta
+# corridor: 8 rollouts per rl_train task with the SFT model -> the templates it does not solve consistently
+SPLIT=rl_train K=8 TEMPERATURE=1.0 MLFLOW_EXPERIMENT=db_bahn_rl_corridor \
+  bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3 ep3_corridor
+python3 evaluation/corridor_from_traces.py --input data/generated/eval/db_traces_rl_train_ep3_corridor_k8.jsonl
+GRPO_IMAGE=agentic-grpo:verl docker compose -f docker/docker-compose.yml --profile grpo run --rm -T grpo \
+  training_pipeline/build_grpo_pool.py --corridor /app/data/generated/eval/rl_corridor_ep3_corridor_k8.json \
+  --traces /app/data/generated/eval/db_traces_rl_train_ep3_corridor_k8.jsonl --pool-id corridor_ep3_k8_20260902
+
+bash ops/grpo_run.sh smoke                         # 2-step smoke: preflight -> verl -> 24-task validation
+bash ops/grpo_run.sh r1                            # the run (tmux); rerun the same command to resume
+python3 training_pipeline/grpo_metrics.py r1 --select --mlflow   # ledger stats, exact pass^4, stop rule, `selected`
+bash ops/grpo_export.sh r1 selected                # verl checkpoint -> LoRA adapter -> merged model
+bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4b/grpo_db_bahn_r1/step_<N> after_grpo_r1
+```
+
+**In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=4 rollouts per
+task** (default) over the 480 `heldout_eval` tasks, printing per-template **pass^4** and mean; `K=1`
+reproduces the old single-shot files:
+
+```bash
+bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think                    # -> …_base_think_k4.jsonl
+python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]   # re-report / delta (pass^k for k>1)
 ```
 
 `build_sft_data.sh` (BEFORE, reused as caps source) and `traj_sft_pipeline.sh` (both AFTER evals)
@@ -282,8 +311,7 @@ telecom + banking_knowledge are the strict held-outs; airline/retail share the A
 (tasks measured disjoint) and are reported with an asterisk. Results land in
 `data/generated/eval/tau2/<label>/` + MLflow (`tau2_eval`); absolute scores are not
 leaderboard-comparable (local user sim) — the Base↔ep3 delta is the measurement. Budget
-**~4.5–5.5 days per model** for the full set (telecom alone ≈ 1.5–2 days); details and traps in
-`docs/tau2-benchmark.md`.
+**~4.5–5.5 days per model** for the full set (telecom alone ≈ 1.5–2 days).
 
 ## Training recipe (Stage 1)
 
@@ -299,6 +327,24 @@ What `ops/traj_sft_pipeline.sh` launches:
 | Speed | **FA2** + **Liger** (fused CE) + `group_by_length` | Liger is **required** for micro > 4 @ 12k (removes the 55 GB fp32 logit tensor) |
 | Regularization | **NEFTune α=5** | noisy input embeddings, train-time only ([arXiv:2310.05914](https://arxiv.org/abs/2310.05914)) |
 | Eval | held-out val + `eval_steps 300` | overfit diagnostic only — the real judge is the rollout `verified_yield` |
+
+## Training recipe (Stage 2)
+
+What `ops/grpo_run.sh r1` launches (`config/grpo_db_bahn.yaml`, profile `r1`):
+
+| Knob | Value | Note |
+|------|-------|------|
+| Vehicle | **verl 0.8.0** (frozen image `agentic-grpo:verl`) | in-process vLLM rollout + tool-agent loop against the real tau2 env |
+| Init | merged SFT ep3 + **fresh LoRA r=16 / α=32** | the RL adapter is merged into ep3 afterwards (`ops/grpo_export.sh`) |
+| Algorithm | **Dr.GRPO** (advantage = reward − group mean), no KL (switch), lr 3e-6 | one update per step |
+| Step / epoch | **16 prompts × 8 rollouts**; epoch = 128 draws = 8 steps | checkpoint + validation every epoch |
+| Pool | all tasks of every template with ≥1 corridor task (1–7 of 8 successes) | `build_grpo_pool.py`; 640 tasks / 32 templates for ep3 |
+| Sampling | ledger-driven weights p̂(1−p̂), low-variance resampling, aging for failed tasks; `static` switch | `CorridorDataset` (`grpo_dataset.py`) reads the ledger `grpo_reward.py` appends to |
+| Rollout | thinking on, temp 1.0 / top_p 0.95 / top_k 20; prompt 6144 + response 8192; 15 assistant + 15 user turns; up to 10 parallel calls | same verifier and tool truncation as SFT/eval |
+| Reward | binary `trajectory_reward.py` via `grpo_reward.py` (episode text → messages → replay on a fresh DB) | parser round-trip is a preflight gate |
+| Validation | full heldout, **K=4**, temp 0.6, every epoch + step 0 | exact pass^4 from the dumps (`grpo_metrics.py`) |
+| Stop / select | informative-group share < 20 % · 2 epochs without heldout gain · 10-epoch cap → best exact pass^4 (`--select`) | nothing selected if step 0 is not beaten |
+| Memory | rollout share 0.33, dataloader workers 0, micro-batch 1 | ~95 GB peak of the 128 GB unified memory |
 
 ## Repo layout
 
@@ -325,17 +371,23 @@ data_pipeline/                   raw data -> training jsonl
 ├── build_sft_mix.py             3-leg mix (db capped via --db-caps) + stratified val split + manifest
 └── common.py                    shared helpers
 
-training_pipeline/               Stage 1 SFT · Stage 2 verl seams
+training_pipeline/               Stage 1 SFT · Stage 2 GRPO layer around verl
 ├── train_traj.py                LoRA SFT
 ├── collator_multiturn.py        assistant-only loss mask (final turns)
-├── build_grpo_pool.py           rl_train subset -> verl parquet
+├── build_grpo_pool.py           corridor measurement -> pool parquets (train / val / smoke_val) + manifest
+├── grpo_sampling.py             pool math: smoothed weights, low-variance resampling, aging (--selftest)
+├── grpo_dataset.py              CorridorDataset: verl dataset that draws by ledger weights
+├── grpo_config.py               grpo_db_bahn.yaml profile -> verl flags, memory budget, paths
+├── grpo_preflight.py            container-side gates before every run
+├── grpo_metrics.py              ledger + validation dumps -> informative share, exact pass^4, stop rule, selection
 ├── grpo_db_bahn_tools.py        the tau2 tools as verl BaseTools
 └── grpo_tool_config.yaml        verl tool registry
 
 evaluation/
 ├── trajectory_reward.py         the verifier = the Stage-2 reward
-├── grpo_reward.py               verl seam: episode text -> messages
-├── eval_report.py               per-template yield table, optional baseline delta
+├── grpo_reward.py               verl seam: episode text -> messages (+ ledger line per rollout, round-trip self-test)
+├── eval_report.py               per-template pass^k + mean table, optional baseline delta
+├── corridor_from_traces.py      k-sample rollout JSONL -> per-task success rates (the corridor file)
 ├── benchmarks/bfcl/             BFCL v4 harness glue
 │   ├── preflight.py             CPU-only gate (deps, registry, sampling, context) + run manifest
 │   ├── registry_inject.py       runtime registry entry per served model
@@ -356,9 +408,11 @@ evaluation/
 serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
 ops/                             teacher_bakeoff · gen_traces · watch_gen · toolace_backfill ·
-                                 eval_heldout · eval_bfcl · eval_tau2 · build_sft_data · traj_sft_pipeline · grpo_smoke
+                                 eval_heldout · eval_bfcl · eval_tau2 · build_sft_data · traj_sft_pipeline ·
+                                 grpo_run · grpo_export
 docker/                          GB10 sm_121 stack
-config/pipeline_config.yaml      the single config
+config/pipeline_config.yaml      SDG / SFT / eval config
+config/grpo_db_bahn.yaml         Stage-2 profiles (smoke, r1)
 data/, archive/                  [gitignored]
 ```
 
@@ -372,5 +426,8 @@ sequentially. Tool parsers differ per Qwen generation (`hermes` for Qwen3-4B/8B,
 Qwen3.6), and `--reasoning-parser` is mandatory for τ² but forbidden for BFCL/heldout (they parse
 `<think>` client-side). For Stage 2 additionally:
 `load_format=auto` (else the rollout serves random weights), `attn_implementation=sdpa` (FA2 fails
-the actor forward on sm_121) and `rollout.agent.default_agent_loop=tool_agent` (`multi_turn.enable`
-alone is a no-op). All applied in the `ops/` scripts.
+the actor forward on sm_121), `rollout.agent.default_agent_loop=tool_agent` (`multi_turn.enable`
+alone is a no-op), `multi_turn.max_parallel_calls` raised (the default 1 silently drops parallel
+tool calls), user-turn cap = assistant-turn cap (tool results count as user turns) and micro-batch 1
+(no `remove_padding` on sm_121, so larger micro-batches only pad). All applied in
+`config/grpo_db_bahn.yaml` and the `ops/` scripts.
