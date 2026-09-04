@@ -53,7 +53,7 @@ flowchart TD
     AREAL --> MIX
     MIX -->|"ops/traj_sft_pipeline.sh<br/>model-gate · train · merge"| SFT["Stage 1 — LoRA SFT"]
     SFT -->|"eval_heldout.sh SPLIT=rl_train K=8<br/>corridor_from_traces.py · build_grpo_pool.py"| POOL["RL pool<br/>(templates with unsolved tasks)"]
-    POOL -->|"ops/grpo_run.sh r1<br/>verl tool-agent loop · ledger sampler"| RL["Stage 2 — GRPO/verl"]
+    POOL -->|"ops/grpo_run.sh default &lt;run&gt;<br/>verl tool-agent loop · ledger sampler"| RL["Stage 2 — GRPO/verl"]
     SFT -->|merge_adapter.py| STUDENT["merged student"]
     RL -->|"grpo_metrics.py --select<br/>ops/grpo_export.sh"| STUDENT
     STUDENT --> AFTER["AFTER-eval (pass^4)"]
@@ -218,7 +218,9 @@ bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x
                                 #   -> checkpoint-selection (best of ep1-3)
 ```
 
-**Stage 2 — GRPO (verl)** — every knob lives in `config/grpo_db_bahn.yaml` (profiles `smoke`, `r1`).
+**Stage 2 — GRPO (verl)** — every knob lives in `config/grpo_db_bahn.yaml`. A profile is a configuration
+variant (`default`, `smoke`, `smoke_static`); the run name is given on the command line and names the run's
+folders, and each run keeps the configuration it was started with in `runs/<run>/resolved_config.json`.
 The preflight runs inside the container and blocks on pool, init fingerprint, tool registry, flags,
 reward-parser round-trip, prompt length and run state. Ledger, sampler state and dumps land in
 `data/final/grpo/runs/<run>/`, verl checkpoints in `data/final/grpo/verl_ckpt/<run>/`:
@@ -226,17 +228,17 @@ reward-parser round-trip, prompt length and run state. Ledger, sampler state and
 ```bash
 # corridor: 8 rollouts per rl_train task with the SFT model -> the templates it does not solve consistently
 SPLIT=rl_train K=8 TEMPERATURE=1.0 MLFLOW_EXPERIMENT=db_bahn_rl_corridor \
-  bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3 ep3_corridor
-python3 evaluation/corridor_from_traces.py --input data/generated/eval/db_traces_rl_train_ep3_corridor_k8.jsonl
+  bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/selected <label>
+python3 evaluation/corridor_from_traces.py --input data/generated/eval/db_traces_rl_train_<label>_k8.jsonl
 GRPO_IMAGE=agentic-grpo:verl docker compose -f docker/docker-compose.yml --profile grpo run --rm -T grpo \
-  training_pipeline/build_grpo_pool.py --corridor /app/data/generated/eval/rl_corridor_ep3_corridor_k8.json \
-  --traces /app/data/generated/eval/db_traces_rl_train_ep3_corridor_k8.jsonl --pool-id corridor_ep3_k8_20260902
+  training_pipeline/build_grpo_pool.py --corridor /app/data/generated/eval/rl_corridor_<label>_k8.json \
+  --traces /app/data/generated/eval/db_traces_rl_train_<label>_k8.jsonl --pool-id <pool-id>   # then set paths.pool_dir
 
 bash ops/grpo_run.sh smoke                         # 2-step smoke: preflight -> verl -> 24-task validation
-bash ops/grpo_run.sh r1                            # the run (tmux); rerun the same command to resume
-python3 training_pipeline/grpo_metrics.py r1 --select --mlflow   # ledger stats, exact pass^4, stop rule, `selected`
-bash ops/grpo_export.sh r1 selected                # verl checkpoint -> LoRA adapter -> merged model
-bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4b/grpo_db_bahn_r1/step_<N> after_grpo_r1
+bash ops/grpo_run.sh default <run>                 # the run (tmux); rerun the same command to resume
+python3 training_pipeline/grpo_metrics.py <run> --select   # ledger stats, exact pass^4, stop rule, `selected` (--mlflow: inside the grpo container)
+bash ops/grpo_export.sh <run> selected             # verl checkpoint -> LoRA adapter -> merged model
+bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4b/<run>/step_<N> after_<run>
 ```
 
 **In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=4 rollouts per
@@ -330,21 +332,21 @@ What `ops/traj_sft_pipeline.sh` launches:
 
 ## Training recipe (Stage 2)
 
-What `ops/grpo_run.sh r1` launches (`config/grpo_db_bahn.yaml`, profile `r1`):
+What `ops/grpo_run.sh default <run>` launches (`config/grpo_db_bahn.yaml`, profile `default` = base):
 
 | Knob | Value | Note |
 |------|-------|------|
 | Vehicle | **verl 0.8.0** (frozen image `agentic-grpo:verl`) | in-process vLLM rollout + tool-agent loop against the real tau2 env |
 | Init | merged SFT ep3 + **fresh LoRA r=16 / α=32** | the RL adapter is merged into ep3 afterwards (`ops/grpo_export.sh`) |
-| Algorithm | **Dr.GRPO** (advantage = reward − group mean), no KL (switch), lr 3e-6 | one update per step |
+| Algorithm | **Dr.GRPO** (advantage = reward − group mean), no KL (switch), lr 2e-5 with 4 warmup steps, then constant | **two updates per step**: mini-batch 8 of the 16 prompts, the PPO clip (0.2) covers the slightly off-policy second half |
 | Step / epoch | **16 prompts × 8 rollouts**; epoch = 128 draws = 8 steps | checkpoint + validation every epoch |
-| Pool | all tasks of every template with ≥1 corridor task (1–7 of 8 successes) | `build_grpo_pool.py`; 640 tasks / 32 templates for ep3 |
-| Sampling | ledger-driven weights p̂(1−p̂), low-variance resampling, aging for failed tasks; `static` switch | `CorridorDataset` (`grpo_dataset.py`) reads the ledger `grpo_reward.py` appends to |
+| Pool | all tasks of every template with ≥1 corridor task (1–7 of 8 successes) | `build_grpo_pool.py`; corridor tasks are the core, their 8/8 siblings hedge the measurement noise |
+| Sampling | ledger-driven weights p̂(1−p̂) with p̂ = 0.7·own rate + 0.3·template rate, low-variance resampling, aging for failed tasks; `static` switch | `CorridorDataset` (`grpo_dataset.py`) reads the ledger `grpo_reward.py` appends to |
 | Rollout | thinking on, temp 1.0 / top_p 0.95 / top_k 20; prompt 6144 + response 8192; 15 assistant + 15 user turns; up to 10 parallel calls | same verifier and tool truncation as SFT/eval |
 | Reward | binary `trajectory_reward.py` via `grpo_reward.py` (episode text → messages → replay on a fresh DB) | parser round-trip is a preflight gate |
 | Validation | full heldout, **K=4**, temp 0.6, every epoch + step 0 | exact pass^4 from the dumps (`grpo_metrics.py`) |
-| Stop / select | informative-group share < 20 % · 2 epochs without heldout gain · 10-epoch cap → best exact pass^4 (`--select`) | nothing selected if step 0 is not beaten |
-| Memory | rollout share 0.33, dataloader workers 0, micro-batch 1 | ~95 GB peak of the 128 GB unified memory |
+| Stop / select | informative-group share < 20 % · 3 validations without a new heldout best · 15-epoch cap → best exact pass^4 (`--select`) | applied by the watcher via `grpo_metrics.py`; nothing selected if step 0 is not beaten |
+| Memory | rollout share 0.30, validation in batches of 32 tasks, dataloader workers 0, micro-batch 1 | rollout vLLM, FSDP actor and one tau2 env per live episode share the 128 GB unified memory |
 
 ## Repo layout
 
@@ -412,7 +414,7 @@ ops/                             teacher_bakeoff · gen_traces · watch_gen · t
                                  grpo_run · grpo_export
 docker/                          GB10 sm_121 stack
 config/pipeline_config.yaml      SDG / SFT / eval config
-config/grpo_db_bahn.yaml         Stage-2 profiles (smoke, r1)
+config/grpo_db_bahn.yaml         Stage-2 config (profiles default, smoke, smoke_static)
 data/, archive/                  [gitignored]
 ```
 
