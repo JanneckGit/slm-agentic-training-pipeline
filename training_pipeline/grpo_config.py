@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Render a profile of config/grpo_db_bahn.yaml into verl Hydra flags (+ memory budget, paths).
+"""Render a profile of config/grpo_db_bahn.yaml into verl Hydra flags (+ memory budget, paths) and
+persist/load the resolved configuration of a run.
 
-    python3 training_pipeline/grpo_config.py r1 --print-flags      # one flag per line (for the runner)
-    python3 training_pipeline/grpo_config.py smoke --print-json    # resolved profile
-    python3 training_pipeline/grpo_config.py r1 --memory           # budget check
+    python3 training_pipeline/grpo_config.py default --run <run> --print-flags   # one flag per line (for the runner)
+    python3 training_pipeline/grpo_config.py smoke --print-json                  # resolved profile
+    python3 training_pipeline/grpo_config.py default --run <run> --memory        # budget check
+    python3 training_pipeline/grpo_config.py default --run <run> --write-resolved <file>   # runs/<run>/resolved_config.json
+    python3 training_pipeline/grpo_config.py --run-env <run>                     # KEY=value lines from a run's resolved config
+
+A profile is a configuration variant; the run name is the identity. Every run keeps the resolved
+configuration it was started with (`resolved_config.json`), so metrics and export read from there and
+a later change of the defaults never re-interprets an old run.
 
 Plain python3 + PyYAML. The mapping below is the single place where our settings meet verl's
 config keys; the load-bearing GB10 flags (load_format=auto, sdpa, Dr.GRPO, tool_agent loop) are
@@ -15,6 +22,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -36,8 +44,12 @@ def load_profile(profile: str, config_path: Path = CONFIG_DEFAULT, run: str | No
     if profile not in cfg["profiles"]:
         raise SystemExit(f"unknown profile {profile!r}; have {sorted(cfg['profiles'])}")
     prof = cfg["profiles"][profile] or {}
-    resolved = _deep_merge(cfg["base"], {k: v for k, v in prof.items() if k != "run"})
-    resolved["run"] = run or prof.get("run") or f"grpo_{profile}"
+    resolved = _deep_merge(cfg["base"], {k: v for k, v in prof.items() if k != "run_default"})
+    run = run or prof.get("run_default")
+    if not run:
+        raise SystemExit(f"profile {profile!r} has no default run name — give one: "
+                         f"bash ops/grpo_run.sh {profile} <run-name>")
+    resolved["run"] = run
     resolved["profile"] = profile
     resolved["image"] = cfg["image"]
     resolved["paths"] = copy.deepcopy(cfg["paths"])
@@ -66,6 +78,46 @@ def memory_budget(r: dict) -> dict:
             "total_gb": round(total, 1), "limit_gb": m["limit_gb"], "ok": total <= m["limit_gb"]}
 
 
+def resolved_config(r: dict) -> dict:
+    """What a run was started with — written to runs/<run>/resolved_config.json by ops/grpo_run.sh."""
+    import datetime
+    import subprocess
+    try:
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        head = None
+    return {"schema": 1, "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "git_head": head, "flags": render_flags(r), "resolved": r}
+
+
+def write_resolved(r: dict, path: Path) -> str:
+    """Create the file, or verify an existing one (resume): the knobs must match, else refuse."""
+    doc = resolved_config(r)
+    if path.exists():
+        old = json.loads(path.read_text()).get("resolved", {})
+        diff = [k for k in set(old) | set(doc["resolved"]) if old.get(k) != doc["resolved"].get(k) and k != "profile"]
+        if diff:
+            raise SystemExit(f"{path} exists and differs in {sorted(diff)} — a resume must use the same "
+                             f"configuration (or start a new run name)")
+        return "unchanged"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=1))
+    return "written"
+
+
+def load_run(run: str, config_path: Path = CONFIG_DEFAULT) -> dict:
+    """The resolved configuration of an existing run (host path derived from paths.runs_root)."""
+    cfg = yaml.safe_load(config_path.read_text())
+    runs_root = cfg["paths"]["runs_root"]
+    host_root = REPO / runs_root[len("/app/"):] if runs_root.startswith("/app/") else Path(runs_root)
+    f = host_root / run / "resolved_config.json"
+    if not f.exists():
+        raise SystemExit(f"no resolved_config.json for run {run!r} under {host_root} — "
+                         f"is the run name right? (runs: {sorted(p.name for p in host_root.iterdir() if p.is_dir()) if host_root.exists() else []})")
+    return json.loads(f.read_text())["resolved"]
+
+
 def render_flags(r: dict) -> list[str]:
     p, rp, t, ro, po, va = r["paths"], run_paths(r), r["train"], r["rollout"], r["pool"], r["val"]
     b = lambda x: "True" if x else "False"  # noqa: E731
@@ -77,6 +129,7 @@ def render_flags(r: dict) -> list[str]:
         # --- data + the corridor dataset ---
         f"data.train_files={rp['train_file']}",
         f"data.val_files={rp['val_file']}",
+        f"data.val_batch_size={va['batch_size']}",
         f"data.train_batch_size={t['prompts_per_step']}",
         f"data.max_prompt_length={ro['prompt_len']}",
         f"data.max_response_length={ro['response_len']}",
@@ -164,17 +217,30 @@ def render_flags(r: dict) -> list[str]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="render a GRPO profile into verl flags")
-    ap.add_argument("profile")
+    ap = argparse.ArgumentParser(description="render a GRPO profile into verl flags / read a run's resolved config")
+    ap.add_argument("profile", nargs="?", default=None)
     ap.add_argument("--config", type=Path, default=CONFIG_DEFAULT)
-    ap.add_argument("--run", default=None, help="override the run name")
+    ap.add_argument("--run", default=None, help="run name (required for profiles without run_default)")
+    ap.add_argument("--write-resolved", type=Path, default=None, help="write/verify runs/<run>/resolved_config.json")
+    ap.add_argument("--run-env", default=None, metavar="RUN", help="KEY=value lines from an existing run's resolved config")
     ap.add_argument("--print-flags", action="store_true")
     ap.add_argument("--print-json", action="store_true")
     ap.add_argument("--memory", action="store_true")
     ap.add_argument("--paths", action="store_true")
     ap.add_argument("--env", action="store_true", help="shell KEY=value lines (run, image, run_dir, ckpt_dir)")
     a = ap.parse_args()
+    if a.run_env:
+        r = load_run(a.run_env, a.config)
+        rp = run_paths(r)
+        for k, v in (("RUN", r["run"]), ("PROFILE", r.get("profile")), ("IMAGE", r["image"]), ("RUN_DIR", rp["run_dir"]),
+                     ("CKPT_DIR", rp["ckpt_dir"]), ("INIT_MODEL", r["paths"]["init_model"]), ("VAL_DUMP", rp["val_dump"])):
+            print(f"{k}={shlex.quote(str(v))}")
+        return
+    if not a.profile:
+        ap.error("profile required (or --run-env RUN)")
     r = load_profile(a.profile, a.config, a.run)
+    if a.write_resolved:
+        print(f"resolved_config: {write_resolved(r, a.write_resolved)} -> {a.write_resolved}")
     if a.print_flags:
         print("\n".join(render_flags(r)))
     if a.print_json:
@@ -185,7 +251,7 @@ def main() -> None:
         rp = run_paths(r)
         for k, v in (("RUN", r["run"]), ("IMAGE", r["image"]), ("RUN_DIR", rp["run_dir"]), ("CKPT_DIR", rp["ckpt_dir"]),
                      ("LEDGER_DIR", rp["ledger_dir"]), ("VAL_DUMP", rp["val_dump"]), ("ROLLOUT_DUMP", rp["rollout_dump"])):
-            print(f"{k}={v}")
+            print(f"{k}={shlex.quote(str(v))}")
     if a.memory:
         m = memory_budget(r)
         print(json.dumps(m))

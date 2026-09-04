@@ -7,7 +7,7 @@ Usage (tau2 venv, repo root):
         --traces   data/generated/eval/db_traces_rl_train_ep3_corridor_k8.jsonl \
         --pool-id  corridor_ep3_k8_20260902
 
-Pool design (2026-09-03, docs/stage2-RL.md):
+Pool design:
   * train.parquet — ALL 20 tasks of every template that has ≥1 corridor task (1–7 of 8 successes
     in the measurement). The corridor tasks are the core; their 8/8 "siblings" hedge the ±1/8 noise of
     an 8-rollout measurement and add ticket variety. Templates with 160/160 stay out. Each row carries
@@ -17,7 +17,7 @@ Pool design (2026-09-03, docs/stage2-RL.md):
     size costs nothing; it only spreads the draws.
   * val.parquet — the full heldout_eval split (480 tasks): verl validates on it every epoch with n=4
     → exact pass^4 from the validation dumps (training_pipeline/grpo_metrics.py).
-  * smoke_val.parquet — 24 heldout tasks (12 that ep3 failed at pass^4, 12 it passed) for the GPU smoke.
+  * smoke_val.parquet — 24 heldout tasks (12 the init model failed at pass^4, 12 it passed) for the GPU smoke.
   * pool_manifest.json — provenance (corridor sha, trace sha) and counts per template.
 
 verl schema (verified against the frozen image): the reward manager reads reward_model.ground_truth

@@ -13,7 +13,7 @@ Contract (verl custom_reward_function): extra_info carries `task` / `answer_key`
 (parquet-safe, see training_pipeline/build_grpo_pool.py). Never raises — a parse failure is a
 0.0-reward episode, not a dead training run.
 
-Stage-2 extras (2026-09-03):
+Stage-2 extras:
   * Ledger: if extra_info carries `ledger_dir`, every scored rollout appends one JSON line
     {task_id, score, ts, pid} to <ledger_dir>/<pid>.jsonl (one file per reward worker process, so
     concurrent Ray actors never interleave). training_pipeline/grpo_dataset.py reads the ledger to
@@ -22,9 +22,9 @@ Stage-2 extras (2026-09-03):
     eval traces exactly the way verl decodes an episode, parses them back and re-scores — every score
     must equal the stored one. Run it in the tau2 venv (the verifier replays on the db_bahn env).
 
-Parser fix (2026-09-03, found by the round-trip): with N parallel tool calls the old parser gave all
-N tool messages the FIRST response's text and dropped the rest → grounding false negatives on 46 % of
-ep3 rollouts. Responses are now paired with calls in order.
+Parser note: with N parallel tool calls an earlier version gave all N tool messages the FIRST response's
+text and dropped the rest → grounding false negatives. Responses are paired with calls in order; the
+round-trip self-test guards this.
 """
 
 import json

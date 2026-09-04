@@ -1,13 +1,15 @@
 # =============================================================================
-# Stage-2 GRPO on db_bahn — run configuration for the frozen verl 0.8.0 stack.
+# Stage-2 GRPO on db_bahn — configuration for the frozen verl 0.8.0 stack.
 #
-# One file, several profiles. `base` holds the decided r1 settings (docs/stage2-RL.md); a profile
-# overrides only what differs. training_pipeline/grpo_config.py renders a profile into the verl
-# Hydra flags (`--print-flags`), ops/grpo_run.sh runs it, training_pipeline/grpo_preflight.py gates it.
+# `base` holds the defaults of a real run; a profile overrides only what differs. A profile is a
+# configuration VARIANT, not a run: the run name is given on the command line (or `run_default`
+# for the smokes) and every run keeps its resolved configuration in runs/<run>/resolved_config.json.
+# training_pipeline/grpo_config.py renders a profile into the verl Hydra flags, ops/grpo_run.sh runs it,
+# training_pipeline/grpo_preflight.py gates it.
 #
-#   bash ops/grpo_run.sh smoke          # 2 steps, dynamic sampler, 24-task validation
-#   bash ops/grpo_run.sh smoke_static   # 1 step, static sampler
-#   bash ops/grpo_run.sh r1             # the first real run (needs an explicit go)
+#   bash ops/grpo_run.sh smoke                       # 2 steps, dynamic sampler, 24-task validation
+#   bash ops/grpo_run.sh smoke_static                # 1 step, static sampler
+#   bash ops/grpo_run.sh default <run-name>          # a real run; same command again = resume
 #
 # Paths are CONTAINER paths (repo mounted at /app, data at /app/data — docker/docker-compose.yml).
 # =============================================================================
@@ -15,11 +17,11 @@
 image: agentic-grpo:verl          # frozen verl 0.8.0 + vLLM cu130 nightly + tau2 (docker/Dockerfile.grpo-agentic)
 
 paths:
-  init_model: /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3   # merged SFT ep3 = RL basis
-  init_fingerprint: 521cd9dd8b805ceb     # sha256_16(config.json + safetensors index + generation_config), same fp as in docs/tau2-results-qwen3-4b.md
-  pool_dir: /app/data/final/grpo/db_bahn_pool/corridor_ep3_k8_20260902
+  init_model: /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3   # merged SFT checkpoint = RL basis
+  init_fingerprint: 521cd9dd8b805ceb     # sha256_16(config.json + safetensors index + generation_config) of init_model
+  pool_dir: /app/data/final/grpo/db_bahn_pool/corridor_ep3_k8_20260902      # build_grpo_pool.py output
   corridor_file: /app/data/generated/eval/rl_corridor_ep3_corridor_k8.json  # pool_manifest.corridor_sha256_16 must match
-  runs_root: /app/data/final/grpo/runs        # <run>/ledger, <run>/sampler, <run>/rollout_dump, <run>/val_dump
+  runs_root: /app/data/final/grpo/runs        # <run>/{resolved_config.json, ledger, sampler, rollout_dump, val_dump}
   ckpt_root: /app/data/final/grpo/verl_ckpt   # verl checkpoints: <run>/global_step_N/
   tool_config: /app/training_pipeline/grpo_tool_config.yaml
   reward_fn: /app/evaluation/grpo_reward.py
@@ -29,62 +31,65 @@ base:
   pool:                            # -> +data.grpo_* (read by CorridorDataset)
     sampling: dynamic              # dynamic = ledger-driven weights | static = corridor weights frozen
     epoch_size: 128                # draws per epoch = 8 steps x 16 prompts
-    eps: 0.005                     # weight floor (saturated tasks still get probed)
-    mix: 0.5                       # own rate : template rate = 1:1 in the smoothed p
-    max_wait: 2                    # aging: failed task not drawn for 2 epochs -> forced next epoch
+    eps: 0.005                     # weight floor (saturated tasks still get probed occasionally)
+    mix: 0.5                       # own rate : template rate = 1:1 in the smoothed success rate
+    max_wait: 2                    # aging: a failed task not drawn for 2 epochs is forced in the next one
     seed: 42
-    val_file: val.parquet          # full heldout (480 tasks)
+    val_file: val.parquet          # full heldout
   train:
     prompts_per_step: 16           # data.train_batch_size = ppo_mini_batch_size (one update per step)
     n: 8                           # rollouts per prompt = the GRPO group
-    lr: 3.0e-6                     # verl LoRA-GRPO default (SQL pilot's 1e-6 was only a nudge)
+    lr: 5.0e-6                     # LoRA policies tolerate more than the 1e-6 typical for full fine-tuning
     lora_rank: 16
     lora_alpha: 32
-    micro_bs: 1                    # actor.ppo_micro_batch_size_per_gpu — smoke 2026-09-03: micro 2 war LANGSAMER (update 392 s vs 190-226 s, kein remove_padding auf sm_121) und brauchte 42 statt 31 GB
-    logprob_micro_bs: 1            # rollout.log_prob_micro_batch_size_per_gpu (gleiche Messung: 102 s vs 66-77 s)
-    total_epochs: 10               # hard cap; the stop rule (docs/stage2-RL.md) is applied manually
-    total_training_steps: null     # null = epochs x steps/epoch (10 x 8 = 80)
-    save_freq: 8                   # = one checkpoint per epoch, aligned with test_freq
+    micro_bs: 1                    # actor.ppo_micro_batch_size_per_gpu; without remove_padding (sm_121) larger
+    logprob_micro_bs: 1            #   micro-batches only pad to the longest sequence -> slower and more memory
+    total_epochs: 15               # hard cap; the stop rule below is applied by the watcher, not by verl
+    total_training_steps: null     # null = epochs x steps/epoch
+    save_freq: 8                   # one checkpoint per epoch, aligned with test_freq
     test_freq: 8
-    val_before_train: true         # step-0 baseline = end-to-end gate against the ep3 heldout numbers
-    kl: false                      # Dr.GRPO, no KL; switch on (0.001, low_var_kl) if the 100 %-templates drift
+    val_before_train: true         # step-0 validation = baseline of the run and end-to-end gate of the reward path
+    kl: false                      # Dr.GRPO without KL; switch on (0.001, low_var_kl) if mastered templates drift
     kl_coef: 0.001
   rollout:
-    temperature: 1.0               # RL sampling as measured in the corridor run; NO repetition_penalty
+    temperature: 1.0               # RL sampling (the corridor measurement uses the same); NO repetition_penalty
     top_p: 0.95
     top_k: 20
-    gpu_memory_utilization: 0.33   # of the 128 GB unified memory (KV need measured ~25 GB at 0.45)
+    gpu_memory_utilization: 0.30   # share of the unified memory reserved by the rollout vLLM (weights + KV pool)
     max_num_seqs: 48
     max_num_batched_tokens: 8192
-    prompt_len: 6144               # policy + Arbeitsweise + template tools section + ticket = ~4.9k tokens (preflight gate)
-    response_len: 8192             # whole episode incl. tool results; longest measured 4.3k
-    max_assistant_turns: 15        # eval uses 15; kaskade/iteration_ersatz average 11-12 turns
+    prompt_len: 6144               # policy + working rules + template tools section + ticket (preflight gate)
+    response_len: 8192             # whole episode incl. tool results
+    max_assistant_turns: 15        # same cap as the heldout eval
     max_user_turns: 15             # tool-result turns count as user turns in verl's loop
-    max_parallel_calls: 10         # verl default 1 would drop ep3's parallel calls (46 % of rollouts, max 10)
+    max_parallel_calls: 10         # verl's default 1 silently drops parallel tool calls
     max_tool_response_length: 4000 # = rollout.py MAX_TOOL_CONTENT
-  val:                             # actor_rollout_ref.rollout.val_kwargs — verl default is greedy/n=1!
-    n: 4                           # -> mean@4 and (bootstrap) worst@4; exact pass^4 from val dumps
-    temperature: 0.6               # eval recipe (Qwen3 student)
+  val:                             # actor_rollout_ref.rollout.val_kwargs — verl's default is greedy, n=1
+    n: 4                           # -> mean@4 and (bootstrap) worst@4; exact pass^4 from the val dumps
+    batch_size: 32                 # tasks per validation batch (x n rollouts): every live episode holds its own
+                                   #   tau2 env in host RAM, so the whole heldout at once exhausts the memory
+    temperature: 0.6               # eval recipe
     top_p: 0.95
     top_k: 20
+  stop:                            # applied by the watcher via training_pipeline/grpo_metrics.py (verl has no early stop)
+    patience_validations: 3        # stop when the best heldout pass^4 lies >= 3 validations back
+    min_informative_share: 0.20    # stop when < 20 % of an epoch's groups carry gradient
   memory:                          # preflight budget: gmu*total + actor + overhead < limit
     total_gb: 128
-    actor_gb: 31                   # measured peak reserved (July smoke)
+    actor_gb: 31                   # FSDP actor peak (weights + LoRA + optimizer + activations)
     overhead_gb: 12                # Ray, agent-loop workers, tau2 envs, dataloader (0 workers)
     limit_gb: 110
   mlflow:
-    project: db_bahn_grpo          # MLflow experiment; run name = the run
+    project: db_bahn_grpo          # MLflow experiment; the MLflow run name = the run
 
 profiles:
-  smoke:                           # dynamic sampler, 2 steps, tiny validation (24 heldout tasks x 4)
-    run: grpo_smoke
+  default: {}                      # = base; run name required on the command line
+  smoke:                           # dynamic sampler, 2 steps, tiny validation
+    run_default: grpo_smoke
     pool: {val_file: smoke_val.parquet, epoch_size: 32}
-    train: {prompts_per_step: 8, n: 4, total_training_steps: 2, save_freq: 1, test_freq: 1,
-            micro_bs: 1, logprob_micro_bs: 1}
-  smoke_static:                    # static sampler, 1 step, micro-batch 2 (memory/speed probe: lost, see base)
-    run: grpo_smoke_static
+    train: {prompts_per_step: 8, n: 4, total_training_steps: 2, save_freq: 1, test_freq: 1}
+  smoke_static:                    # static sampler, 1 step, micro-batch 2 (memory/speed probe)
+    run_default: grpo_smoke_static
     pool: {sampling: static, val_file: smoke_val.parquet, epoch_size: 32}
     train: {prompts_per_step: 8, n: 4, total_training_steps: 1, save_freq: 1, test_freq: 1,
             micro_bs: 2, logprob_micro_bs: 2, val_before_train: false}
-  r1:
-    run: grpo_db_bahn_r1

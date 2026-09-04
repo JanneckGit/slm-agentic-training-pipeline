@@ -2,8 +2,10 @@
 # =============================================================================
 # Export a Stage-2 GRPO checkpoint: verl FSDP checkpoint -> PEFT LoRA adapter -> merged HF model.
 #
-#   bash ops/grpo_export.sh <profile> <global_step> [RUN_NAME]
-#   bash ops/grpo_export.sh r1 selected            # the step behind runs/<run>/selection.json
+#   bash ops/grpo_export.sh <run-name> <global_step>
+#   bash ops/grpo_export.sh <run-name> selected    # the step behind runs/<run>/selection.json (grpo_metrics.py --select)
+#
+# Everything about the run (init model, image, checkpoint dir) comes from runs/<run>/resolved_config.json.
 #
 # 1) verl's own merger (grpo container) reads global_step_N/actor (FSDP shard + lora_train_meta.json)
 #    and writes  db_bahn_grpo_lora_qwen3-4b/<run>/step_N/lora_adapter/  (adapter_config + safetensors).
@@ -17,14 +19,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
-PROFILE=${1:?usage: grpo_export.sh <profile> <global_step|selected> [RUN_NAME]}
-STEP=${2:?usage: grpo_export.sh <profile> <global_step|selected> [RUN_NAME]}
-RUN=${3:-}
-RUN_ARG=(); [ -n "$RUN" ] && RUN_ARG=(--run "$RUN")
+RUN=${1:?usage: grpo_export.sh <run-name> <global_step|selected>}
+STEP=${2:?usage: grpo_export.sh <run-name> <global_step|selected>}
 COMPOSE="docker compose -f docker/docker-compose.yml"
-eval "$(python3 training_pipeline/grpo_config.py "$PROFILE" "${RUN_ARG[@]}" --env)"
+eval "$(python3 training_pipeline/grpo_config.py --run-env "$RUN")"
 export GRPO_IMAGE="$IMAGE"
-INIT=$(python3 training_pipeline/grpo_config.py "$PROFILE" "${RUN_ARG[@]}" --paths | python3 -c 'import json,sys; print(json.load(sys.stdin)["init_model"])')
+INIT="$INIT_MODEL"
 
 if [ "$STEP" = "selected" ]; then
   SEL="${RUN_DIR#/app/}/selection.json"

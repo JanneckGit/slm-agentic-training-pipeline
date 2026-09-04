@@ -3,9 +3,12 @@
 validation dumps → EXACT pass^k and mean per validation step, stop-rule recommendation, checkpoint
 selection. Plain python3 (+ mlflow-skinny optional for --mlflow).
 
-    python3 training_pipeline/grpo_metrics.py r1                 # table
-    python3 training_pipeline/grpo_metrics.py r1 --mlflow        # + log to the verl run (exp db_bahn_grpo)
-    python3 training_pipeline/grpo_metrics.py r1 --select        # write selection.json + `selected` symlink
+    python3 training_pipeline/grpo_metrics.py <run>              # table
+    python3 training_pipeline/grpo_metrics.py <run> --mlflow     # + log to the verl run (run it inside the grpo container)
+    python3 training_pipeline/grpo_metrics.py <run> --select     # write selection.json + `selected` symlink
+
+The run's knobs (n, validation n, stop rule, paths) come from runs/<run>/resolved_config.json, written by
+ops/grpo_run.sh at start — never from the current YAML defaults.
 
 Why exact pass^k here and not from verl: verl's `worst@N` is a bootstrap estimate (metric_utils.py),
 i.e. a smoothed pass^k; binary rewards allow the exact value = mean over tasks of min(score over n).
@@ -30,7 +33,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from training_pipeline.grpo_config import load_profile, run_paths  # noqa: E402
+from training_pipeline.grpo_config import load_profile, load_run, run_paths  # noqa: E402
 from training_pipeline.grpo_sampling import informative_share  # noqa: E402
 
 HOST_PREFIX = "/app/"
@@ -125,15 +128,19 @@ def validation_metrics(val_dump: Path, n: int) -> list[dict]:
     return out
 
 
-def stop_recommendation(ep_rows: list[dict], vals: list[dict], min_share: float = 0.20, patience: int = 2) -> str:
+def stop_recommendation(ep_rows: list[dict], vals: list[dict], min_share: float = 0.20, patience: int = 3) -> str:
+    """STOP when (a) the last epoch's informative-group share fell below min_share, or (b) the best
+    heldout pass^k lies at least `patience` validations back (i.e. `patience` consecutive validations
+    without a new best)."""
     reasons = []
     if ep_rows and ep_rows[-1]["informative_share"] is not None and ep_rows[-1]["informative_share"] < min_share:
         reasons.append(f"informative share {ep_rows[-1]['informative_share']} < {min_share} in last epoch")
     if len(vals) >= patience + 1:
-        best = max(v["pass_k"] for v in vals)
-        recent = [v["pass_k"] for v in vals[-patience:]]
-        if all(x < best for x in recent) and vals[-patience - 1]["pass_k"] >= best:
-            reasons.append(f"heldout pass^k not improved for {patience} validations (best {best})")
+        best_i = max(range(len(vals)), key=lambda i: (vals[i]["pass_k"], vals[i]["mean"], -i))
+        since_best = len(vals) - 1 - best_i
+        if since_best >= patience:
+            reasons.append(f"heldout pass^k not improved for {since_best} validations "
+                           f"(best {vals[best_i]['pass_k']} at step {vals[best_i]['step']})")
     return "STOP: " + "; ".join(reasons) if reasons else "continue"
 
 
@@ -164,14 +171,14 @@ def select(vals: list[dict], ckpt_dir: Path, adapter_root: Path, run: str, dry: 
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("profile")
-    ap.add_argument("--run", default=None)
+    ap = argparse.ArgumentParser(description="metrics, stop rule and checkpoint selection for a GRPO run")
+    ap.add_argument("run", help="run name (runs/<run>/resolved_config.json)")
+    ap.add_argument("--profile", default=None, help="fallback: resolve the knobs from this YAML profile instead")
     ap.add_argument("--mlflow", action="store_true")
     ap.add_argument("--select", action="store_true")
     ap.add_argument("--dry", action="store_true", help="with --select: decide but write nothing")
     a = ap.parse_args()
-    r = load_profile(a.profile, run=a.run)
+    r = load_profile(a.profile, run=a.run) if a.profile else load_run(a.run)
     rp = run_paths(r)
     run_dir, val_dump, ckpt_dir = host(rp["run_dir"]), host(rp["val_dump"]), host(rp["ckpt_dir"])
     n_train, n_val = r["train"]["n"], r["val"]["n"]
@@ -180,7 +187,7 @@ def main() -> None:
     cov = coverage(run_dir)
     vals = validation_metrics(val_dump, n_val) if val_dump.exists() else []
 
-    print(f"\nrun {r['run']} ({r['profile']}) — {run_dir}")
+    print(f"\nrun {r['run']} (profile {r.get('profile')}) — {run_dir}")
     print(f"{'epoch':>5s} {'mode':>8s} {'rollouts':>8s} {'groups':>6s} {'informative':>11s} {'reward':>7s} {'forced':>6s} {'siblings':>8s}")
     for e in ep_rows:
         print(f"{e['epoch']:5d} {str(e['mode']):>8s} {e['rollouts']:8d} {e['groups']:6d} "
@@ -190,7 +197,9 @@ def main() -> None:
     print(f"\n{'val step':>8s} {'tasks':>5s} {f'pass^{n_val}':>8s} {'mean':>7s} {'rollouts':>8s}")
     for v in vals:
         print(f"{str(v['step']):>8s} {v['tasks']:5d} {v['pass_k']:8.4f} {v['mean']:7.4f} {v['rollouts']:8d}")
-    print("\nrecommendation:", stop_recommendation(ep_rows, vals))
+    stop_cfg = r.get("stop", {})
+    print("\nrecommendation:", stop_recommendation(ep_rows, vals, float(stop_cfg.get("min_informative_share", 0.20)),
+                                                   int(stop_cfg.get("patience_validations", 3))))
 
     if a.select:
         adapter_root = host(f"/app/data/final/checkpoints/db_bahn_grpo_lora_qwen3-4b/{r['run']}")

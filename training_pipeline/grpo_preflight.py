@@ -2,7 +2,7 @@
 """Preflight gates for a Stage-2 GRPO run — runs INSIDE the grpo container (CPU only), called by
 ops/grpo_run.sh before verl starts. Every gate prints OK/FAIL/INFO; any FAIL exits 1.
 
-    docker compose --profile grpo run --rm -T grpo training_pipeline/grpo_preflight.py r1
+    docker compose --profile grpo run --rm -T grpo training_pipeline/grpo_preflight.py default --run <run>
 
 Gates (docs/stage2-RL.md, Block 2):
   config      profile renders, memory budget < limit
@@ -142,6 +142,8 @@ def main() -> int:
         "no rep-pen override": not any("repetition_penalty" in f for f in flags),
         "tool_agent loop": fl.get("actor_rollout_ref.rollout.agent.default_agent_loop") == "tool_agent",
         "load_format=auto": fl.get("actor_rollout_ref.rollout.load_format") == "auto",
+        # an unbatched validation keeps every episode's tau2 env alive at once -> host OOM
+        "val batched (<=64 tasks)": 0 < int(fl.get("data.val_batch_size", 0) or 0) <= 64,
     }
     bad = [k for k, v in checks.items() if not v]
     gate("flags", not bad, "all decision values present" if not bad else f"violations: {bad}")

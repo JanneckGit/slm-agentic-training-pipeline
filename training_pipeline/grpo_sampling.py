@@ -1,6 +1,6 @@
 """Pure sampling math for the Stage-2 GRPO task pool — no verl/torch imports, testable anywhere.
 
-Why this exists (2026-09-03): GRPO learns only from prompt groups whose rollouts do NOT all agree
+Why this exists: GRPO learns only from prompt groups whose rollouts do NOT all agree
 (Dr.GRPO advantage = reward − group mean → a task the policy solves 8/8 or 0/8 contributes nothing).
 The pool builder measured every rl_train task 8× (the "corridor" run); here we turn those rates into
 draw weights and an epoch plan, and re-weight from the training ledger as the policy moves.
