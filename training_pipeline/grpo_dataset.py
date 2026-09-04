@@ -12,7 +12,7 @@ Wiring (all set by ops/grpo_run.sh):
     data.custom_cls.path=/app/training_pipeline/grpo_dataset.py  data.custom_cls.name=CorridorDataset
     +data.grpo_run_dir=/app/data/final/grpo/runs/<run>     # ledger/ + sampler/ live here
     +data.grpo_sampling=dynamic|static  +data.grpo_epoch_size=128  +data.grpo_eps=0.005
-    +data.grpo_mix=0.5  +data.grpo_max_wait=2  +data.grpo_seed=42
+    +data.grpo_mix=0.7  +data.grpo_max_wait=2  +data.grpo_seed=42
     (env GRPO_RUN_DIR / GRPO_SAMPLING are the fallback when the keys are absent)
 Requires data.dataloader_num_workers=0 (the plan lives in the trainer process; the preflight checks it).
 

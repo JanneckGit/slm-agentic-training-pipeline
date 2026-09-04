@@ -32,14 +32,20 @@ base:
     sampling: dynamic              # dynamic = ledger-driven weights | static = corridor weights frozen
     epoch_size: 128                # draws per epoch = 8 steps x 16 prompts
     eps: 0.005                     # weight floor (saturated tasks still get probed occasionally)
-    mix: 0.5                       # own rate : template rate = 1:1 in the smoothed success rate
+    mix: 0.7                       # own rate : template rate = 7:3 in the smoothed success rate (siblings of a wobbly
+                                   #   template still get probed, siblings of a mastered one fall to eps)
     max_wait: 2                    # aging: a failed task not drawn for 2 epochs is forced in the next one
     seed: 42
     val_file: val.parquet          # full heldout
   train:
-    prompts_per_step: 16           # data.train_batch_size = ppo_mini_batch_size (one update per step)
+    prompts_per_step: 16           # data.train_batch_size; optimizer updates per step = prompts_per_step / mini_batch
+    mini_batch: 8                  # actor.ppo_mini_batch_size in prompts (verl multiplies by n) -> 2 updates per step;
+                                   #   the PPO clip (0.2) covers the slightly off-policy second half
     n: 8                           # rollouts per prompt = the GRPO group
-    lr: 5.0e-6                     # LoRA policies tolerate more than the 1e-6 typical for full fine-tuning
+    lr: 2.0e-5                     # LoRA adapters need ~10x the lr of full fine-tuning (verl default 1e-6):
+                                   #   Adam moves every weight by ~lr per update, whatever the gradient size
+    warmup_steps: 4                # actor.optim.lr_warmup_steps: linear warmup, then constant (no cosine: the run
+                                   #   stops by the heldout rule and selects a checkpoint, it does not "land")
     lora_rank: 16
     lora_alpha: 32
     micro_bs: 1                    # actor.ppo_micro_batch_size_per_gpu; without remove_padding (sm_121) larger
@@ -87,7 +93,7 @@ profiles:
   smoke:                           # dynamic sampler, 2 steps, tiny validation
     run_default: grpo_smoke
     pool: {val_file: smoke_val.parquet, epoch_size: 32}
-    train: {prompts_per_step: 8, n: 4, total_training_steps: 2, save_freq: 1, test_freq: 1}
+    train: {prompts_per_step: 8, mini_batch: 4, n: 4, total_training_steps: 2, save_freq: 1, test_freq: 1}
   smoke_static:                    # static sampler, 1 step, micro-batch 2 (memory/speed probe)
     run_default: grpo_smoke_static
     pool: {sampling: static, val_file: smoke_val.parquet, epoch_size: 32}

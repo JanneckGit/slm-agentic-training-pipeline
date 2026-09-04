@@ -24,7 +24,7 @@ import random
 from dataclasses import dataclass, field
 
 EPS_DEFAULT = 0.005          # weight floor: a saturated task is still probed every ~1/ε·Σw epochs
-MIX_DEFAULT = 0.5            # weight of the task's OWN rate vs. its template's rate (1:1)
+MIX_DEFAULT = 0.7            # weight of the task's OWN rate vs. its template's rate (7:3); config/grpo_db_bahn.yaml pool.mix
 LEDGER_LAST_N = 16           # ledger scores per task used for its own rate (two 8-rollout groups)
 MAX_WAIT_EPOCHS = 2          # aging: full epochs without a draw before a failed task is forced
 N_DRAWS_DEFAULT = 128        # epoch length in prompts (= 8 steps × 16 prompts)
@@ -137,14 +137,18 @@ def informative_share(groups: list[list[float]]) -> float:
 # --- self-test: python3 training_pipeline/grpo_sampling.py --selftest ------------------------------
 def _selftest() -> None:
     rng = random.Random(0)
-    # weights from the worked examples in docs/stage2-RL.md (kaskade template rate 0.919)
+    # weights from the worked examples in docs/stage2-RL.md (kaskade template rate 0.919), all at mix 0.5
     kask = 0.919
-    assert abs(task_weight(smooth_p(0.5, kask)) - 0.206) < 0.002, task_weight(smooth_p(0.5, kask))
-    assert abs(task_weight(smooth_p(0.875, kask)) - 0.092) < 0.002
-    assert abs(task_weight(smooth_p(1.0, kask)) - 0.038) < 0.002
-    assert task_weight(smooth_p(1.0, 0.994)) == EPS_DEFAULT          # 159/160-template sibling -> floor
-    assert abs(task_weight(smooth_p(1.0, 0.981)) - 0.0094) < 0.001    # wartung_depot sibling ~ 2x floor
-    assert abs(task_weight(smooth_p(1.0, 0.787)) - 0.095) < 0.002    # refusal_nicht_machbar sibling
+    assert abs(task_weight(smooth_p(0.5, kask, 0.5)) - 0.206) < 0.002, task_weight(smooth_p(0.5, kask, 0.5))
+    assert abs(task_weight(smooth_p(0.875, kask, 0.5)) - 0.092) < 0.002
+    assert abs(task_weight(smooth_p(1.0, kask, 0.5)) - 0.038) < 0.002
+    assert task_weight(smooth_p(1.0, 0.994, 0.5)) == EPS_DEFAULT          # 159/160-template sibling -> floor
+    assert abs(task_weight(smooth_p(1.0, 0.981, 0.5)) - 0.0094) < 0.001    # wartung_depot sibling ~ 2x floor
+    assert abs(task_weight(smooth_p(1.0, 0.787, 0.5)) - 0.095) < 0.002    # refusal_nicht_machbar sibling
+    # the default mix (0.7) leans on the task's own rate: siblings lighter, corridor tasks heavier
+    assert MIX_DEFAULT == 0.7
+    assert abs(task_weight(smooth_p(1.0, kask)) - 0.024) < 0.002, task_weight(smooth_p(1.0, kask))
+    assert abs(task_weight(smooth_p(0.875, kask)) - 0.099) < 0.002, task_weight(smooth_p(0.875, kask))
     # allocate: exact total, floor/ceil bound, claim 0.8 never > 1
     w = [0.109] * 72 + [0.1875] * 32 + [0.234] * 5 + [0.25] * 7 + [0.234] * 3
     for trial in range(200):

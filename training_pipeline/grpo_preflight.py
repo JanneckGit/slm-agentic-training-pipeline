@@ -144,6 +144,10 @@ def main() -> int:
         "load_format=auto": fl.get("actor_rollout_ref.rollout.load_format") == "auto",
         # an unbatched validation keeps every episode's tau2 env alive at once -> host OOM
         "val batched (<=64 tasks)": 0 < int(fl.get("data.val_batch_size", 0) or 0) <= 64,
+        # updates per step = train_batch_size / ppo_mini_batch_size must be a whole number
+        "mini-batch divides batch": (lambda tb, mb: tb > 0 and mb > 0 and tb % mb == 0)(
+            int(fl.get("data.train_batch_size", 0) or 0), int(fl.get("actor_rollout_ref.actor.ppo_mini_batch_size", 0) or 0)),
+        "warmup set": int(fl.get("actor_rollout_ref.actor.optim.lr_warmup_steps", -1)) >= 0,
     }
     bad = [k for k, v in checks.items() if not v]
     gate("flags", not bad, "all decision values present" if not bad else f"violations: {bad}")

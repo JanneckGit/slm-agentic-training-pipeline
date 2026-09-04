@@ -47,7 +47,7 @@ import pandas as pd
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from training_pipeline.grpo_sampling import PoolTask, compute_weights  # noqa: E402
+from training_pipeline.grpo_sampling import EPS_DEFAULT, MIX_DEFAULT, PoolTask, compute_weights  # noqa: E402
 
 DATA_DIR = REPO / "data/raw/db_sandbox"
 POOL_ROOT = REPO / "data/final/grpo/db_bahn_pool"
@@ -201,7 +201,7 @@ def main() -> None:
         "n_ever_failed": sum(1 for i in train_ids if ctasks[i]["ok"] < k),
         "n_val": len(val_rows), "n_smoke_val": len(smoke_rows), "smoke_val_ids": smoke_ids,
         "signal_counts": dict(Counter(signal.get(i, "keiner") for i in train_ids)),
-        "start_weights": {"eps": 0.005, "mix": 0.5, "total": round(tot, 4),
+        "start_weights": {"eps": EPS_DEFAULT, "mix": MIX_DEFAULT, "total": round(tot, 4),
                           "share_corridor": round(sum(x for x, i in zip(w, train_ids) if ctasks[i]["corridor"]) / tot, 4)},
         "templates": per_tmpl,
         "system_prompt_sha256_16": hashlib.sha256(sys_prompt.encode()).hexdigest()[:16],

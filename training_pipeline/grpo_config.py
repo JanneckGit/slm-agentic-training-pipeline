@@ -155,7 +155,8 @@ def render_flags(r: dict) -> list[str]:
         "+actor_rollout_ref.model.override_config.attn_implementation=sdpa",
         # --- actor ---
         f"actor_rollout_ref.actor.optim.lr={t['lr']}",
-        f"actor_rollout_ref.actor.ppo_mini_batch_size={t['prompts_per_step']}",
+        f"actor_rollout_ref.actor.optim.lr_warmup_steps={t.get('warmup_steps', -1)}",   # -1 = none (verl: ratio 0)
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={t.get('mini_batch', t['prompts_per_step'])}",
         f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={t['micro_bs']}",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_coeff=0",
