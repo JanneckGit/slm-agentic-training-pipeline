@@ -26,6 +26,10 @@
 #   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  VLLM_EXTRA  TAU2PY
 #   MLFLOW_EXPERIMENT (db_bahn_traj_eval)
 #   TEMPERATURE (0.6)  TOP_P (0.95)  TOP_K (20)  MIN_P (0)  PRESENCE_PENALTY (0.0)
+#   RESUME (0)  1 = eine unterbrochene Ausgabe fortsetzen: rollout.py ueberspringt vorhandene (task, sample)-Paare;
+#               erlaubt nur, wenn die Sidecar <OUT>.meta.json (Modell, Label, Split, K, Sampling, Serve-Flags, Timeouts)
+#               exakt zu diesem Aufruf passt — sonst Abbruch VOR dem Serve. Eine halb geschriebene letzte Zeile wird verworfen.
+#   WRITE_META_ONLY (0)  1 = nur die Sidecar fuer eine vorhandene (Legacy-)Ausgabe schreiben, kein Serve, kein Rollout.
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -63,21 +67,75 @@ PRESENCE_PENALTY=${PRESENCE_PENALTY:-0.0}
 # den Vision-Encoder nicht mit und gibt KV-Pool frei. NICHT --reasoning-parser setzen — der schoebe
 # das Think in ein eigenes Feld, waehrend rollout.py es INLINE aus dem Content parst.
 VLLM_EXTRA=${VLLM_EXTRA:-}
+RESUME=${RESUME:-0}; WRITE_META_ONLY=${WRITE_META_ONLY:-0}; RESUME_SUF=""
+META="${OUT}.meta.json"
+EXPECTED_ROWS=$(( $(python3 -c 'import json,sys;print(len(json.load(open("data/raw/db_sandbox/split_tasks.json"))[sys.argv[1]]))' "$SPLIT") * K ))
+
+# Sidecar: die Identitaet eines Laufs. "identity" wird beim Resume verglichen, "info" nicht (Parallelitaet ist nur Tempo).
+meta_json() {
+  MODEL="$MODEL" LABEL="$LABEL" SPLIT="$SPLIT" K="$K" TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" TOP_K="$TOP_K" MIN_P="$MIN_P" \
+  PRESENCE_PENALTY="$PRESENCE_PENALTY" MAXLEN="${VLLM_MAX_MODEL_LEN:-20480}" GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" VLLM_EXTRA="$VLLM_EXTRA" \
+  RTO="${ROLLOUT_TIMEOUT_S:-1800}" EVAL_CONC="$EVAL_CONC" python3 - <<'PY'
+import datetime, json, os, socket
+e = os.environ
+ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int(e["K"]),
+         "temperature": float(e["TEMPERATURE"]), "top_p": float(e["TOP_P"]), "top_k": int(e["TOP_K"]), "min_p": float(e["MIN_P"]),
+         "presence_penalty": float(e["PRESENCE_PENALTY"]), "enable_thinking": True, "max_turns": 15, "max_tokens_per_turn": 3072,
+         "max_regen": 0, "max_model_len": int(e["MAXLEN"]), "gpu_util": float(e["GPU_UTIL"]), "vllm_extra": " ".join(e["VLLM_EXTRA"].split()),
+         "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
+info = {"eval_conc": int(e["EVAL_CONC"]), "created": datetime.datetime.now().isoformat(timespec="seconds"), "host": socket.gethostname()}
+print(json.dumps({"identity": ident, "info": info}, indent=1, ensure_ascii=False))
+PY
+}
 
 mkdir -p data/generated/eval logs
 export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Training-Container
 
-# Dieses Skript ist EIGENTUEMER von Teardown und rm -f (beides lag frueher im Aufrufer):
+# Dieses Skript ist EIGENTUEMER von Teardown und der Ausgabedatei (beides lag frueher im Aufrufer):
 #  - ohne Teardown bekaeme ein nachfolgendes Training keinen Speicher (vLLM haelt 0.85 x 128 GB)
-#  - ohne rm -f wuerde rollout.py in eine vorhandene Datei RESUMEN (append + skip bekannter
-#    (task_id, sample_idx)) und die Zahlen zweier Modelle vermischen
+#  - rollout.py RESUMT in eine vorhandene Datei (append + skip bekannter (task_id, sample_idx)); damit sich nie
+#    zwei Modelle unter einem Label vermischen, wird die Datei entweder frisch angelegt (Default) oder nur mit
+#    passender Sidecar fortgesetzt (RESUME=1) — geprueft VOR dem Serve.
 teardown() { $COMPOSE --profile vllm down vllm >/dev/null 2>&1; }
-trap teardown EXIT
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
 echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY"
 echo "   serving : conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'"
 echo "   limits  : eval_timeout=${EVAL_TIMEOUT}s rollout_timeout=${ROLLOUT_TIMEOUT_S:-1800}s -> $OUT"
+
+if [ "$WRITE_META_ONLY" = 1 ]; then
+  [ -f "$OUT" ] || { echo "== WRITE_META_ONLY: $OUT fehlt — abort"; exit 1; }
+  meta_json > "$META" && echo "== Sidecar geschrieben: $META ($(wc -l < "$OUT") Zeilen vorhanden)"; exit 0
+fi
+if [ "$RESUME" = 1 ]; then
+  [ -f "$OUT" ] || { echo "== RESUME: $OUT fehlt — nichts fortzusetzen (RESUME=0 fuer einen frischen Lauf) — abort"; exit 1; }
+  [ -f "$META" ] || { echo "== RESUME: Sidecar $META fehlt (Legacy-Datei) — mit den Original-Envs WRITE_META_ONLY=1 anlegen — abort"; exit 1; }
+  DIFF=$(meta_json | python3 -c '
+import json, sys
+new = json.load(sys.stdin)["identity"]; old = json.load(open(sys.argv[1]))["identity"]
+print(" ".join(sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))))' "$META")
+  [ -n "$DIFF" ] && { echo "== RESUME: Sidecar passt nicht zu diesem Aufruf — abweichende Felder: $DIFF — abort"; exit 1; }
+  REPAIR=$(python3 - "$OUT" <<'PY'
+import json, sys
+p = sys.argv[1]; lines = open(p).read().split("\n")
+if lines and lines[-1] == "": lines.pop()
+def ok(l):
+    try: json.loads(l); return True
+    except Exception: return False
+bad = [i for i, l in enumerate(lines) if not ok(l)]
+if bad and bad != [len(lines) - 1]: print(f"INVALID_MID Zeilen {[i + 1 for i in bad[:5]]}"); sys.exit(2)
+if bad: open(p, "w").write("\n".join(lines[:-1]) + "\n"); print("TRIMMED: 1 ungueltige Endzeile verworfen")
+else: print("OK")
+PY
+) || { echo "== RESUME: Ausgabe beschaedigt ($REPAIR) — abort"; exit 1; }
+  [ "$REPAIR" != OK ] && echo "   repair  : $REPAIR"
+  N_HAVE=$(wc -l < "$OUT"); RESUME_SUF="_resume"
+  echo "   resume  : $N_HAVE vorhanden, $((EXPECTED_ROWS - N_HAVE)) fehlen (Soll $EXPECTED_ROWS) — Sidecar passt"
+else
+  rm -f "$OUT" "$META"
+  meta_json > "$META"
+fi
+trap teardown EXIT
 teardown; sleep 3
 
 # NUR Standard-Transformer hier (Base 4B / merged Student) -> kein --gdn-prefill-backend,
@@ -107,7 +165,7 @@ fi
 docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
   | tail -1 | sed 's/^/   vLLM: /'
 
-rm -f "$OUT"
+# Ausgabe: frisch angelegt oder per RESUME fortgesetzt (siehe oben).
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /
 # presence 1.5), nicht das Studenten-Rezept. Fehlt ein Flag, wird still falsch evaluiert.
 # --max-regen 0 = genau ein Versuch (siehe rollout.py solve_task).
@@ -118,7 +176,7 @@ timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" --request-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
-  --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "${LABEL}${KSUF}" \
+  --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "${LABEL}${KSUF}${RESUME_SUF}" \
   --output "$OUT" 2>&1 | tee -a logs/eval_heldout.log | tail -12
 rc=${PIPESTATUS[0]}
 [ "$rc" -ne 0 ] && echo "== ROLLOUT FAILED (exit $rc; 124 = EVAL_TIMEOUT) =="

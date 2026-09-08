@@ -243,7 +243,8 @@ bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4
 
 **In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=8 rollouts per
 task** (default) over the 480 `heldout_eval` tasks, printing per-template **pass^8** and mean; `K=<n>`
-overrides it (the output file carries a `_k<K>` suffix for K≠1, the MLflow run name too):
+overrides it (the output file carries a `_k<K>` suffix for K≠1, the MLflow run name too). `RESUME=1` continues an
+interrupted run; a sidecar (`<out>.meta.json`: model, label, split, K, sampling, serve flags) must match, otherwise it aborts:
 
 ```bash
 bash ops/eval_heldout.sh Qwen/Qwen3-4B base_qwen3-4b                 # -> …_base_qwen3-4b_k8.jsonl
