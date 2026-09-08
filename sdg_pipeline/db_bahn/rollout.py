@@ -571,6 +571,9 @@ def main():
     ap.add_argument("--branch-temp-bump", type=float, default=0.2,
                     help="temperature increase for resampled tails (diversity, avoid repeating the mistake)")
     ap.add_argument("--rollout-timeout-s", type=float, default=300.0)
+    ap.add_argument("--request-timeout-s", type=float, default=600.0,
+                    help="HTTP read timeout per model call (s). Under high server concurrency a single long turn can "
+                         "exceed it and is then counted as teacher_error; evals set it to the rollout budget")
     ap.add_argument("--teacher-name", default=None, help="label written into records (bake-off table)")
     ap.add_argument("--api-base", default=None)
     ap.add_argument("--model", default=None)
@@ -668,7 +671,7 @@ def main():
         def factory(temp_bump=0.0):
             cfg = teacher_cfg if not temp_bump else {**teacher_cfg,
                                                      "temperature": teacher_cfg["temperature"] + temp_bump}
-            return make_teacher_call(cfg)
+            return make_teacher_call(cfg, timeout=args.request_timeout_s)
         return factory
 
     def work(item):

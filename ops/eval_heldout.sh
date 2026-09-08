@@ -19,6 +19,10 @@
 # Env-Overrides (Defaults in Klammern):
 #   K (8)  SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)
 #   EVAL_TIMEOUT (5400 * K = 1,5 h je Rollout-Runde, bei K=8 also 12 h)
+# Das HTTP-Lese-Timeout je Zug (rollout.py --request-timeout-s, Default 600 s) wird hier auf das Episoden-Budget
+# ROLLOUT_TIMEOUT_S gesetzt: bei hoher Server-Parallelitaet dauert ein einzelner langer Zug sonst laenger als 600 s
+# und wird als teacher_error (Score 0) gezaehlt — ein Serving-Artefakt, kein Modellfehler (2026-09-07: Teacher 4,4 %,
+# Qwen3.8-27B 30 % der Rollouts). Die Modellgrenzen (Zuege, Token je Zug, Episoden-Budget) bleiben fuer alle gleich.
 #   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  VLLM_EXTRA  TAU2PY
 #   MLFLOW_EXPERIMENT (db_bahn_traj_eval)
 #   TEMPERATURE (0.6)  TOP_P (0.95)  TOP_K (20)  MIN_P (0)  PRESENCE_PENALTY (0.0)
@@ -113,7 +117,7 @@ timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
   --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
-  --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
+  --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" --request-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
   --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "${LABEL}${KSUF}" \
   --output "$OUT" 2>&1 | tee -a logs/eval_heldout.log | tail -12
 rc=${PIPESTATUS[0]}
