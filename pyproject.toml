@@ -16,3 +16,10 @@ requires-python = ">=3.10"
 [tool.setuptools]
 # Importable stage packages (flat layout). serving/ops/tools are script dirs (run by path), not packages.
 packages = ["data_pipeline", "training_pipeline", "evaluation", "sdg_pipeline"]
+
+[tool.pytest.ini_options]
+# `pytest` from the repo root — the tests import the stage packages, so the root goes on sys.path (the
+# same PYTHONPATH=. the scripts use). The verifier suite needs the tau2 venv + the generated db_bahn
+# fixtures (tests/conftest.py skips with the regenerate command otherwise); the collator test needs torch.
+testpaths = ["tests"]
+pythonpath = ["."]
