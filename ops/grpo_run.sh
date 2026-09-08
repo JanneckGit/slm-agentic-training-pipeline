@@ -37,7 +37,7 @@ if ! docker image inspect "$GRPO_IMAGE" >/dev/null 2>&1; then
   echo "== image $GRPO_IMAGE not found (docker images); abort"; exit 1
 fi
 if [ -z "${TMUX:-}" ] && [ "$PROFILE" != "smoke" ] && [ "$PROFILE" != "smoke_static" ]; then
-  echo "== WARNING: not inside tmux — a dropped SSH session kills this run (see docs/stage2-RL.md)"
+  echo "== WARNING: not inside tmux — a dropped SSH session kills this run"
 fi
 
 # --- preflight (container, CPU) --------------------------------------------------------------------

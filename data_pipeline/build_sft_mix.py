@@ -19,7 +19,7 @@ Filters here:
     none, derived from the heldout eval). Inside a capped template the kept subset mirrors the
     (fault, replan, recovery_mode) variant mix — leftover rounding seats go to the SMALLEST strata, so
     rare recovery variants survive by construction. Fail-closed: the caps carry a sha256 of the leg
-    they were derived for; a changed leg with stale caps aborts. Rationale: docs/dataset-edits-db.md.
+    they were derived for; a changed leg with stale caps aborts.
   - Val split: stratified per-source (~val-frac), seeded; the rest is train. One shuffle (seed 42), no blocks.
 
 Output: sft_mix_chat/_val (im Normalfall LABEL-suffigiert via ops/build_sft_data.sh, das danach die

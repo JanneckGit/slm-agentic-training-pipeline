@@ -137,7 +137,7 @@ def informative_share(groups: list[list[float]]) -> float:
 # --- self-test: python3 training_pipeline/grpo_sampling.py --selftest ------------------------------
 def _selftest() -> None:
     rng = random.Random(0)
-    # weights from the worked examples in docs/stage2-RL.md (kaskade template rate 0.919), all at mix 0.5
+    # worked example: kaskade template rate 0.919, all at mix 0.5
     kask = 0.919
     assert abs(task_weight(smooth_p(0.5, kask, 0.5)) - 0.206) < 0.002, task_weight(smooth_p(0.5, kask, 0.5))
     assert abs(task_weight(smooth_p(0.875, kask, 0.5)) - 0.092) < 0.002

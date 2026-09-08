@@ -4,7 +4,7 @@ ops/grpo_run.sh before verl starts. Every gate prints OK/FAIL/INFO; any FAIL exi
 
     docker compose --profile grpo run --rm -T grpo training_pipeline/grpo_preflight.py default --run <run>
 
-Gates (docs/stage2-RL.md, Block 2):
+Gates:
   config      profile renders, memory budget < limit
   init        init model dir exists, fingerprint == config (the ep3 the heldout/tau2 numbers belong to)
   pool        parquets + manifest exist; manifest corridor sha == corridor file; row counts; roles;

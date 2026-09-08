@@ -9,7 +9,7 @@ Three bands on the single-shot heldout yield y (accept gate = evaluation/eval_re
   korridor    0.45..0.85 -> cap 250  (per-task saturation; ~median template size)
   lernkern    y <  0.45  -> uncapped (the actual learning material)
 Thresholds sit BETWEEN the discrete 10-pp steps of a 10-rollout measurement (+-18 pp noise per
-template) — finer bands would be pseudo-precision. Rationale + literature: docs/dataset-edits-db.md.
+template) — finer bands would be pseudo-precision.
 
 Hard gates: dups in the eval (resumed into a stale file) and records without a template abort.
 A leg template without (full) eval coverage is WARNED and left uncapped (cap null) — the safe
@@ -107,8 +107,7 @@ def main():
                         "band": band, "cap": BAND_CAPS[band], "n_leg": leg_counts[t]}
         if y == 0.0:
             print(f"WARN: {t} bei 0% Yield — Teacher-Traces einmal stichprobenartig pruefen "
-                  f"(lernbare Demonstration vs. Task-Defekt; Befund fuer die aktuellen zwei: "
-                  f"docs/dataset-edits-db.md)")
+                  f"(lernbare Demonstration vs. Task-Defekt)")
     for t in sorted(set(per) - set(leg_counts)):
         print(f"WARN: {t} in der Eval, aber nicht im Leg — ignoriert")
 

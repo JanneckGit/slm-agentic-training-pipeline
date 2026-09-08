@@ -16,7 +16,7 @@
 #
 # Die abgeleiteten Caps sind modellspezifisch (Bandzuteilung haengt am Basis-Yield); die Ableitung
 # traegt nur fuer faehige Basismodelle (>=4B) — bei kleinen misst der Yield Formatbeherrschung,
-# nicht Aufgabenverstaendnis (siehe docs/heldout-eval-baselines.md), die Kuerzung liefe leer.
+# nicht Aufgabenverstaendnis, die Kuerzung liefe leer.
 # Artefakte sind LABEL-suffigiert (mehrere Modelle liegen nebeneinander); die kanonischen Namen
 # (sft_mix_chat.jsonl, db_bahn_caps.json, ...) sind Symlinks, die erst NACH grünem Build in einem
 # Rutsch umgezeigt werden — ein Abbruch mittendrin lässt die alten Links intakt. Konsumenten

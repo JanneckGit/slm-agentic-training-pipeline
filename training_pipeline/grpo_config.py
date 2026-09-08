@@ -14,7 +14,7 @@ a later change of the defaults never re-interprets an old run.
 
 Plain python3 + PyYAML. The mapping below is the single place where our settings meet verl's
 config keys; the load-bearing GB10 flags (load_format=auto, sdpa, Dr.GRPO, tool_agent loop) are
-inherited from the validated SQL-era pilot (docs/text2sql-experiments/experiments-verl_RL_lora-grpo.md).
+inherited from the validated SQL-era pilot.
 """
 
 from __future__ import annotations

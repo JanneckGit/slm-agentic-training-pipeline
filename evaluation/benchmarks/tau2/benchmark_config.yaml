@@ -64,7 +64,7 @@ nl_judge:
     temperature: 0.0
 
 run:
-  num_trials: 4        # offizieller Leaderboard-Standard (docs/leaderboard-submission.md:22)
+  num_trials: 4        # offizieller Leaderboard-Standard
   seed: 300            # tau2-Default, explizit gepinnt
   max_steps: 200
   max_errors: 10

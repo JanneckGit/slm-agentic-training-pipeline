@@ -51,7 +51,7 @@ EVAL_TIMEOUT=${EVAL_TIMEOUT:-$((5400 * K))}
 EVAL_CONC=${EVAL_CONC:-21}
 
 # Sampling — Default ist das Qwen3-STUDENTEN-Rezept (Model-Card Qwen3-4B). Qwen3.5 faehrt nach dem
-# bakeoff_dev-A/B (docs/heldout-eval-baselines.md) dasselbe Rezept, braucht aber
+# bakeoff_dev-A/B dasselbe Rezept, braucht aber
 # VLLM_EXTRA=--language-model-only. Andere Familien ueberschreiben per Env, z. B. der SDG-Teacher
 # Qwen3.6 mit dem Thinking-Preset seiner Model-Card:
 #   VLLM_EXTRA="--gdn-prefill-backend triton" TEMPERATURE=1.0 PRESENCE_PENALTY=1.5 \
