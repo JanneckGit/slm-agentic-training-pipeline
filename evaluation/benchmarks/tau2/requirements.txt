@@ -1,24 +1,23 @@
-# tau2-bench harness venv (.venv-tau2bench) — Setup (Stand 2026-08-19):
+# tau2-bench-Harness-venv (.venv-tau2bench) — Spezifikation. Die eingefrorene Umgebung (jede transitive
+# Version, mit der der Benchmark gelaufen ist) liegt in requirements/tau2bench.lock.txt:
 #
-#   git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench
+#   git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench   # = TAU2_DATA_DIR
 #   python3.12 -m venv .venv-tau2bench
-#   .venv-tau2bench/bin/pip install ./data/raw/tau2-bench
-#   .venv-tau2bench/bin/pip install rank_bm25   # banking_knowledge-Retrieval; tau2 deklariert
-#                                               # die Dependency NICHT (Laufzeit-Import im
-#                                               # bm25-Indexer) — Preflight-Gate retrieval-deps
+#   .venv-tau2bench/bin/pip install --no-deps -r requirements/tau2bench.lock.txt
 #
-# Warum Install aus dem lokalen Checkout statt einer Zeile hier: derselbe gepinnte
-# Checkout ist Code-Quelle UND Datenquelle (TAU2_DATA_DIR=data/raw/tau2-bench/data —
-# tau2s Loader haengen selbst tau2/domains/… an).
-# Ein Stand fuer beides = kein Drift zwischen Paketversion und Task-Daten. Der
-# Preflight gated den Checkout-Commit (v1.0.1 = fc0055dc4e0a316c3f83133267fbd6faaa770992)
-# und die Paketversion (1.0.1) hart.
+# Die zwei Zeilen unten sind dieselbe Umgebung UNgefroren (`pip install -r` dieser Datei): tau2 aus dem
+# v1.0.1-Commit gebaut plus rank_bm25 fuer das banking_knowledge-Retrieval, das tau2 nicht deklariert
+# (Laufzeit-Import im bm25-Indexer — Preflight-Gate retrieval-deps).
+tau2 @ git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992
+rank_bm25
+
+# Warum der Checkout trotzdem bleibt: derselbe gepinnte Checkout ist die Datenquelle
+# (TAU2_DATA_DIR=data/raw/tau2-bench/data — tau2s Loader haengen selbst tau2/domains/… an).
+# Ein Stand fuer beides = kein Drift zwischen Paketversion und Task-Daten. Der Preflight gated den
+# Checkout-Commit (v1.0.1 = fc0055dc4e0a316c3f83133267fbd6faaa770992) und die Paketversion (1.0.1) hart.
 #
 # v1.0.1 ist Pflicht, nicht Kosmetik: das Release aendert das banking_knowledge-Grading
 # (CHANGELOG: Scores <1.0.1 vs. >=1.0.1 dort NICHT vergleichbar).
 #
-# Bewusst getrennt von .venv-tau2 (tau2 1.0.0): das nutzen validate_areal + der
-# (bald neu gebaute) GRPO-Code als Bibliothek — Benchmark-Harness und Trainingscode
-# teilen sich kein venv (BFCL-Konvention).
-#
-# Diese Datei ist Doku/Reproduzierbarkeit; sie wird nicht direkt pip-installiert.
+# Bewusst getrennt von .venv-tau2 (tau2 1.0.0): das nutzen rollout/eval/validate_areal und der GRPO-Code
+# als Bibliothek — Benchmark-Harness und Trainingscode teilen sich kein venv (BFCL-Konvention).

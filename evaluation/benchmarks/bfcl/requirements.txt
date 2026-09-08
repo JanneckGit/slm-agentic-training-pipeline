@@ -7,6 +7,8 @@
 #   .venv-bfcl/bin/pip install "numpy>=2.0"      # <- see NUMPY below
 #
 # `evaluation/benchmarks/bfcl/preflight.py` checks both and names the fix if either is missing.
+# Frozen environment (all pins incl. the numpy override; aarch64 snapshot): requirements/bfcl.lock.txt
+#   `pip install --no-deps -r requirements/bfcl.lock.txt` replaces both steps (README, OOD section).
 bfcl-eval==2026.3.23
 # The 2026.3.23 PyPI release imports qwen_agent -> soundfile but does not declare it (CLI import crash without).
 soundfile
