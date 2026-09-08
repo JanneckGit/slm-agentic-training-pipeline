@@ -8,6 +8,7 @@
 ![serving vLLM](https://img.shields.io/badge/serving-vLLM-4B8BBE)
 ![hardware GB10 DGX Spark](https://img.shields.io/badge/hardware-GB10%20DGX%20Spark-76B900)
 ![training SFT LoRA + GRPO](https://img.shields.io/badge/training-SFT%20LoRA%20%2B%20GRPO-E8710A)
+![tests](https://github.com/JanneckGit/slm-agentic-training-pipeline/actions/workflows/tests.yml/badge.svg)
 
 ## What is this?
 
@@ -86,7 +87,7 @@ flowchart TD
   ([evaluation/trajectory_reward.py](evaluation/trajectory_reward.py)): DB-state hash +
   tool-grounding + anti-hallucination + refusal gates (`no_write`, `no_forbidden`). Only
   `accepted()` trajectories survive; `format_traj` additionally drops truncated/degenerate/≥3×-call
-  traces. Self-test: 21 cases.
+  traces. Scenario suite: 21 cases (`tests/test_trajectory_reward.py`, `bash ops/run_tests.sh`).
 
 **Tools (13)**
 
@@ -121,21 +122,23 @@ host.
 git clone https://github.com/JanneckGit/slm-agentic-training-pipeline.git
 cd slm-agentic-training-pipeline
 
-# τ²-bench dependency, isolated in its own venv (the git clone below is tau2-bench, not this repo;
-# runtime dep of the db_bahn domain — the τ²-bench OOD benchmark pins its own newer checkout, see OOD section)
+# τ²-bench dependency, isolated in its own venv, installed from the frozen lock: tau2 1.0.0 @ 1901a30
+# built from GitHub + every transitive version this pipeline was run with (+ pytest for the tests).
+# Runtime dep of the db_bahn domain — the τ²-bench OOD benchmark pins its own newer checkout, see OOD section.
 python3.12 -m venv .venv-tau2
-git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau2-bench
-git -C /tmp/tau2-bench checkout 1901a30        # the pinned commit — HEAD may have drifted
-./.venv-tau2/bin/pip install /tmp/tau2-bench
+./.venv-tau2/bin/pip install --no-deps -r requirements/tau2.lock.txt
+# upgrading instead: pip install a newer tau2-bench checkout, then `bash ops/freeze_venvs.sh` refreshes the locks
 ```
 
 Rollout/eval scripts default to `.venv-tau2/` (override with `TAU2PY=/path/to/python`); the data
 chain (`ops/build_sft_data.sh`) runs on host `python3`. Two more venvs exist only for the optional
-OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections). Two configs, no secrets:
+OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections); all three are frozen in
+`requirements/*.lock.txt` (`bash ops/freeze_venvs.sh` refreshes them). Two configs, no secrets:
 `config/pipeline_config.yaml` (SDG / SFT / eval) and `config/grpo_db_bahn.yaml` (Stage 2) — the teacher
 is local vLLM and all models are public. The first serve pulls weights
 into the `hf_cache` volume (bind path set at the bottom of `docker/docker-compose.yml`, default
-`/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB.
+`/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB. `HF_TOKEN` is optional
+(all models are public); Compose reads it from `docker/.env` — template in `docker/.env.example`.
 
 **Data prerequisites.** The GTFS snapshot ships with the repo (`data/raw/db_sandbox/gtfs_de_fv/` —
 frozen gtfs.de *de_fv* feed of 2026-06-27, 2.8 MB, © gtfs.de / DELFI e.V., CC-BY-4.0). It anchors
@@ -168,10 +171,11 @@ PYTHONPATH=. ./.venv-tau2/bin/python sdg_pipeline/db_bahn/gen_tasks.py --seed 42
 PYTHONPATH=. ./.venv-tau2/bin/python sdg_pipeline/db_bahn/rollout.py \
   --dry-run --split bakeoff_dev --max-turns 15 --output /tmp/oracle_smoke.jsonl
 
-# selftests
-PYTHONPATH=. ./.venv-tau2/bin/python evaluation/trajectory_reward.py     # verifier (21 cases)
-docker compose -f docker/docker-compose.yml run --rm -T training \
-  python3 training_pipeline/collator_multiturn.py                        # loss-mask golden test
+# tests — pytest in the tau2 venv (verifier scenario suite, sampler, backfill) + the loss-mask golden
+# test in the training container, started GPU-free (docker/docker-compose.cpu.yml — a test run never
+# touches the shared GPU); SKIP_CONTAINER=1 runs the pytest part alone. CI runs the same from
+# requirements/tau2.lock.txt (.github/workflows/tests.yml).
+bash ops/run_tests.sh
 ```
 
 **GPU** (sequential — GB10 has no MIG, serve one model at a time):
@@ -255,13 +259,13 @@ python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]
 call this same script, so those numbers are comparable by construction.
 
 **OOD benchmark (BFCL v4)** — external harness in its own venv, driven by one ops script per model.
-Setup is **three steps** (the `numpy` upgrade is not optional — without it `faiss` fails to import on
-aarch64/py3.12 and the whole `memory` group drops out; step three feeds `memory_vector` — the
-preflight gates it):
+Setup is **two steps**: the frozen venv (it carries the `numpy>=2` override — without it `faiss` fails
+to import on aarch64/py3.12 and the whole `memory` group drops out) and the embedding model that feeds
+`memory_vector` — the preflight gates both:
 
 ```bash
-python3.12 -m venv .venv-bfcl && .venv-bfcl/bin/pip install -r evaluation/benchmarks/bfcl/requirements.txt
-.venv-bfcl/bin/pip install "numpy>=2.0"
+python3.12 -m venv .venv-bfcl && .venv-bfcl/bin/pip install --no-deps -r requirements/bfcl.lock.txt
+#   (unfrozen: pip install -r evaluation/benchmarks/bfcl/requirements.txt && pip install "numpy>=2.0")
 docker compose -f docker/docker-compose.yml run --rm -T sdg python3 -c \
   "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"
 ```
@@ -289,13 +293,13 @@ resume is the same command — run it in tmux.
 
 **OOD benchmark (τ²-bench)** — the main before/after yardstick around GRPO: multi-turn
 conversations against an LLM user simulator (dual control), pass^k over 4 trials. Setup is one
-pinned checkout serving as both package source and task data (`TAU2_DATA_DIR`); the preflight
-gates commit, task counts and a data fingerprint:
+pinned checkout as task data (`TAU2_DATA_DIR`) plus the frozen venv (tau2 built from the same v1.0.1
+commit); the preflight gates commit, package version, task counts and a data fingerprint:
 
 ```bash
-git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench
-python3.12 -m venv .venv-tau2bench && .venv-tau2bench/bin/pip install ./data/raw/tau2-bench
-.venv-tau2bench/bin/pip install rank_bm25    # banking retrieval — tau2 doesn't declare it; the preflight gates it
+git clone --branch v1.0.1 --depth 1 https://github.com/sierra-research/tau2-bench data/raw/tau2-bench   # = TAU2_DATA_DIR
+python3.12 -m venv .venv-tau2bench && .venv-tau2bench/bin/pip install --no-deps -r requirements/tau2bench.lock.txt
+#   (frozen: tau2 1.0.1 from the v1.0.1 commit + rank_bm25 for banking retrieval — the preflight gates both)
 ```
 
 ```bash
@@ -412,8 +416,11 @@ serving/merge_adapter.py         LoRA -> merged sharded model
 tools/quantize_fp8.py            FP8 deploy quantization
 ops/                             teacher_bakeoff · gen_traces · watch_gen · toolace_backfill ·
                                  eval_heldout · eval_bfcl · eval_tau2 · build_sft_data · traj_sft_pipeline ·
-                                 grpo_run · grpo_export
-docker/                          GB10 sm_121 stack
+                                 grpo_run · grpo_export · run_tests · freeze_venvs
+tests/                           pytest — verifier scenario suite (21 cases) + wrappers for the three module self-tests
+requirements/                    frozen venvs (tau2 · tau2bench · bfcl): pip install --no-deps -r …; ops/freeze_venvs.sh refreshes
+.github/workflows/tests.yml      CI — the same tests from the tau2 lock (fixtures regenerated + cached) + the collator job
+docker/                          GB10 sm_121 stack · docker-compose.cpu.yml = GPU-free override for the test runner
 config/pipeline_config.yaml      SDG / SFT / eval config
 config/grpo_db_bahn.yaml         Stage-2 config (profiles default, smoke, smoke_static)
 data/, archive/                  [gitignored]
