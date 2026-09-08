@@ -3,7 +3,7 @@
 #
 # Per candidate: (bg-download next) -> serve via compose vllm -> health-wait -> coherence pre-check
 # -> 12 stratified bakeoff_dev tasks x k=1 through rollout.py + verifier (hard 25-min cap)
-# -> teardown -> update docs/teacher-bakeoff.md.  Candidates that fail to serve/eval are logged and
+# -> teardown -> update the results table (BAKEOFF_DOC).  Candidates that fail to serve/eval are logged and
 # SKIPPED (agentic error policy: try, record, move on).  Resume-safe: completed candidates are skipped.
 #
 # Usage: bash ops/teacher_bakeoff.sh [start_index]
@@ -13,6 +13,7 @@ REPO=$(pwd)
 COMPOSE="docker compose -f docker/docker-compose.yml"
 TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 N_TASKS=12; K=1; MAX_TURNS=8; MAXTOK=2048; EVAL_TIMEOUT=1500; HEALTH_TIMEOUT=900
+BAKEOFF_DOC=${BAKEOFF_DOC:-data/generated/sdg/teacher-bakeoff.md}   # results table, next to the traces it aggregates
 mkdir -p logs data/generated
 
 # short|model|extra vllm args (incl. --max-num-seqs)|gpu_util|max_len|omit_thinking_kwarg(0/1)|maxtok_per_turn
@@ -101,9 +102,9 @@ for i in "${!CANDIDATES[@]}"; do
     --concurrency 4 --output "$TRACE" $OMITFLAG 2>&1 | tail -12 | tee -a "$LOG"
 
   teardown
-  env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write | tail -3
+  env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write "$BAKEOFF_DOC" | tail -3
 done
 
 wait  # drain background downloads
 echo "== BAKE-OFF DONE =="
-env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write
+env PYTHONPATH="$REPO" python3 sdg_pipeline/db_bahn/bakeoff_summary.py --write "$BAKEOFF_DOC"

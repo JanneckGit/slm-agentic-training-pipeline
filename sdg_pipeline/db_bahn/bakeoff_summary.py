@@ -2,7 +2,8 @@
 sdg_pipeline/db_bahn/bakeoff_summary.py
 =======================================
 Aggregate all bake-off trace files (data/generated/sdg/db_traces_bakeoff_dev_*.jsonl) into per-teacher
-metrics and print/update the markdown table for docs/teacher-bakeoff.md.
+metrics and print the markdown table; `--write PATH` replaces the "## Results" section of that markdown
+file (created if missing).
 
 Metrics per teacher (the plan's protocol): verified-yield %, German-quality proxy, replan-rate on
 injected tasks, avg turns, tool-call validity, avg wall s/rollout, traces/GPU-h, score =
@@ -16,6 +17,7 @@ import glob
 import json
 import re
 import sys
+from pathlib import Path
 
 from data_pipeline.common import final_answer
 
@@ -27,6 +29,18 @@ UMLAUT = re.compile(r"[äöüÄÖÜß]")
 
 def german_score(text: str) -> bool:
     return len(GERMAN_WORDS.findall(text or "")) >= 2 or bool(UMLAUT.search(text or ""))
+
+
+def write_table(doc: str, table: str) -> None:
+    """Replace the '## Results' section of `doc` with `table`; a missing file is created with both markers."""
+    marker, nxt = "## Results", "## Winner + validation"
+    path = Path(doc)
+    content = path.read_text() if path.exists() else f"# Teacher bake-off\n\n{marker}\n\n{nxt}\n"
+    pre = content.split(marker)[0]
+    post = content.split(nxt)[1] if nxt in content else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(pre + marker + "\n\n" + table + "\n\n" + nxt + post)
+    print(f"\nwrote table -> {doc}")
 
 
 def main():
@@ -74,14 +88,10 @@ def main():
     table = "\n".join(lines)
     print(table)
     if "--write" in sys.argv:
-        doc = "docs/teacher-bakeoff.md"
-        content = open(doc).read()
-        marker = "## Results"
-        nxt = "## Winner + validation"
-        pre = content.split(marker)[0]
-        post = content.split(nxt)[1] if nxt in content else ""
-        open(doc, "w").write(pre + marker + "\n\n" + table + "\n\n" + nxt + post)
-        print(f"\nwrote table -> {doc}")
+        i = sys.argv.index("--write")
+        if i + 1 >= len(sys.argv):
+            sys.exit("--write needs a PATH (markdown file whose '## Results' section is replaced)")
+        write_table(sys.argv[i + 1], table)
 
 
 if __name__ == "__main__":
