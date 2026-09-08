@@ -25,7 +25,7 @@ Two training stages, both grounded in the same domain:
 2. **Stage 2 — GRPO/verl RL** against the same db_bahn tools, reward = the same deterministic
    trajectory verifier. The pool is measured, not assumed: every `rl_train` task is rolled 8× with the
    SFT model, the templates it does not solve consistently form the pool, and a ledger re-weights the
-   tasks while training. Success metric: heldout **pass^4**.
+   tasks while training. Success metric: heldout **pass^8**.
 
 ## Architecture
 
@@ -56,7 +56,7 @@ flowchart TD
     POOL -->|"ops/grpo_run.sh default &lt;run&gt;<br/>verl tool-agent loop · ledger sampler"| RL["Stage 2 — GRPO/verl"]
     SFT -->|merge_adapter.py| STUDENT["merged student"]
     RL -->|"grpo_metrics.py --select<br/>ops/grpo_export.sh"| STUDENT
-    STUDENT --> AFTER["AFTER-eval (pass^4)"]
+    STUDENT --> AFTER["AFTER-eval (pass^8)"]
     STUDENT --> BFCL["OOD — BFCL v4"]
     STUDENT --> TAU2["OOD — τ²-bench"]
     EVAL -.->|"baseline Δ"| AFTER
@@ -104,7 +104,7 @@ template** — so every class is individually measurable)
 |-------|-------|------|---------|
 | `sft_train` | 13,948 | rest | teacher rollouts → SFT traces |
 | `rl_train` | 960 | 20 / template | corridor measurement (8 rollouts / task) → Stage-2 pool |
-| `heldout_eval` | 480 | 10 / template | before/after pass^4 eval (K=4) + source of the db-leg caps + verl validation set |
+| `heldout_eval` | 480 | 10 / template | before/after pass^8 eval (K=8) + source of the db-leg caps + verl validation set |
 | `bakeoff_dev` | 48 | 1 / template | smoke/dev subset (⊆ `sft_train`) |
 
 ## Setup
@@ -236,17 +236,17 @@ GRPO_IMAGE=agentic-grpo:verl docker compose -f docker/docker-compose.yml --profi
 
 bash ops/grpo_run.sh smoke                         # 2-step smoke: preflight -> verl -> 24-task validation
 bash ops/grpo_run.sh default <run>                 # the run (tmux); rerun the same command to resume
-python3 training_pipeline/grpo_metrics.py <run> --select   # ledger stats, exact pass^4, stop rule, `selected` (--mlflow: inside the grpo container)
+python3 training_pipeline/grpo_metrics.py <run> --select   # ledger stats, exact pass^8, stop rule, `selected` (--mlflow: inside the grpo container)
 bash ops/grpo_export.sh <run> selected             # verl checkpoint -> LoRA adapter -> merged model
 bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4b/<run>/step_<N> after_<run>
 ```
 
-**In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=4 rollouts per
-task** (default) over the 480 `heldout_eval` tasks, printing per-template **pass^4** and mean; `K=1`
-reproduces the old single-shot files:
+**In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=8 rollouts per
+task** (default) over the 480 `heldout_eval` tasks, printing per-template **pass^8** and mean; `K=<n>`
+overrides it (the output file carries a `_k<K>` suffix for K≠1, the MLflow run name too):
 
 ```bash
-bash ops/eval_heldout.sh Qwen/Qwen3-4B base_think                    # -> …_base_think_k4.jsonl
+bash ops/eval_heldout.sh Qwen/Qwen3-4B base_qwen3-4b                 # -> …_base_qwen3-4b_k8.jsonl
 python3 evaluation/eval_report.py --input <eval.jsonl> [--baseline <eval.jsonl>]   # re-report / delta (pass^k for k>1)
 ```
 
@@ -344,9 +344,9 @@ What `ops/grpo_run.sh default <run>` launches (`config/grpo_db_bahn.yaml`, profi
 | Sampling | ledger-driven weights p̂(1−p̂) with p̂ = 0.7·own rate + 0.3·template rate, low-variance resampling, aging for failed tasks; `static` switch | `CorridorDataset` (`grpo_dataset.py`) reads the ledger `grpo_reward.py` appends to |
 | Rollout | thinking on, temp 1.0 / top_p 0.95 / top_k 20; prompt 6144 + response 8192; 15 assistant + 15 user turns; up to 10 parallel calls | same verifier and tool truncation as SFT/eval |
 | Reward | binary `trajectory_reward.py` via `grpo_reward.py` (episode text → messages → replay on a fresh DB) | parser round-trip is a preflight gate |
-| Validation | full heldout, **K=4**, temp 0.6, every epoch + step 0 | exact pass^4 from the dumps (`grpo_metrics.py`) |
-| Stop / select | informative-group share < 20 % · 3 validations without a new heldout best · 15-epoch cap → best exact pass^4 (`--select`) | applied by the watcher via `grpo_metrics.py`; nothing selected if step 0 is not beaten |
-| Memory | rollout share 0.30, validation in batches of 32 tasks, dataloader workers 0, micro-batch 1 | rollout vLLM, FSDP actor and one tau2 env per live episode share the 128 GB unified memory |
+| Validation | full heldout, **K=8**, temp 0.6, every epoch + step 0 | exact pass^8 from the dumps (`grpo_metrics.py`) |
+| Stop / select | informative-group share < 20 % · 3 validations without a new heldout best · 15-epoch cap → best exact pass^8 (`--select`) | applied by the watcher via `grpo_metrics.py`; nothing selected if step 0 is not beaten |
+| Memory | rollout share 0.30, validation in batches of 16 tasks (128 live episodes), dataloader workers 0, micro-batch 1 | rollout vLLM, FSDP actor and one tau2 env per live episode share the 128 GB unified memory |
 
 ## Repo layout
 
@@ -381,7 +381,7 @@ training_pipeline/               Stage 1 SFT · Stage 2 GRPO layer around verl
 ├── grpo_dataset.py              CorridorDataset: verl dataset that draws by ledger weights
 ├── grpo_config.py               grpo_db_bahn.yaml profile -> verl flags, memory budget, paths
 ├── grpo_preflight.py            container-side gates before every run
-├── grpo_metrics.py              ledger + validation dumps -> informative share, exact pass^4, stop rule, selection
+├── grpo_metrics.py              ledger + validation dumps -> informative share, exact pass^8, stop rule, selection
 ├── grpo_db_bahn_tools.py        the tau2 tools as verl BaseTools
 └── grpo_tool_config.yaml        verl tool registry
 

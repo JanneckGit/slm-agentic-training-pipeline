@@ -8,7 +8,7 @@ score==1.0 AND not truncated AND not degenerate.
 Counts are shown next to the percentage on purpose: heldout_eval has 10 rollouts per template, so a
 single flip moves the number by 10 pp — a bare percentage would fake a precision that is not there.
 
-k > 1 (since 2026-09-02, ops/eval_heldout.sh default K=4): `yield` is then the MEAN over all
+k > 1 (ops/eval_heldout.sh default K=8): `yield` is then the MEAN over all
 task×sample rollouts (= a lower-noise pass@1, comparable to the old k=1 files), and an extra
 `pass^k` column counts a task only if ALL k of its samples are accepted (consistency measure, the
 same pass^k τ²-bench reports). Tasks with fewer than k samples (interrupted run) are excluded from

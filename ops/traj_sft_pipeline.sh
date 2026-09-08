@@ -3,7 +3,8 @@
 # Der BEFORE-Eval liegt NICHT mehr hier: ops/build_sft_data.sh erzeugt ihn (skip-if-exists) und
 # nutzt ihn doppelt — als Vergleichsbasis UND als Quelle der db_bahn-Template-Caps im Mix.
 # Sequential (GB10 has no MIG). Eval = rollout.py on the heldout_eval tasks through the same verifier
-# (before = Basis aus build_sft_data.sh, after = merged student). Logs to logs/traj_sft.log.
+# (before = Basis aus build_sft_data.sh, after = merged student), K rollouts per task (ops/eval_heldout.sh
+# default 8 -> 3 epochs x 3.840 rollouts, ~12 h on the 4B). Logs to logs/traj_sft.log.
 # BASE wird HART gegen das Mix-Manifest gegatet (sft_mix_manifest.json traegt den vollen
 # Modellstring aus build_sft_data.sh) — Training auf dem Mix eines anderen Modells bricht ab.
 set -uo pipefail
@@ -49,8 +50,9 @@ CKPT_LABEL="${MIX_LABEL#base_}"
 MERGED_HOST="data/final/checkpoints/db_bahn_traj_merged_${CKPT_LABEL}"
 MERGED_CTR="/app/${MERGED_HOST}"
 ADAPTER="data/final/checkpoints/db_bahn_traj_lora_${CKPT_LABEL}"
-AFTER="data/generated/eval/db_traces_heldout_after_${CKPT_LABEL}"   # + _ep{N}.jsonl bzw. .jsonl
-echo "   Checkpoints: ${MERGED_HOST} + ${ADAPTER}  |  After: ${AFTER}_ep{N}.jsonl"
+K=${K:-8}; export K; KSUF=""; [ "$K" -ne 1 ] && KSUF="_k${K}"          # Dateisuffix wie in eval_heldout.sh
+AFTER="data/generated/eval/db_traces_heldout_after_${CKPT_LABEL}"   # + _ep{N}${KSUF}.jsonl bzw. ${KSUF}.jsonl
+echo "   Checkpoints: ${MERGED_HOST} + ${ADAPTER}  |  After: ${AFTER}_ep{N}${KSUF}.jsonl (K=$K)"
 
 echo "== [1/3] TRAIN traj_sft ($(wc -l < "$DATA" 2>/dev/null || echo '?') traces, $EPOCHS epochs, LoRA @12288) =="
 # --save-epoch-adapters -> ${ADAPTER}/ep{1..N} for checkpoint selection; --neftune 5 = noisy-embedding reg.
@@ -69,17 +71,17 @@ for EP in $(seq 1 "$EPOCHS"); do
     --config config/pipeline_config.yaml 2>&1 | tail -4
 done
 
-echo "== [3/3] AFTER-eval: eval ALL $EPOCHS epochs on heldout_eval, keep the highest verified_yield =="
+echo "== [3/3] AFTER-eval: eval ALL $EPOCHS epochs on heldout_eval (K=$K), keep the highest verified_yield =="
 for EP in $(seq 1 "$EPOCHS"); do
   bash ops/eval_heldout.sh "${MERGED_CTR}/ep${EP}" "after_${CKPT_LABEL}_ep${EP}" \
-    "${AFTER}_ep${EP}.jsonl" \
+    "${AFTER}_ep${EP}${KSUF}.jsonl" \
     || echo "== AFTER-eval ep${EP} FAILED"
 done
 
 # checkpoint selection: same accept gate as the eval report (score==1.0 AND not truncated AND not
 # degenerate) — a bare score==1.0 would prefer the checkpoint that produces MORE think-loops, and with
 # single-shot evals those gates finally fire. Tie -> hoechste Epoche.
-WINNER=$(EPOCHS="$EPOCHS" AFTER="$AFTER" python3 - <<'PY'
+WINNER=$(EPOCHS="$EPOCHS" AFTER="$AFTER" KSUF="$KSUF" python3 - <<'PY'
 import json, os, sys
 def vyield(p):
     n = y = 0
@@ -96,8 +98,8 @@ def vyield(p):
         return -1.0, 0, 0
     return (y / n if n else 0.0), y, n
 eps = range(1, int(os.environ["EPOCHS"]) + 1)
-base = os.environ["AFTER"]
-res = {ep: vyield(f"{base}_ep{ep}.jsonl") for ep in eps}
+base = os.environ["AFTER"]; ksuf = os.environ.get("KSUF", "")
+res = {ep: vyield(f"{base}_ep{ep}{ksuf}.jsonl") for ep in eps}
 sys.stderr.write("  |  ".join(f"ep{ep} verified_yield={res[ep][0]:.3f} ({res[ep][1]}/{res[ep][2]})"
                               for ep in eps) + "\n")
 print(max(eps, key=lambda ep: (res[ep][0], ep)))
@@ -110,7 +112,7 @@ echo "== checkpoint selection: EPOCH $WINNER wins -> 'selected' symlinks =="
 $COMPOSE run --rm -T training bash -c "
   ln -sfn 'ep${WINNER}' '${MERGED_CTR}/selected' &&
   ln -sfn 'ep${WINNER}' '/app/${ADAPTER}/selected' && echo 'selected -> ep${WINNER} (merged + adapter)'" 2>&1 | tail -1
-cp -f "${AFTER}_ep${WINNER}.jsonl" "${AFTER}.jsonl"
+cp -f "${AFTER}_ep${WINNER}${KSUF}.jsonl" "${AFTER}${KSUF}.jsonl"
 echo "   servable model: ${MERGED_HOST}/selected   |   adapter: ${ADAPTER}/selected"
 
 echo "==== PHASE 6 DONE $(date) ===="

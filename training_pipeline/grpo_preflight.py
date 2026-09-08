@@ -66,7 +66,7 @@ def main() -> int:
     ap.add_argument("--run", default=None)
     ap.add_argument("--roundtrip-limit", type=int, default=200)
     ap.add_argument("--roundtrip-file", type=Path,
-                    default=REPO / "data/generated/eval/db_traces_heldout_eval_after_qwen3-4b_ep3_k4.jsonl")
+                    default=REPO / "data/generated/eval/db_traces_heldout_eval_after_qwen3-4b_ep3_k8.jsonl")
     a = ap.parse_args()
 
     r = load_profile(a.profile, run=a.run)

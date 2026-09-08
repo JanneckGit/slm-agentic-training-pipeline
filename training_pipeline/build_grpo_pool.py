@@ -15,9 +15,9 @@ Pool design:
     keiner — which verifier component failed) for training_pipeline/grpo_dataset.py, which turns them
     into draw weights (see grpo_sampling.py). Compute per step is fixed (128 draws/epoch), so the pool
     size costs nothing; it only spreads the draws.
-  * val.parquet — the full heldout_eval split (480 tasks): verl validates on it every epoch with n=4
-    → exact pass^4 from the validation dumps (training_pipeline/grpo_metrics.py).
-  * smoke_val.parquet — 24 heldout tasks (12 the init model failed at pass^4, 12 it passed) for the GPU smoke.
+  * val.parquet — the full heldout_eval split (480 tasks): verl validates on it every epoch with n=8
+    → exact pass^8 from the validation dumps (training_pipeline/grpo_metrics.py).
+  * smoke_val.parquet — 24 heldout tasks (12 the init model failed at pass^k, 12 it passed) for the GPU smoke.
   * pool_manifest.json — provenance (corridor sha, trace sha) and counts per template.
 
 verl schema (verified against the frozen image): the reward manager reads reward_model.ground_truth
@@ -51,7 +51,7 @@ from training_pipeline.grpo_sampling import EPS_DEFAULT, MIX_DEFAULT, PoolTask, 
 
 DATA_DIR = REPO / "data/raw/db_sandbox"
 POOL_ROOT = REPO / "data/final/grpo/db_bahn_pool"
-HELDOUT_K4_DEFAULT = REPO / "data/generated/eval/db_traces_heldout_eval_after_qwen3-4b_ep3_k4.jsonl"
+HELDOUT_TRACES_DEFAULT = REPO / "data/generated/eval/db_traces_heldout_eval_after_qwen3-4b_ep3_k8.jsonl"
 SEED = 42
 
 
@@ -116,8 +116,8 @@ def main() -> None:
     ap.add_argument("--corridor", type=Path, required=True, help="rl_corridor_*.json (corridor_from_traces.py)")
     ap.add_argument("--traces", type=Path, required=True, help="the k=8 rollout JSONL behind the corridor")
     ap.add_argument("--pool-id", required=True, help="folder name under data/final/grpo/db_bahn_pool/")
-    ap.add_argument("--heldout-k4", type=Path, default=HELDOUT_K4_DEFAULT,
-                    help="ep3 heldout k=4 traces (picks the smoke-val tasks)")
+    ap.add_argument("--heldout-traces", type=Path, default=HELDOUT_TRACES_DEFAULT,
+                    help="init-model heldout traces, K rollouts per task (picks the smoke-val tasks: not-all-passed vs all-passed)")
     ap.add_argument("--smoke-val-n", type=int, default=24)
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
@@ -156,14 +156,14 @@ def main() -> None:
         rows.append(_row(tasks[tid], keys[tid], n, sys_prompt, tool_names, extra))
         pool_tasks.append(PoolTask(tid, v["template"], extra["rate0"], extra["template_rate0"], extra["ever_failed"]))
 
-    # --- val: full heldout; smoke_val: 12 ep3-non-pass^4 + 12 passed ------------------------------
+    # --- val: full heldout; smoke_val: 12 ep3-non-pass^k + 12 passed ------------------------------
     held_ids = sorted(splits["heldout_eval"])
     val_rows = [_row(tasks[tid], keys[tid], n, sys_prompt, tool_names,
                      {"pool_role": "val", "split": "heldout_eval", "pool_id": args.pool_id,
                       "template": keys[tid]["template"]}) for n, tid in enumerate(held_ids)]
     ok_by_task: dict[str, list[float]] = defaultdict(list)
-    if args.heldout_k4.exists():
-        with open(args.heldout_k4) as f:
+    if args.heldout_traces.exists():
+        with open(args.heldout_traces) as f:
             for line in f:
                 r = json.loads(line)
                 ok_by_task[r["task_id"]].append(r["score"]["score"])

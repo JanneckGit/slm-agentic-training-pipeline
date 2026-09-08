@@ -5,8 +5,8 @@
 #   bash ops/build_sft_data.sh                              # Qwen/Qwen3-4B, base_qwen3-4b (Eval liegt vor -> kein GPU)
 #   bash ops/build_sft_data.sh Qwen/Qwen3-8B base_qwen3-8b  # Studentenwechsel: Rest leitet sich ab
 #
-# Fehlt die Eval-Datei fuer LABEL, laeuft ops/eval_heldout.sh (vLLM-Serve; 4B: ~40 min Wanduhr /
-# ~12 h Compute) -> dann in tmux starten. Sampling-Overrides fremder Modellfamilien (TEMPERATURE,
+# Fehlt die Eval-Datei fuer LABEL, laeuft ops/eval_heldout.sh (vLLM-Serve; 4B bei K=8: ~5 h
+# Wanduhr) -> dann in tmux starten. Sampling-Overrides fremder Modellfamilien (TEMPERATURE,
 # PRESENCE_PENALTY, VLLM_EXTRA, ...) als Env mitgeben — eval_heldout.sh erbt sie.
 #
 # Die Skip-Logik lebt bewusst HIER: eval_heldout.sh selbst macht rm -f auf seine Ausgabe
@@ -26,7 +26,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 MODEL=${1:-${MODEL:-Qwen/Qwen3-4B}}
 LABEL=${2:-${LABEL:-base_qwen3-4b}}
-EVAL_FILE="data/generated/eval/db_traces_heldout_eval_${LABEL}.jsonl"   # == OUT-Default von eval_heldout.sh
+K=${K:-8}; KSUF=""; [ "$K" -ne 1 ] && KSUF="_k${K}"                      # wie in eval_heldout.sh: Suffix bei K != 1
+EVAL_FILE="data/generated/eval/db_traces_heldout_eval_${LABEL}${KSUF}.jsonl"   # == OUT-Default von eval_heldout.sh
 CAPS="data/generated/eval/db_bahn_caps_${LABEL}.json"
 MIX_CHAT="data/final/sft_mix_chat_${LABEL}.jsonl"
 MIX_VAL="data/final/sft_mix_val_${LABEL}.jsonl"
@@ -47,7 +48,7 @@ if eval_ok; then
   echo "== [1/5] Basis-Eval vorhanden ($EVAL_FILE, >=$EXPECTED Zeilen) — skip =="
 else
   echo "== [1/5] Basis-Eval fehlt/unvollstaendig -> ops/eval_heldout.sh $MODEL $LABEL (GPU!) =="
-  bash ops/eval_heldout.sh "$MODEL" "$LABEL"
+  K="$K" bash ops/eval_heldout.sh "$MODEL" "$LABEL"
   eval_ok || { echo "ABORT: Eval nach Lauf unvollstaendig ($EVAL_FILE) — logs/eval_heldout.log pruefen"; exit 1; }
 fi
 

@@ -71,14 +71,14 @@ base:
     max_parallel_calls: 10         # verl's default 1 silently drops parallel tool calls
     max_tool_response_length: 4000 # = rollout.py MAX_TOOL_CONTENT
   val:                             # actor_rollout_ref.rollout.val_kwargs — verl's default is greedy, n=1
-    n: 4                           # -> mean@4 and (bootstrap) worst@4; exact pass^4 from the val dumps
-    batch_size: 32                 # tasks per validation batch (x n rollouts): every live episode holds its own
+    n: 8                           # -> mean@8 and (bootstrap) worst@8; exact pass^8 from the val dumps (= heldout eval K)
+    batch_size: 16                 # tasks per validation batch (x n = 128 live episodes): every live episode holds its own
                                    #   tau2 env in host RAM, so the whole heldout at once exhausts the memory
     temperature: 0.6               # eval recipe
     top_p: 0.95
     top_k: 20
   stop:                            # applied by the watcher via training_pipeline/grpo_metrics.py (verl has no early stop)
-    patience_validations: 3        # stop when the best heldout pass^4 lies >= 3 validations back
+    patience_validations: 3        # stop when the best heldout pass^8 lies >= 3 validations back
     min_informative_share: 0.20    # stop when < 20 % of an epoch's groups carry gradient
   memory:                          # preflight budget: gmu*total + actor + overhead < limit
     total_gb: 128

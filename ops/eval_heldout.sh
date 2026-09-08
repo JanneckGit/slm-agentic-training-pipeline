@@ -8,7 +8,7 @@
 # SINGLE-SHOT (--max-regen 0): genau EIN Versuch pro Rollout. Aeltere Heldout-Zahlen entstanden mit
 # --max-regen 1 = bis zu 3 Versuche mit best-of-Auswahl; sie sind mit diesen NICHT vergleichbar.
 #
-# K ROLLOUTS PRO TASK (Default 4, seit 2026-09-02): eval_report.py liefert daraus pass^k (Task zaehlt
+# K ROLLOUTS PRO TASK (Default 8): eval_report.py liefert daraus pass^k (Task zaehlt
 # nur, wenn ALLE k Samples bestehen) UND den Mittelwert ueber k (= rauschaermerer pass@1, vergleichbar
 # mit den alten k=1-Dateien). Bei K != 1 haengt der Dateiname `_k<K>` an, damit der rm -f unten
 # keine k=1-Datei desselben Labels ueberschreibt. K=1 reproduziert das alte Verhalten 1:1.
@@ -17,8 +17,8 @@
 #     bash ops/eval_heldout.sh <ep3-merged> ep3_corridor      # ~5 h; danach corridor_from_traces.py
 #
 # Env-Overrides (Defaults in Klammern):
-#   K (4)  SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)
-#   EVAL_TIMEOUT (5400 * K = 1,5 h je Rollout-Runde; deckt heldout k=4 und rl_train k=8 ab)
+#   K (8)  SPLIT (heldout_eval)  EVAL_CONC (21)  ROLLOUT_TIMEOUT_S (1800)
+#   EVAL_TIMEOUT (5400 * K = 1,5 h je Rollout-Runde, bei K=8 also 12 h)
 #   VLLM_MAX_MODEL_LEN (20480)  VLLM_GPU_UTIL (0.85)  VLLM_EXTRA  TAU2PY
 #   MLFLOW_EXPERIMENT (db_bahn_traj_eval)
 #   TEMPERATURE (0.6)  TOP_P (0.95)  TOP_K (20)  MIN_P (0)  PRESENCE_PENALTY (0.0)
@@ -31,7 +31,7 @@ TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
 MODEL=${1:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 LABEL=${2:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 SPLIT=${SPLIT:-heldout_eval}
-K=${K:-4}
+K=${K:-8}
 case "$K" in ''|*[!0-9]*|0) echo "K muss eine positive Ganzzahl sein, ist '$K'"; exit 2;; esac
 KSUF=""; [ "$K" -ne 1 ] && KSUF="_k${K}"
 OUT=${3:-data/generated/eval/db_traces_${SPLIT}_${LABEL}${KSUF}.jsonl}
@@ -42,9 +42,12 @@ EVAL_TIMEOUT=${EVAL_TIMEOUT:-$((5400 * K))}
 # Neues Modell? Einmal servieren und `docker logs text2sql_vllm_teacher | grep 'Maximum concurrency'`.
 EVAL_CONC=${EVAL_CONC:-21}
 
-# Sampling — Default ist das Qwen3-STUDENTEN-Rezept (Model-Card Qwen3-4B). Andere Modellfamilien
-# haben andere Empfehlungen und muessen sie beim Aufruf ueberschreiben, z. B. Qwen3.5 general:
-#   TEMPERATURE=1.0 PRESENCE_PENALTY=1.5 bash ops/eval_heldout.sh Qwen/Qwen3.5-4B base_qwen3.5-4b
+# Sampling — Default ist das Qwen3-STUDENTEN-Rezept (Model-Card Qwen3-4B). Qwen3.5 faehrt nach dem
+# bakeoff_dev-A/B (docs/heldout-eval-baselines.md) dasselbe Rezept, braucht aber
+# VLLM_EXTRA=--language-model-only. Andere Familien ueberschreiben per Env, z. B. der SDG-Teacher
+# Qwen3.6 mit dem Thinking-Preset seiner Model-Card:
+#   VLLM_EXTRA="--gdn-prefill-backend triton" TEMPERATURE=1.0 PRESENCE_PENALTY=1.5 \
+#     bash ops/eval_heldout.sh Qwen/Qwen3.6-35B-A3B teacher_qwen3.6-35b-a3b
 # Wer hier nichts setzt, misst mit dem Qwen3-Rezept — bei einer fremden Familie also potenziell
 # die Fehlkonfiguration statt der Faehigkeit.
 TEMPERATURE=${TEMPERATURE:-0.6}
@@ -111,7 +114,7 @@ timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
-  --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "$LABEL" \
+  --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "${LABEL}${KSUF}" \
   --output "$OUT" 2>&1 | tee -a logs/eval_heldout.log | tail -12
 rc=${PIPESTATUS[0]}
 [ "$rc" -ne 0 ] && echo "== ROLLOUT FAILED (exit $rc; 124 = EVAL_TIMEOUT) =="
