@@ -1,0 +1,83 @@
+# Tests — the four self-tests behind one runner (ops/run_tests.sh is the local equivalent).
+#
+# cpu-tests: verifier scenario suite + sampler + backfill in a venv built from requirements/tau2.lock.txt.
+#   The db_bahn fixtures (db.json, tasks.json, answer_keys.json — 35 MB, generated, not in git) are
+#   regenerated from the tracked GTFS snapshot on a cache miss: seed_worldstate takes 0.4 s, gen_tasks
+#   ~40 min on GB10 (it deep-copies the DB per task) — hence the cache keyed on generator + GTFS and the
+#   generous timeout for a first run. The regeneration is byte-reproducible (seed 42, README).
+# collator-test: the loss-mask golden test with CPU torch + the training image's transformers pin.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      LOGURU_LEVEL: ERROR
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/tau2.lock.txt
+      - name: Install the frozen tau2 venv (tau2 itself is built from its pinned commit)
+        run: pip install --no-deps -r requirements/tau2.lock.txt
+      - name: Restore the db_bahn fixtures
+        id: fixtures
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/raw/db_sandbox/db.json
+            data/raw/db_sandbox/world_manifest.json
+            data/raw/db_sandbox/tasks.json
+            data/raw/db_sandbox/split_tasks.json
+            data/raw/db_sandbox/answer_keys.json
+          key: db-bahn-fixtures-${{ hashFiles('sdg_pipeline/db_bahn/**', 'data/raw/db_sandbox/gtfs_de_fv/**') }}
+      - name: Regenerate the db_bahn fixtures (cache miss — ~40 min or more)
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        env:
+          PYTHONPATH: .
+        run: |
+          python sdg_pipeline/db_bahn/seed_worldstate.py --gtfs-dir data/raw/db_sandbox/gtfs_de_fv \
+            --out data/raw/db_sandbox/db.json --seed 42
+          python sdg_pipeline/db_bahn/gen_tasks.py --seed 42
+      - name: Save the db_bahn fixtures (before pytest — a red test must not cost the next run 40 min)
+        if: steps.fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/raw/db_sandbox/db.json
+            data/raw/db_sandbox/world_manifest.json
+            data/raw/db_sandbox/tasks.json
+            data/raw/db_sandbox/split_tasks.json
+            data/raw/db_sandbox/answer_keys.json
+          key: ${{ steps.fixtures.outputs.cache-primary-key }}
+      - name: pytest
+        run: python -m pytest -q
+
+  collator-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch + the training image's transformers pin
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==5.6.2" pytest==9.1.1
+      - name: Cache the Qwen3-4B tokenizer
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-tokenizer-qwen3-4b
+      - name: pytest (collator)
+        run: python -m pytest -q tests/test_collator_multiturn.py
