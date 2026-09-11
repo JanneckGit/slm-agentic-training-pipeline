@@ -70,7 +70,7 @@ def host_path(model: str) -> Path | None:
 
 def hf_snapshot(model: str) -> Path | None:
     """Juengster HF-Cache-Snapshot fuer eine HF-Modell-ID (Sichtweise HF_HOME)."""
-    roots = [os.environ.get("HF_HOME"), "/data/hf_cache",
+    roots = [os.environ.get("HF_HOME"), str(REPO / "data/hf_cache"),
              str(Path.home() / ".cache/huggingface")]
     sub = "models--" + model.replace("/", "--")
     for r in roots:

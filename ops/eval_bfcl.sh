@@ -54,9 +54,10 @@
 #                               budgetiert bfcl max_tokens gegen das WAHRE Kontextfenster
 #                               (s. registry_inject.py; vorher: 262.144-Falle des geliehenen
 #                               Instruct-2507-Keys -> stille 0 % in multi_turn_long_context).
-#   HF_HOME (/data/hf_cache)    Cache-Sicht des Harness-venv: bfcl laedt AutoConfig/AutoTokenizer
+#   HF_HOME (data/hf_cache)     Cache-Sicht des Harness-venv: bfcl laedt AutoConfig/AutoTokenizer
 #                               des model_name auf dem HOST — ohne HF_HOME schaut es in ~/.cache,
-#                               wo unsere Modelle fehlen.
+#                               wo unsere Modelle fehlen. Repo-lokal, dieselben Dateien wie
+#                               /data/hf_cache in den Containern.
 #   VLLM_GPU_UTIL (0.85)   BFCL_ENABLE_WEB_SEARCH (0)   BFCL_ALLOW_OVERWRITE (0)
 #   BFCL_RUN_IDS (leer)         Pfad zu einer test_case_ids_to_generate.json -> nur diese IDs
 #                               (Smoke-/Probe-Modus, zieht automatisch --partial-eval nach und
@@ -79,7 +80,10 @@ ROOT="$REPO/data/generated/eval/bfcl/$LABEL"
 # Cache-Sicht des Harness angleichen: bfcl laedt AutoConfig/AutoTokenizer des Registry-model_name
 # im HOST-venv (immer, auch mit --skip-server-setup). Ohne HF_HOME schaut transformers in
 # ~/.cache/huggingface — dort fehlen unsere Modelle, der Lauf stuerbe erst beim generate.
-export HF_HOME=${HF_HOME:-/data/hf_cache}
+# Default = derselbe repo-lokale Cache, den die Container als /data/hf_cache sehen
+# (docker/docker-compose.yml). mkdir hier, damit er uns gehoert und nicht Docker ihn als root anlegt.
+export HF_HOME=${HF_HOME:-$REPO/data/hf_cache}
+mkdir -p "$HF_HOME"
 
 mkdir -p "$ROOT/logs" logs
 LOG="$ROOT/logs/run.log"

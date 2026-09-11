@@ -38,7 +38,7 @@ services:
       - ../data:/app/data
       - ../logs:/app/logs
       # HuggingFace model cache (shared with training service)
-      - hf_cache:/data/hf_cache
+      - ../data/hf_cache:/data/hf_cache
 
     environment:
       - PYTHONUNBUFFERED=1
@@ -66,7 +66,7 @@ services:
       - ../data:/app/data
       - ../logs:/app/logs
       - ../mlruns:/app/mlruns
-      - hf_cache:/data/hf_cache
+      - ../data/hf_cache:/data/hf_cache
 
     environment:
       - PYTHONUNBUFFERED=1
@@ -116,7 +116,7 @@ services:
       - ..:/app                   # repo: runner imports the reward fn, reads config
       - ../data:/app/data
       - ../mlruns:/app/mlruns     # MLflow store shared with the SFT/eval runs
-      - hf_cache:/data/hf_cache
+      - ../data/hf_cache:/data/hf_cache
 
     environment:
       - PYTHONUNBUFFERED=1
@@ -152,7 +152,7 @@ services:
     profiles: ["vllm"]   # Only starts with: docker compose --profile vllm up
 
     volumes:
-      - hf_cache:/data/hf_cache
+      - ../data/hf_cache:/data/hf_cache
       # serve locally-merged checkpoints (e.g. the merged SFT student) for eval
       # rollouts. VLLM_MODEL points into /app/data.
       - ../data:/app/data
@@ -213,7 +213,7 @@ services:
     profiles: ["vllm-user"]
 
     volumes:
-      - hf_cache:/data/hf_cache
+      - ../data/hf_cache:/data/hf_cache
       - ../data:/app/data
 
     environment:
@@ -280,13 +280,10 @@ services:
       - ../mlruns:/mlruns
 
 # ---------------------------------------------------------------------------
-# Shared volumes
+# HF model cache: every service binds the repo-local, gitignored ../data/hf_cache
+# to /data/hf_cache (= HF_HOME inside the containers); ops/eval_bfcl.sh and
+# ops/eval_tau2.sh default the host HF_HOME to the same directory. It replaced a
+# machine-wide host cache that other workloads on this box share and prune.
+# Create it as your user before the first container start (the eval scripts do)
+# — otherwise Docker creates it root-owned.
 # ---------------------------------------------------------------------------
-volumes:
-  hf_cache:
-    driver: local
-    driver_opts:
-      type: none
-      # Change this path to where you want to store HF models on your GB10
-      o: bind
-      device: /data/hf_cache   # Create this directory on your host first!

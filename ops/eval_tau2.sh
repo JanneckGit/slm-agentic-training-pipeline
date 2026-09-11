@@ -39,7 +39,8 @@ T2BPY=${T2BPY:-$REPO/.venv-tau2bench/bin/python}   # Harness-venv (tau2==1.0.1)
 TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}      # traegt mlflow (Harness-venv nicht)
 # tau2s Loader bauen selbst DATA_DIR/tau2/domains/… -> auf …/data zeigen, NICHT …/data/tau2
 export TAU2_DATA_DIR="$REPO/data/raw/tau2-bench/data"
-export HF_HOME=${HF_HOME:-/data/hf_cache}          # Preflight loest gen-configs ueber HF_HOME auf
+export HF_HOME=${HF_HOME:-$REPO/data/hf_cache}     # Preflight loest gen-configs ueber HF_HOME auf; = /data/hf_cache der Container
+mkdir -p "$HF_HOME"                                # uns gehoerend anlegen, bevor Docker es als root tut
 
 MODEL=${1:?usage: eval_tau2.sh <MODEL> <LABEL> [DOMAINS]}
 LABEL=${2:?usage: eval_tau2.sh <MODEL> <LABEL> [DOMAINS]}

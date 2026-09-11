@@ -81,7 +81,7 @@ def host_path(model: str) -> Path | None:
 
 def hf_snapshot(model_id: str) -> Path | None:
     """Snapshot directory of an HF model in the local cache (no network)."""
-    for base in (os.getenv("HF_HOME"), "/data/hf_cache", Path.home() / ".cache/huggingface"):
+    for base in (os.getenv("HF_HOME"), REPO / "data/hf_cache", Path.home() / ".cache/huggingface"):
         if not base:
             continue
         hub = Path(base) / "hub"
@@ -99,7 +99,7 @@ def harness_snapshot(model_id: str) -> Path | None:
     """Snapshot dir as the HARNESS will see it — HF_HOME, else ~/.cache. Nothing else.
 
     Deliberately narrower than hf_snapshot(): transformers inside the bfcl venv resolves via
-    HF_HOME or the default cache, it does NOT know our /data/hf_cache convention. A check that
+    HF_HOME or the default cache, it does NOT know our repo-local data/hf_cache convention. A check that
     probes more paths than the harness can pass while the actual AutoConfig load fails.
     """
     base = os.getenv("HF_HOME") or (Path.home() / ".cache/huggingface")
@@ -216,7 +216,7 @@ def check_registry_context(c: Check, model_name: str, served_mpe: int | None) ->
         c.fail("registry-context", f"'{model_name}' not resolvable in the harness cache "
                                    f"(HF_HOME={os.getenv('HF_HOME') or 'unset -> ~/.cache'}) — "
                                    "AutoConfig/AutoTokenizer load would die at generate time. "
-                                   "Fix: export HF_HOME=/data/hf_cache")
+                                   f"Fix: export HF_HOME={REPO / 'data/hf_cache'} (the ops/eval_bfcl.sh default)")
         return
     registry_mpe = read_mpe(d)
     if registry_mpe is None:
@@ -297,10 +297,11 @@ def check_memory_vector_model(c: Check, cats: list[str]) -> None:
     """memory_vector needs an embedding model IN THE HARNESS CACHE — importable is not enough.
 
     `memory_vector.py` instantiates `SentenceTransformer("all-MiniLM-L6-v2")` at MODULE level:
-    the first import tries to DOWNLOAD the model into the effective HF cache. With
-    HF_HOME=/data/hf_cache that cache is root-owned -> Permission denied -> every single
-    vector item (192) dies instantly as an `infra` error, discovered hours into the run.
-    Exactly that killed the 2026-08-18 base run's vector category. Hence: hard gate.
+    the first import tries to DOWNLOAD the model into the effective HF cache. If that cannot
+    happen (a root-owned cache — the old machine-wide one was — or one that got pruned), every
+    single vector item (192) dies instantly as an `infra` error, discovered hours into the run.
+    Exactly that killed the 2026-08-18 base run's vector category. Hence: hard gate — pull the
+    model into the repo-local data/hf_cache before the run.
     """
     if "memory_vector" not in cats:
         return
@@ -323,9 +324,8 @@ def check_memory_vector_model(c: Check, cats: list[str]) -> None:
     if not snaps:
         c.fail("memory_vector model",
                f"'{repo}' not in the harness cache ({base}) — the module-level download would "
-               f"die on the root-owned cache. Fix: docker compose -f docker/docker-compose.yml "
-               f"run --rm -T sdg python3 -c \"from huggingface_hub import snapshot_download; "
-               f"snapshot_download('{repo}')\"")
+               f"die mid-run. Fix (pull it as your user): HF_HOME={base} .venv-bfcl/bin/python -c "
+               f"\"from huggingface_hub import snapshot_download; snapshot_download('{repo}')\"")
         return
     unreadable = [str(p) for p in snaps[-1].rglob("*") if p.is_file() and not os.access(p, os.R_OK)]
     if unreadable:

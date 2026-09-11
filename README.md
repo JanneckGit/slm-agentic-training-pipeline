@@ -135,9 +135,10 @@ chain (`ops/build_sft_data.sh`) runs on host `python3`. Two more venvs exist onl
 OOD benchmarks (`.venv-bfcl`, `.venv-tau2bench` — see the OOD sections); all three are frozen in
 `requirements/*.lock.txt` (`bash ops/freeze_venvs.sh` refreshes them). Two configs, no secrets:
 `config/pipeline_config.yaml` (SDG / SFT / eval) and `config/grpo_db_bahn.yaml` (Stage 2) — the teacher
-is local vLLM and all models are public. The first serve pulls weights
-into the `hf_cache` volume (bind path set at the bottom of `docker/docker-compose.yml`, default
-`/data/hf_cache`) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB. `HF_TOKEN` is optional
+is local vLLM and all models are public. The first serve pulls weights into the repo-local,
+gitignored `data/hf_cache/` (every container sees it as `/data/hf_cache`, the BFCL/τ² harnesses use it
+as host `HF_HOME`; create it as your user before the first container start, otherwise Docker creates it
+root-owned) — student Qwen3-4B ≈ 8 GB, teacher Qwen3.6-35B-A3B ≈ 67 GB. `HF_TOKEN` is optional
 (all models are public); Compose reads it from `docker/.env` — template in `docker/.env.example`.
 
 **Data prerequisites.** The GTFS snapshot ships with the repo (`data/raw/db_sandbox/gtfs_de_fv/` —
