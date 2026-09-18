@@ -151,7 +151,8 @@ def main() -> int:
     if manifest.is_file():
         m = json.loads(manifest.read_text())
         print(f"Run       : {m.get('label')}  ({m.get('model')})")
-        print(f"Checkpoint: {m.get('model_dir_resolved') or '—'}  fp={m.get('model_fingerprint') or '—'}")
+        print(f"Checkpoint: {m.get('model_dir_resolved') or '—'}  fp={m.get('model_fingerprint') or '—'}"
+              f"  wfp={m.get('weights_fingerprint') or '—'}")
         reg = m.get("registry") or {}
         print(f"Registry  : {m.get('model_key')} -> alias '{m.get('model_alias')}'"
               f"{'  (injected)' if reg.get('injected') else ''}"

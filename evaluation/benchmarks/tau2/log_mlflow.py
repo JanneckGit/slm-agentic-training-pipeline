@@ -56,6 +56,8 @@ def main() -> int:
             "model": m["model"],
             "model_alias": m["model_alias"],
             "model_fingerprint": m.get("model_fingerprint"),
+            "weights_fingerprint": m.get("weights_fingerprint"),
+            "checkpoint": m.get("model_dir_resolved"),
             "agent_llm_args": json.dumps({k: v for k, v in m["agent"]["llm_args"].items()
                                           if not k.startswith("api_")}),
             "user_sim_model": m["user_sim"]["model"],

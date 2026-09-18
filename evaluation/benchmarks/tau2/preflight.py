@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,11 +97,31 @@ def read_json(p: Path) -> dict | None:
 
 
 def fingerprint_model(d: Path) -> str:
+    """Struktur-Fingerprint (Config + Index) — bei Feintunes derselben Architektur identisch
+    (ep3 = GRPO Step 24). Die Gewichte identifiziert weights_fingerprint()."""
     h = hashlib.sha256()
     for name in ("config.json", "model.safetensors.index.json", "generation_config.json"):
         f = d / name
         if f.exists():
             h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def weights_fingerprint(d: Path) -> str | None:
+    """Inhalts-Hash der Gewichte: alle *.safetensors, voll gelesen.
+
+    Eine Stichprobe reicht nicht: LoRA-Merges lassen embed_tokens (die ersten ~778 MB von
+    Shard 1) unveraendert. Voll: 8 GB in ~10 s kalt / ~4 s warm — vLLM liest sie danach eh.
+    """
+    files = sorted(d.glob("*.safetensors"))
+    if not files:
+        return None
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode())
+        with open(f, "rb") as fh:
+            while chunk := fh.read(16 << 20):
+                h.update(chunk)
     return h.hexdigest()[:16]
 
 
@@ -336,11 +357,30 @@ def main() -> int:
                               f"(cap {az_info['total_cap']}, Gewichte {az_info['weights_gb']} GB, "
                               f"KV-Ziel {az_info['kv_target_gb']} GB)")
 
-    # --- Ein Label = ein Modell (Resume-Schutz) ---
+    # --- Gewichts-Identitaet: Inhalt statt Struktur (Manifest + Resume-Schutz) ---
+    t0 = time.monotonic()
+    wfp = weights_fingerprint(agent_dir) if agent_dir else None
+    if wfp:
+        gb = sum(f.stat().st_size for f in agent_dir.glob("*.safetensors")) / 1e9
+        checks.ok("weights", f"{wfp} ({gb:.1f} GB in {time.monotonic() - t0:.1f} s)")
+    else:
+        checks.warn("weights", "keine safetensors aufloesbar — Gewichts-Identitaet ungeprueft")
+
+    # --- Ein Label = ein Modell (Resume-Schutz): Pfad UND Gewichte ---
+    # Das Manifest wird bei jedem Start neu geschrieben -> VORHER vergleichen, sonst mischt ein
+    # unter demselben Pfad geaenderter Checkpoint (Re-Merge) still in results.json.
     prev = read_json(a.root / "run_manifest.json")
+    prev_wfp = (prev or {}).get("weights_fingerprint")
     if prev and prev.get("model") != a.model:
         checks.fail("label-dir", f"{a.root} traegt bereits Modell {prev.get('model')!r} — "
                                  "neues Modell braucht ein neues Label")
+    elif prev_wfp and wfp and prev_wfp != wfp:
+        checks.fail("label-dir", f"{a.root} traegt Ergebnisse anderer Gewichte ({prev_wfp} ≠ "
+                                 f"jetzt {wfp}) — Checkpoint unter demselben Pfad geaendert; "
+                                 "neues Label")
+    elif prev and not prev_wfp:
+        checks.ok("label-dir", "kein Modell-Konflikt (Alt-Manifest ohne weights_fingerprint — "
+                               "Gewichtsvergleich ab diesem Start)")
     else:
         checks.ok("label-dir", "kein Modell-Konflikt im Label-Verzeichnis")
 
@@ -405,6 +445,8 @@ def main() -> int:
         "model": a.model,
         "model_alias": alias,
         "model_fingerprint": fingerprint_model(agent_dir) if agent_dir else None,
+        "model_dir_resolved": str(agent_dir.resolve()) if agent_dir else None,
+        "weights_fingerprint": wfp,
         "agent": {
             "llm": f"openai/{alias}",
             "llm_args": with_endpoint(cfg["agent"]["llm_args"], AGENT_PORT),

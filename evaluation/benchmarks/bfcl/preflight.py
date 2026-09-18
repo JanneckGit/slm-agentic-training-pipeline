@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -124,16 +125,35 @@ def read_mpe(model_dir: Path | None) -> int | None:
 
 
 def fingerprint(model_dir: Path) -> str:
-    """Cheap, deterministic checkpoint fingerprint.
+    """Cheap, deterministic STRUCTURAL fingerprint (config.json + safetensors index + generation config).
 
-    Do not hash the weights (8 GB) — config.json plus the safetensors index identify the checkpoint
-    structurally and cost milliseconds.
+    Identical for every fine-tune of the same architecture (ep3 = GRPO step 24) — the weights are
+    identified by weights_fingerprint(). Kept as is so old manifests stay comparable.
     """
     h = hashlib.sha256()
     for name in ("config.json", "model.safetensors.index.json", "generation_config.json"):
         f = model_dir / name
         if f.is_file():
             h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def weights_fingerprint(model_dir: Path) -> str | None:
+    """Content hash of the weights: every *.safetensors, read in full.
+
+    Same recipe as tau2/preflight.py:weights_fingerprint. A sample is not enough: LoRA merges leave
+    embed_tokens (the first ~778 MB of shard 1) untouched. Full read of 8 GB: ~10 s cold, ~4 s warm
+    — and vLLM reads the same files right after.
+    """
+    files = sorted(model_dir.glob("*.safetensors"))
+    if not files:
+        return None
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode())
+        with open(f, "rb") as fh:
+            while chunk := fh.read(16 << 20):
+                h.update(chunk)
     return h.hexdigest()[:16]
 
 
@@ -469,6 +489,29 @@ def main() -> int:
                                  "bfcl_report would sum two models into one label. Use a fresh "
                                  "label or remove them")
 
+    # Same label = RESUME, and the manifest is rewritten on every start -> compare against the
+    # previous one BEFORE that. A checkpoint changed under the same path (re-merge) keeps the
+    # registry key and would be mixed silently into the existing result files.
+    t0 = time.monotonic()
+    wfp = weights_fingerprint(model_dir) if model_dir else None
+    prev_manifest = a.root / "run_manifest.json"
+    prev_wfp = None
+    if prev_manifest.is_file():
+        try:
+            prev_wfp = json.loads(prev_manifest.read_text()).get("weights_fingerprint")
+        except Exception:
+            pass
+    if wfp is None:
+        c.warn("weights", "no local safetensors — weight identity unchecked")
+    elif prev_wfp and prev_wfp != wfp:
+        c.fail("weights", f"{a.root} holds results of DIFFERENT weights ({prev_wfp} != now {wfp}) — "
+                          "the checkpoint changed under the same path; use a fresh label")
+    else:
+        gb = sum(f.stat().st_size for f in model_dir.glob("*.safetensors")) / 1e9
+        note = ("  (old manifest without weights_fingerprint — compared from this start on)"
+                if prev_manifest.is_file() and not prev_wfp else "")
+        c.ok("weights", f"{wfp} ({gb:.1f} GB in {time.monotonic() - t0:.1f} s){note}")
+
     check_label(c, a.label, a.model)
     cats = resolve_categories(c, a.categories, a.enable_web_search)
     check_format_sensitivity(c, cats, registry["model_key"])
@@ -535,6 +578,7 @@ def main() -> int:
         "hf_home": os.getenv("HF_HOME"),
         "model_dir_resolved": str(model_dir.resolve()) if model_dir else None,
         "model_fingerprint": fingerprint(model_dir) if model_dir else None,
+        "weights_fingerprint": wfp,
         "generation_config": {k: gen_cfg.get(k) for k in EXPECTED_GENERATION_CONFIG} if gen_cfg else None,
         "sampling": {"temperature": a.temperature, "note": "top_p/top_k come from generation_config.json"},
         "serving": {"max_model_len": max_model_len, "max_model_len_derived": a.max_model_len is None,

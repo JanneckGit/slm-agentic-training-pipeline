@@ -57,6 +57,7 @@ def main() -> int:
             "model_key": m.get("model_key"),
             "model_alias": m.get("model_alias"),
             "model_fingerprint": m.get("model_fingerprint"),
+            "weights_fingerprint": m.get("weights_fingerprint"),
             "checkpoint": m.get("model_dir_resolved"),
             "temperature": (m.get("sampling") or {}).get("temperature"),
             "generation_config": json.dumps(m.get("generation_config")),
