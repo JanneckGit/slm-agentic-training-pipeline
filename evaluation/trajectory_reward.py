@@ -255,9 +255,16 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
 
 
 # --- verl reward-manager adapter (Stage-2 seam) -----------------------------------------------
+# errors after which the verifier could not judge the episode at all (exception, unreplayable gold) —
+# NOT `ungrounded_tokens`, which is a regular verdict about the answer
+VERIFIER_ERROR_PREFIXES = ("verifier_exception", "gold_replay_failed")
+
+
 def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_info=None, **kw):
     """Stage-2 GRPO seam: extra_info carries {'task': ..., 'answer_key': ...}; solution_str is the
-    trajectory messages as JSON. Returns dict{score, ...aux} (verl custom_reward_function contract)."""
+    trajectory messages as JSON. Returns dict{score, ...aux} (verl custom_reward_function contract).
+    `verifier_error` = 1.0 when the verifier could not score the episode (its 0.0 says nothing about
+    the policy) — counted per run by training_pipeline/grpo_metrics.py."""
     extra_info = extra_info or {}
     try:
         messages = json.loads(solution_str) if isinstance(solution_str, str) else (solution_str or [])
@@ -266,6 +273,10 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_
     res = score_trajectory(extra_info.get("task") or {}, messages, extra_info.get("answer_key"))
     flat = {k: v for k, v in res.items() if isinstance(v, (int, float))}
     flat["score"] = res["score"]
+    err = res.get("error") or ""
+    flat["verifier_error"] = 1.0 if err.startswith(VERIFIER_ERROR_PREFIXES) else 0.0
+    if err.startswith("gold_replay_failed"):  # score_trajectory warns only for its own exceptions
+        print(f"[trajectory_reward] WARNING {err}", file=sys.stderr)
     return flat
 
 

@@ -18,9 +18,17 @@ Stage-2 extras:
     {task_id, score, ts, pid} to <ledger_dir>/<pid>.jsonl (one file per reward worker process, so
     concurrent Ray actors never interleave). training_pipeline/grpo_dataset.py reads the ledger to
     re-weight the task pool; validation rows carry no `ledger_dir` and therefore leave no trace.
+  * Constant keys: every episode returns exactly REWARD_KEYS, in that order — verl takes the reward-extra
+    keys from the first episode of a batch and indexes all others with them (agent_loop `_postprocess`),
+    then asserts equal key lists when it merges the workers' batches. One episode with other keys (the
+    old adapter-error dict) is a KeyError/AssertionError that kills the run. Failures are flags instead:
+    `adapter_error` (this module raised — parse/JSON) and `verifier_error` (the verifier could not judge,
+    trajectory_reward.VERIFIER_ERROR_PREFIXES); both score 0.0 and land in the dumps + val-aux metrics.
   * Round-trip self-test: `python3 evaluation/grpo_reward.py --roundtrip <rollout.jsonl>` renders our
     eval traces exactly the way verl decodes an episode, parses them back and re-scores — every score
-    must equal the stored one. Run it in the tau2 venv (the verifier replays on the db_bahn env).
+    must equal the stored one, and the full seam (compute_score with parquet-shaped extra_info) must
+    return the same score with exactly REWARD_KEYS. Run it in the tau2 venv (the verifier replays on the
+    db_bahn env); `--limit N --include-fails` = the first N rows plus every failed one.
 
 Parser note: with N parallel tool calls an earlier version gave all N tool messages the FIRST response's
 text and dropped the rest → grounding false negatives. Responses are paired with calls in order; the
@@ -38,6 +46,14 @@ if __package__ in (None, ""):  # run by path (self-test) → make `evaluation.*`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluation.trajectory_reward import compute_score as _score_messages  # noqa: E402
+
+# the verifier's numeric fields (trajectory_reward.score_trajectory, in its order) + this seam's fields
+REWARD_KEYS = ("score", "task_solved", "turns_used", "n_tool_calls", "n_tool_errors", "tool_calls_valid",
+               "n_plan_turns", "replan_occurred", "self_recovery", "parallel_max_calls_per_turn",
+               "efficiency_expected_calls", "efficiency_call_ratio", "efficiency_within_3x",
+               "n_msgs", "adapter_error", "verifier_error")
+_INT_KEYS = frozenset({"turns_used", "n_tool_calls", "n_tool_errors", "n_plan_turns",
+                       "parallel_max_calls_per_turn", "efficiency_expected_calls"})
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_RESP_RE = re.compile(r"<tool_response>\n?(.*?)\n?</tool_response>", re.DOTALL)
@@ -166,6 +182,10 @@ def _ledger_append(extra_info: dict, ground_truth, score: float) -> None:
         print(f"[grpo_reward] ledger append failed: {type(e).__name__}: {e}", file=sys.stderr)
 
 
+def _default(key: str):
+    return 0 if key in _INT_KEYS else 0.0
+
+
 def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_info=None, **kw):
     extra_info = extra_info or {}
     try:
@@ -177,53 +197,83 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_
         out = _score_messages(data_source=data_source, solution_str=messages,
                               ground_truth=ground_truth, extra_info=info)
         out["n_msgs"] = float(len(messages))
-    except Exception as e:  # a broken adapter must not kill the run
-        out = {"score": 0.0, "adapter_error": 1.0, "error_str": f"{type(e).__name__}: {e}"}
-    _ledger_append(extra_info, ground_truth, out.get("score", 0.0))
+        out["adapter_error"] = 0.0
+    except Exception as e:  # a broken adapter must not kill the run: 0.0, flagged, same keys
+        print(f"[grpo_reward] ADAPTER_ERROR task={ground_truth}: {type(e).__name__}: {e}", file=sys.stderr)
+        out = {"score": 0.0, "adapter_error": 1.0}
+    out = {k: out.get(k, _default(k)) for k in REWARD_KEYS}
+    _ledger_append(extra_info, ground_truth, out["score"])
     return out
 
 
 # --- round-trip self-test ------------------------------------------------------------------------
-def _roundtrip(path: str, limit: int | None, verbose: int) -> int:
-    from collections import Counter
+def _typed(key: str, value) -> bool:
+    return type(value) is (int if key in _INT_KEYS else float)
 
-    from evaluation.trajectory_reward import score_trajectory
+
+def roundtrip_row(rec: dict, task: dict, key: dict | None) -> list[str]:
+    """One stored eval trace through the reward path the way verl sees it. Returns the problems ([] = ok):
+    (a) render as verl decodes it → parse → score_trajectory: score AND components equal the stored ones;
+    (b) the whole seam, compute_score with parquet-shaped extra_info (JSON strings): same score, exactly
+    REWARD_KEYS in order, typed values, adapter_error 0, verifier_error == the verifier's own verdict."""
+    from evaluation.trajectory_reward import VERIFIER_ERROR_PREFIXES, score_trajectory
+
+    problems = []
+    text = render_verl_response(rec["messages"])
+    res = score_trajectory(task, hermes_to_messages(text), key)
+    ref = rec["score"]
+    if res["score"] != ref["score"] or res["components"] != ref["components"]:
+        diff = sorted(c for c in set(res["components"]) | set(ref["components"])
+                      if res["components"].get(c) != ref["components"].get(c))
+        problems.append("components:" + (",".join(diff) or "score"))
+    out = compute_score(data_source="db_bahn", solution_str=text, ground_truth=rec["task_id"],
+                        extra_info={"task": json.dumps(task, ensure_ascii=False),
+                                    "answer_key": json.dumps(key, ensure_ascii=False)})
+    if tuple(out) != REWARD_KEYS:
+        problems.append("keys")
+    elif bad := [k for k in REWARD_KEYS if not _typed(k, out[k])]:
+        problems.append("types:" + ",".join(bad))
+    if out.get("score") != res["score"]:
+        problems.append("seam_score")
+    if out.get("adapter_error") != 0.0:
+        problems.append("adapter_error")
+    if out.get("verifier_error") != (1.0 if (res.get("error") or "").startswith(VERIFIER_ERROR_PREFIXES) else 0.0):
+        problems.append("verifier_error")
+    return problems
+
+
+def roundtrip_file(path, limit: int | None = None, include_fails: bool = False, verbose: int = 0,
+                   progress: bool = False) -> dict:
+    """roundtrip_row over a K-rollout trace file: the first `limit` rows (all if None), plus — with
+    include_fails — every row whose stored score is < 1 (the reward's error-prone half)."""
+    from collections import Counter
 
     root = Path(__file__).resolve().parents[1] / "data/raw/db_sandbox"
     tasks = {t["id"]: t for t in json.loads((root / "tasks.json").read_text())}
     keys = json.loads((root / "answer_keys.json").read_text())
-    n = ok = 0
-    mism = Counter()
+    n = ok = fails = 0
+    kinds: Counter = Counter()
     examples = []
     t0 = time.time()
     with open(path) as f:
-        for line in f:
-            if limit and n >= limit:
-                break
+        for i, line in enumerate(f):
             r = json.loads(line)
+            failed = r["score"]["score"] < 1
+            if not (limit is None or i < limit or (include_fails and failed)):
+                continue
             n += 1
-            text = render_verl_response(r["messages"])
-            msgs = hermes_to_messages(text)
-            res = score_trajectory(tasks[r["task_id"]], msgs, keys.get(r["task_id"]))
-            ref = r["score"]
-            same = res["score"] == ref["score"] and res["components"] == ref["components"]
-            if same:
+            fails += failed
+            problems = roundtrip_row(r, tasks[r["task_id"]], keys.get(r["task_id"]))
+            if not problems:
                 ok += 1
             else:
-                diff = [c for c in set(res["components"]) | set(ref["components"])
-                        if res["components"].get(c) != ref["components"].get(c)]
-                mism[tuple(sorted(diff)) or ("score",)] += 1
+                kinds.update(problems)
                 if len(examples) < verbose:
-                    examples.append((r["task_id"], r.get("sample_idx"), ref["score"], res["score"], diff,
-                                     res.get("error"), ref.get("error")))
-            if n % 500 == 0:
+                    examples.append((r["task_id"], r.get("sample_idx"), r["score"]["score"], problems))
+            if progress and n % 500 == 0:
                 print(f"  {n} … identical {ok}", flush=True)
-    print(f"\nround-trip {path}: {ok}/{n} identical ({100 * ok / max(1, n):.2f} %), {time.time() - t0:.0f}s")
-    if mism:
-        print("mismatch components:", dict(mism.most_common()))
-        for ex in examples:
-            print("  ", ex)
-    return 0 if ok == n else 1
+    return {"n": n, "ok": ok, "failed_rows": fails, "problems": dict(kinds.most_common()),
+            "examples": examples, "seconds": round(time.time() - t0)}
 
 
 if __name__ == "__main__":
@@ -232,8 +282,16 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="verl reward seam; --roundtrip runs the parser self-test")
     ap.add_argument("--roundtrip", metavar="ROLLOUT_JSONL")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--include-fails", action="store_true", help="with --limit: also every row with stored score < 1")
     ap.add_argument("--verbose", type=int, default=5, help="mismatch examples to print")
     a = ap.parse_args()
     if not a.roundtrip:
         ap.error("nothing to do (use --roundtrip <jsonl>)")
-    sys.exit(_roundtrip(a.roundtrip, a.limit, a.verbose))
+    rt = roundtrip_file(a.roundtrip, a.limit, a.include_fails, a.verbose, progress=True)
+    print(f"\nround-trip {a.roundtrip}: {rt['ok']}/{rt['n']} identical ({100 * rt['ok'] / max(1, rt['n']):.2f} %; "
+          f"{rt['failed_rows']} failed rows), {rt['seconds']}s")
+    if rt["problems"]:
+        print("problems:", rt["problems"])
+        for ex in rt["examples"]:
+            print("  ", ex)
+    sys.exit(0 if rt["ok"] == rt["n"] else 1)
