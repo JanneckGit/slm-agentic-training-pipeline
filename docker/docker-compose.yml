@@ -110,7 +110,12 @@ services:
       dockerfile: docker/Dockerfile.grpo
     container_name: text2sql_grpo
     profiles: ["grpo"]            # only with: docker compose --profile grpo ...
-    entrypoint: ["python3"]       # committed image's CMD is grpo_gate's keep-alive probe; override it
+    # NGC entrypoint, then python3 (the committed image's own entrypoint/CMD are grpo_gate's keep-alive probe).
+    # The NGC entrypoint re-runs the CUDA forward-compat check (/etc/shinit_v2) for the HOST's driver. The image
+    # was committed with the compat symlink of its June host (driver 580.95.05) frozen in; started straight into
+    # python3, every container loaded that old libcuda and failed with CUDA error 803 once the host got driver
+    # 580.173 (2026-09-10). Through the entrypoint the check runs per container and the host's libcuda loads.
+    entrypoint: ["/opt/nvidia/nvidia_entrypoint.sh", "python3"]
 
     volumes:
       - ..:/app                   # repo: runner imports the reward fn, reads config
