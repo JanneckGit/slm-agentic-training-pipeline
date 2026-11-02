@@ -7,9 +7,11 @@
 # training_pipeline/grpo_config.py renders a profile into the verl Hydra flags, ops/grpo_run.sh runs it,
 # training_pipeline/grpo_preflight.py gates it.
 #
-#   bash ops/grpo_run.sh smoke                       # 2 steps, dynamic sampler, 24-task validation
+#   bash ops/grpo_run.sh smoke [<run-name>]          # 2 steps, dynamic sampler, 24-task validation
 #   bash ops/grpo_run.sh smoke_static                # 1 step, static sampler
 #   bash ops/grpo_run.sh default <run-name>          # a real run; same command again = resume
+#
+# The smokes inherit the whole base recipe (KL, scheduler, log-prob mismatch, loss) and only shrink it.
 #
 # Paths are CONTAINER paths (repo mounted at /app, data at /app/data — docker/docker-compose.yml).
 # =============================================================================
@@ -19,6 +21,8 @@ image: agentic-grpo:verl          # frozen verl 0.8.0 + vLLM cu130 nightly + tau
 paths:
   init_model: /app/data/final/checkpoints/db_bahn_traj_merged_qwen3-4b/ep3   # merged SFT checkpoint = RL basis
   init_fingerprint: 521cd9dd8b805ceb     # sha256_16(config.json + safetensors index + generation_config) of init_model
+  init_weights_fingerprint: 2f5737417bcebc72   # sha256_16 over the *.safetensors bytes (the config hash above is
+                                               #   the same for every 4B merge; this one tells ep3 from a GRPO merge)
   pool_dir: /app/data/final/grpo/db_bahn_pool/corridor_ep3_k8_20260902      # build_grpo_pool.py output
   corridor_file: /app/data/generated/eval/rl_corridor_ep3_corridor_k8.json  # pool_manifest.corridor_sha256_16 must match
   runs_root: /app/data/final/grpo/runs        # <run>/{resolved_config.json, ledger, sampler, rollout_dump, val_dump}
@@ -44,23 +48,31 @@ base:
     n: 8                           # rollouts per prompt = the GRPO group
     lr: 2.0e-5                     # LoRA adapters need ~10x the lr of full fine-tuning (verl default 1e-6):
                                    #   Adam moves every weight by ~lr per update, whatever the gradient size
-    warmup_steps: 4                # actor.optim.lr_warmup_steps: linear warmup, then constant (no cosine: the run
-                                   #   stops by the heldout rule and selects a checkpoint, it does not "land")
+    warmup_steps: 4                # actor.optim.lr_warmup_steps: linear warmup (verl counts from 0: step 1 trains at lr 0)
+    lr_schedule: cosine            # actor.optim.lr_scheduler_type: after the warmup the lr decays along a half cosine to
+    min_lr_ratio: 0.1              #   min_lr_ratio x lr at total_training_steps — late steps move the policy less
     lora_rank: 16
     lora_alpha: 32
     micro_bs: 1                    # actor.ppo_micro_batch_size_per_gpu; without remove_padding (sm_121) larger
     logprob_micro_bs: 1            #   micro-batches only pad to the longest sequence -> slower and more memory
-    total_epochs: 15               # hard cap; the stop rule below is applied by the watcher, not by verl
-    total_training_steps: null     # null = epochs x steps/epoch
+    total_epochs: 15               # upper bound for verl's dataloader; total_training_steps ends the run earlier
+    total_training_steps: 40       # fixed horizon = the cosine's end (null = epochs x steps/epoch); a multiple of save_freq
     save_freq: 8                   # one checkpoint per epoch, aligned with test_freq
     test_freq: 8
     val_before_train: true         # step-0 validation = baseline of the run and end-to-end gate of the reward path
-    kl: false                      # Dr.GRPO without KL; switch on (0.001, low_var_kl) if mastered templates drift
-    kl_coef: 0.001
+    kl: true                       # KL anchor in the loss (low_var_kl); the reference is the actor with the LoRA switched
+    kl_coef: 0.01                  #   off = the init model, so the anchor costs one extra forward pass, no second model
+    conf_weight:                   # confidence weighting of negative-advantage tokens (training_pipeline/grpo_conf_loss.py)
+      enabled: false               #   switched on only by the diagnosis (evaluation/conf_diagnosis.py decide)
+      tau: null                    #   in a rollout with advantage < 0, tokens the policy sampled with p > tau ...
+      factor: 0.2                  #   ... get factor x the gradient; all other tokens keep weight 1
   rollout:
     temperature: 1.0               # RL sampling (the corridor measurement uses the same); NO repetition_penalty
     top_p: 0.95
     top_k: 20
+    calculate_log_probs: true      # vLLM returns the sampling log-probs -> training/rollout_probs_diff_* (rollout vs actor)
+    logprobs_mode: raw_logprobs    #   raw = full softmax like the actor (verl's default processed_logprobs is renormalised
+                                   #   after top-k/top-p and therefore biased upwards)
     gpu_memory_utilization: 0.30   # share of the unified memory reserved by the rollout vLLM (weights + KV pool)
     max_num_seqs: 48
     max_num_batched_tokens: 8192
@@ -77,9 +89,13 @@ base:
     temperature: 0.6               # eval recipe
     top_p: 0.95
     top_k: 20
-  stop:                            # applied by the watcher via training_pipeline/grpo_metrics.py (verl has no early stop)
+  stop:                            # evaluated by training_pipeline/grpo_metrics.py (verl has no early stop) — advisory
     patience_validations: 3        # stop when the best heldout pass^8 lies >= 3 validations back
     min_informative_share: 0.20    # stop when < 20 % of an epoch's groups carry gradient
+    entropy_factor: 2.0            # divergence alarm: actor/entropy > factor x its epoch-0 mean (from epoch 1 on) ...
+    clip_ratio_max: 0.05           #   ... or response_length/clip_ratio > this (from step 1 on) ...
+    consecutive: 2                 #   ... in this many consecutive steps; the run continues, but checkpoints from the
+                                   #   first of those steps on are excluded from --select
   memory:                          # preflight budget: gmu*total + actor + overhead < limit
     total_gb: 128
     actor_gb: 31                   # FSDP actor peak (weights + LoRA + optimizer + activations)

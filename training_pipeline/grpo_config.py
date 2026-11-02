@@ -7,6 +7,7 @@ persist/load the resolved configuration of a run.
     python3 training_pipeline/grpo_config.py default --run <run> --memory        # budget check
     python3 training_pipeline/grpo_config.py default --run <run> --write-resolved <file>   # runs/<run>/resolved_config.json
     python3 training_pipeline/grpo_config.py --run-env <run>                     # KEY=value lines from a run's resolved config
+    python3 training_pipeline/grpo_config.py default --run <run> --check-flags   # decision checks on the rendered flags
 
 A profile is a configuration variant; the run name is the identity. Every run keeps the resolved
 configuration it was started with (`resolved_config.json`), so metrics and export read from there and
@@ -14,14 +15,18 @@ a later change of the defaults never re-interprets an old run.
 
 Plain python3 + PyYAML. The mapping below is the single place where our settings meet verl's
 config keys; the load-bearing GB10 flags (load_format=auto, sdpa, Dr.GRPO, tool_agent loop) are
-inherited from the validated SQL-era pilot.
+inherited from the validated SQL-era pilot. Flags for later recipe knobs (scheduler, KL reference,
+log-prob mismatch, confidence weighting) are rendered only when the knob is set, so an older run's
+resolved config renders exactly the flags it was started with.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
+import math
 import shlex
 import sys
 from pathlib import Path
@@ -30,6 +35,9 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIG_DEFAULT = REPO / "config/grpo_db_bahn.yaml"
+# confidence-weighted policy loss: registered by this module (verl imports it via model.external_lib)
+CONF_LOSS_MODE = "conf_weighted"
+CONF_LOSS_LIB = "training_pipeline.grpo_conf_loss"
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
@@ -70,6 +78,31 @@ def run_paths(r: dict) -> dict:
     }
 
 
+def steps_per_epoch(r: dict) -> int:
+    return r["pool"]["epoch_size"] // r["train"]["prompts_per_step"]
+
+
+def conf_weight(r: dict) -> dict:
+    """train.conf_weight with defaults (absent in runs before r3 = off)."""
+    cw = r["train"].get("conf_weight") or {}
+    return {"enabled": bool(cw.get("enabled", False)), "tau": cw.get("tau"), "factor": cw.get("factor", 0.2)}
+
+
+def lr_factor(step: int, warmup: int, total: int | None, min_ratio: float = 0.0, schedule: str = "cosine") -> float:
+    """lr multiplier verl applies while TRAINING step `step` (1-based) — closed form of
+    verl.utils.torch_functional.get_{cosine,constant}_schedule_with_warmup with zero-indexed steps: step k
+    trains at lambda(k-1), so step 1 trains at 0. The logged actor/lr of step k is read after the scheduler
+    stepped, i.e. lr x lr_factor(k + 1)."""
+    cur = step - 1
+    warmup = max(0, warmup)
+    if cur < warmup:
+        return cur / max(1, warmup)
+    if schedule != "cosine":
+        return 1.0
+    progress = (cur - warmup) / max(1, (total or 0) - warmup)
+    return max(min_ratio, math.cos(math.pi * progress) * (1 - min_ratio) * 0.5 + (1 + min_ratio) * 0.5)
+
+
 def memory_budget(r: dict) -> dict:
     m, gmu = r["memory"], r["rollout"]["gpu_memory_utilization"]
     rollout_gb = gmu * m["total_gb"]
@@ -78,21 +111,52 @@ def memory_budget(r: dict) -> dict:
             "total_gb": round(total, 1), "limit_gb": m["limit_gb"], "ok": total <= m["limit_gb"]}
 
 
+def _git(*args: str) -> str | None:
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return None
+
+
+def git_dirty() -> dict | None:
+    """Uncommitted state of the code a run starts from: changed + untracked files (gitignored data/logs are
+    not listed) and a hash over `git diff HEAD` + the untracked files' bytes. None outside a git checkout."""
+    status = _git("status", "--porcelain", "--untracked-files=all")
+    if status is None:
+        return None
+    files = sorted(line[3:] for line in status.splitlines() if line.strip())
+    h = hashlib.sha256((_git("diff", "HEAD", "--binary") or "").encode())
+    for line in sorted(status.splitlines()):
+        if line.startswith("??"):
+            f = REPO / line[3:]
+            if f.is_file():
+                h.update(line[3:].encode() + b"\0" + f.read_bytes())
+    return {"files": files, "sha256_16": h.hexdigest()[:16] if files else None}
+
+
 def resolved_config(r: dict) -> dict:
     """What a run was started with — written to runs/<run>/resolved_config.json by ops/grpo_run.sh."""
     import datetime
-    import subprocess
-    try:
-        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
-    except Exception:
-        head = None
+    head = _git("rev-parse", "--short", "HEAD")
     return {"schema": 1, "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-            "git_head": head, "flags": render_flags(r), "resolved": r}
+            "git_head": head.strip() if head else None, "git_dirty": git_dirty(),
+            "flags": render_flags(r), "resolved": r}
 
 
-def write_resolved(r: dict, path: Path) -> str:
-    """Create the file, or verify an existing one (resume): the knobs must match, else refuse."""
+def resolved_sha(r: dict) -> str:
+    """Fingerprint of the whole resolved profile (every knob, paths, image) — ops/grpo_run.sh takes it with the
+    flag render before the preflight and hands it to --write-resolved, so a YAML edited meanwhile is refused."""
+    return hashlib.sha256(json.dumps(r, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def write_resolved(r: dict, path: Path, expect_sha: str | None = None) -> str:
+    """Create the file, or verify an existing one (resume): the knobs must match, else refuse. Every start
+    (first or resume) also appends one line to starts.jsonl beside it — the code state of each start.
+    `expect_sha`: the resolved_sha taken when the flags were rendered — any difference refuses before writing."""
+    if expect_sha is not None and resolved_sha(r) != expect_sha:
+        raise SystemExit(f"the configuration changed since the flags were rendered (resolved_sha {expect_sha} -> "
+                         f"{resolved_sha(r)}; YAML edited during the preflight?) — start again")
     doc = resolved_config(r)
     if path.exists():
         old = json.loads(path.read_text()).get("resolved", {})
@@ -100,10 +164,15 @@ def write_resolved(r: dict, path: Path) -> str:
         if diff:
             raise SystemExit(f"{path} exists and differs in {sorted(diff)} — a resume must use the same "
                              f"configuration (or start a new run name)")
-        return "unchanged"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, indent=1))
-    return "written"
+        status = "unchanged"
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, indent=1))
+        status = "written"
+    with open(path.parent / "starts.jsonl", "a") as f:
+        f.write(json.dumps({"ts": doc["created"], "resolved_config": status, "profile": r.get("profile"),
+                            "git_head": doc["git_head"], "git_dirty": doc["git_dirty"]}) + "\n")
+    return status
 
 
 def load_run(run: str, config_path: Path = CONFIG_DEFAULT) -> dict:
@@ -214,7 +283,73 @@ def render_flags(r: dict) -> list[str]:
     ]
     if t.get("total_training_steps"):
         flags.append(f"trainer.total_training_steps={t['total_training_steps']}")
+    # --- later recipe knobs: rendered only when set (older runs re-render exactly their flags) ---
+    if t.get("lr_schedule"):
+        flags += [f"actor_rollout_ref.actor.optim.lr_scheduler_type={t['lr_schedule']}",
+                  f"actor_rollout_ref.actor.optim.min_lr_ratio={t.get('min_lr_ratio', 0.0)}"]
+    if t["kl"]:   # the KL reference log-probs need their own micro-batch (verl validate_config raises otherwise)
+        flags.append(f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={t['logprob_micro_bs']}")
+    if ro.get("calculate_log_probs"):
+        flags.append("actor_rollout_ref.rollout.calculate_log_probs=True")
+    if ro.get("logprobs_mode"):
+        flags.append(f"actor_rollout_ref.rollout.logprobs_mode={ro['logprobs_mode']}")
+    if conf_weight(r)["enabled"]:   # tau/factor are read by the loss from resolved_config.json, not Hydra
+        flags += [f"actor_rollout_ref.actor.policy_loss.loss_mode={CONF_LOSS_MODE}",
+                  f"actor_rollout_ref.model.external_lib={CONF_LOSS_LIB}"]
     return flags
+
+
+def flag_map(flags: list[str]) -> dict[str, str]:
+    return {f.lstrip("+").split("=", 1)[0]: f.split("=", 1)[1] for f in flags}
+
+
+def flag_checks(r: dict, flags: list[str]) -> dict[str, bool]:
+    """Decision values the rendered flags must carry (preflight gate `flags`; plain python, testable)."""
+    fl = flag_map(flags)
+    t, ro = r["train"], r["rollout"]
+    mt = "actor_rollout_ref.rollout.multi_turn."
+    a = "actor_rollout_ref.actor."
+    num = lambda k, d=0: float(fl.get(k, d) or d)  # noqa: E731
+    total = int(t.get("total_training_steps") or 0)
+    cw = conf_weight(r)
+    checks = {
+        "dataloader_num_workers=0": fl.get("data.dataloader_num_workers") == "0",
+        "assistant_turns>=15": num(mt + "max_assistant_turns") >= 15,
+        "user_turns>=15": num(mt + "max_user_turns") >= 15,
+        "parallel_calls>=10": num(mt + "max_parallel_calls") >= 10,
+        "val_kwargs sampled": fl.get("actor_rollout_ref.rollout.val_kwargs.do_sample") == "True"
+                              and num("actor_rollout_ref.rollout.val_kwargs.n") >= 1,
+        "custom dataset": fl.get("data.custom_cls.name") == "CorridorDataset",
+        "run dir wired": fl.get("data.grpo_run_dir") == run_paths(r)["run_dir"],
+        "no rep-pen override": not any("repetition_penalty" in f for f in flags),
+        "tool_agent loop": fl.get("actor_rollout_ref.rollout.agent.default_agent_loop") == "tool_agent",
+        "load_format=auto": fl.get("actor_rollout_ref.rollout.load_format") == "auto",
+        # an unbatched validation keeps every episode's tau2 env alive at once -> host OOM
+        "val batched (<=64 tasks)": 0 < num("data.val_batch_size") <= 64,
+        # updates per step = train_batch_size / ppo_mini_batch_size must be a whole number
+        "mini-batch divides batch": (lambda tb, mb: tb > 0 and mb > 0 and tb % mb == 0)(
+            int(num("data.train_batch_size")), int(num(a + "ppo_mini_batch_size"))),
+        "warmup set": num(a + "optim.lr_warmup_steps", -1) >= 0,
+        "no None / no duplicate keys": all(f.split("=", 1)[1] not in ("None", "") for f in flags)
+                                       and len(fl) == len(flags),
+        # --- later recipe knobs ---
+        "kl -> ref micro-batch": (fl.get(a + "use_kl_loss") != "True"
+                                  or num("actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu") > 0),
+        "cosine -> horizon + min ratio": (fl.get(a + "optim.lr_scheduler_type") != "cosine"
+                                          or (total > 0 and 0 <= num(a + "optim.min_lr_ratio", -1) <= 1)),
+        "epochs cover horizon": total == 0 or t["total_epochs"] * steps_per_epoch(r) >= total,
+        "horizon on a checkpoint": total == 0 or (t["save_freq"] > 0 and total % t["save_freq"] == 0),
+        "save_freq == test_freq": t["save_freq"] == t["test_freq"],
+        "log-probs raw": (not ro.get("calculate_log_probs")) or fl.get("actor_rollout_ref.rollout.logprobs_mode") == "raw_logprobs",
+        "conf weighting wired": (
+            (fl.get(a + "policy_loss.loss_mode") == CONF_LOSS_MODE
+             and fl.get("actor_rollout_ref.model.external_lib") == CONF_LOSS_LIB
+             and isinstance(cw["tau"], (int, float)) and 0 < cw["tau"] < 1
+             and isinstance(cw["factor"], (int, float)) and 0 < cw["factor"] <= 1)
+            if cw["enabled"] else
+            (a + "policy_loss.loss_mode" not in fl and "actor_rollout_ref.model.external_lib" not in fl)),
+    }
+    return checks
 
 
 def main() -> None:
@@ -223,10 +358,13 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=CONFIG_DEFAULT)
     ap.add_argument("--run", default=None, help="run name (required for profiles without run_default)")
     ap.add_argument("--write-resolved", type=Path, default=None, help="write/verify runs/<run>/resolved_config.json")
+    ap.add_argument("--expect-sha", default=None, help="with --write-resolved: refuse unless resolved_sha matches")
+    ap.add_argument("--print-sha", action="store_true", help="resolved_sha of the profile (whole configuration)")
     ap.add_argument("--run-env", default=None, metavar="RUN", help="KEY=value lines from an existing run's resolved config")
     ap.add_argument("--print-flags", action="store_true")
     ap.add_argument("--print-json", action="store_true")
     ap.add_argument("--memory", action="store_true")
+    ap.add_argument("--check-flags", action="store_true", help="decision checks on the rendered flags (exit 1 on a violation)")
     ap.add_argument("--paths", action="store_true")
     ap.add_argument("--env", action="store_true", help="shell KEY=value lines (run, image, run_dir, ckpt_dir)")
     a = ap.parse_args()
@@ -241,7 +379,9 @@ def main() -> None:
         ap.error("profile required (or --run-env RUN)")
     r = load_profile(a.profile, a.config, a.run)
     if a.write_resolved:
-        print(f"resolved_config: {write_resolved(r, a.write_resolved)} -> {a.write_resolved}")
+        print(f"resolved_config: {write_resolved(r, a.write_resolved, a.expect_sha)} -> {a.write_resolved}")
+    if a.print_sha:
+        print(resolved_sha(r))
     if a.print_flags:
         print("\n".join(render_flags(r)))
     if a.print_json:
@@ -253,6 +393,11 @@ def main() -> None:
         for k, v in (("RUN", r["run"]), ("IMAGE", r["image"]), ("RUN_DIR", rp["run_dir"]), ("CKPT_DIR", rp["ckpt_dir"]),
                      ("LEDGER_DIR", rp["ledger_dir"]), ("VAL_DUMP", rp["val_dump"]), ("ROLLOUT_DUMP", rp["rollout_dump"])):
             print(f"{k}={shlex.quote(str(v))}")
+    if a.check_flags:
+        bad = [k for k, v in flag_checks(r, render_flags(r)).items() if not v]
+        print("flags ok" if not bad else f"flag violations: {bad}")
+        if bad:
+            sys.exit(1)
     if a.memory:
         m = memory_budget(r)
         print(json.dumps(m))

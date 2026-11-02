@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """Preflight gates for a Stage-2 GRPO run — runs INSIDE the grpo container (CPU only), called by
-ops/grpo_run.sh before verl starts. Every gate prints OK/FAIL/INFO; any FAIL exits 1.
+ops/grpo_run.sh before verl starts. Every gate prints OK/FAIL/INFO; any FAIL exits 1. Each gate catches
+its own exceptions (the runner shows only the gate lines, no tracebacks).
 
     docker compose --profile grpo run --rm -T grpo training_pipeline/grpo_preflight.py default --run <run>
 
 Gates:
   config      profile renders, memory budget < limit
-  init        init model dir exists, fingerprint == config (the ep3 the heldout/tau2 numbers belong to)
+  init        init model dir exists, config fingerprint == config (identical for every 4B merge)
+  weights     sha256_16 over the init model's *.safetensors == paths.init_weights_fingerprint (= ep3)
   pool        parquets + manifest exist; manifest corridor sha == corridor file; row counts; roles;
               train ⊂ rl_train, val ⊂ heldout_eval, train ∩ val = ∅; tools_kwargs cover all tools
   registry    grpo_tool_config.yaml names == live tau2 env tools (13/13)
-  flags       dataloader_num_workers=0, turns >= 15 (both), max_parallel_calls >= 10, val sampling set,
-              custom dataset wired, ledger/run dir wired, no repetition_penalty override
+  flags       grpo_config.flag_checks: dataloader workers, turn/parallel caps, val sampling, dataset +
+              run dir wired, no repetition_penalty; KL -> ref micro-batch, cosine horizon, raw log-probs,
+              confidence weighting wired iff enabled
+  hydra       verl composes ppo_trainer with exactly these flags, the values arrive, validate_config passes,
+              actor/rollout/model configs build (the model config imports model.external_lib)
+  sched       verl's own lr scheduler, stepped like the trainer, == grpo_config.lr_factor for every step
+  logprobs    rollout.logprobs_mode is a mode the image's vLLM accepts
+  loss        conf_weighted registered + equals vanilla on hand-weighted advantages (hard iff enabled)
   imports     CorridorDataset, grpo_reward.compute_score, DbBahnTool importable in this image
-  roundtrip   grpo_reward parser vs stored scores on the ep3 heldout traces (--roundtrip-limit)
+  roundtrip   reward path (render -> parse -> verifier, and the full compute_score seam with constant
+              keys) vs stored scores: first --roundtrip-limit rows + every failed row (--roundtrip-all)
   prompt      INFO: unified-diff size between verl's rendered system prompt (template + tools) and
               rollout.py's eval prompt — known divergence, the step-0 validation is the real gate
+  prompt_len  every rendered train/val prompt fits data.max_prompt_length
   state       fresh run: no stale ledger/sampler state; resume: checkpoint dir present
 """
 
@@ -30,7 +40,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from training_pipeline.grpo_config import load_profile, memory_budget, render_flags, run_paths  # noqa: E402
+from training_pipeline.grpo_config import (CONF_LOSS_LIB, CONF_LOSS_MODE, conf_weight, flag_checks,  # noqa: E402
+                                           flag_map, load_profile, lr_factor, memory_budget, render_flags,
+                                           run_paths)
 
 REPO = Path(__file__).resolve().parents[1]
 RESULTS: list[tuple[str, str, str]] = []
@@ -60,11 +72,130 @@ def fingerprint_model(d: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def weights_fingerprint(d: Path) -> str | None:
+    """Same recipe as evaluation/benchmarks/tau2/preflight.py:weights_fingerprint (sha256_16 over the
+    *.safetensors bytes, sorted by name)."""
+    files = sorted(d.glob("*.safetensors"))
+    if not files:
+        return None
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode())
+        with open(f, "rb") as fh:
+            while chunk := fh.read(16 << 20):
+                h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def guarded(name: str, fn) -> None:
+    """fn() -> (ok | None, msg); an exception is a FAIL with its message."""
+    try:
+        ok, msg = fn()
+    except Exception as e:
+        ok, msg = False, f"{type(e).__name__}: {str(e)[:300]}"
+    gate(name, ok, msg)
+
+
+def compose_verl(flags: list[str]):
+    """verl's ppo_trainer config with our flags, the way main_ppo builds it (hydra + legacy-reward migration)."""
+    import os
+
+    import verl
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from verl.experimental.reward_loop import migrate_legacy_reward_impl
+    with initialize_config_dir(config_dir=os.path.join(os.path.dirname(verl.__file__), "trainer", "config"),
+                               version_base=None):
+        cfg = compose(config_name="ppo_trainer", overrides=list(flags))
+    cfg = migrate_legacy_reward_impl(cfg)
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def hydra_check(r: dict, cfg) -> tuple[bool, str]:
+    from verl.trainer.ppo.utils import need_critic, need_reference_policy
+    from verl.utils.config import omega_conf_to_dataclass, validate_config
+    t, ro, cw = r["train"], r["rollout"], conf_weight(r)
+    arr, act = cfg.actor_rollout_ref, cfg.actor_rollout_ref.actor
+    want = {
+        "use_kl_loss": (act.use_kl_loss, bool(t["kl"])),
+        "kl_loss_coef": (float(act.kl_loss_coef), float(t["kl_coef"])),
+        "lr_scheduler_type": (act.optim.lr_scheduler_type, t.get("lr_schedule") or "constant"),
+        "total_training_steps": (cfg.trainer.total_training_steps, t.get("total_training_steps") or None),
+        "calculate_log_probs": (bool(arr.rollout.calculate_log_probs), bool(ro.get("calculate_log_probs", False))),
+        "logprobs_mode": (arr.rollout.logprobs_mode, ro.get("logprobs_mode") or "processed_logprobs"),
+        "loss_mode": (act.policy_loss.loss_mode, CONF_LOSS_MODE if cw["enabled"] else "vanilla"),
+        "external_lib": (arr.model.external_lib, CONF_LOSS_LIB if cw["enabled"] else None),
+    }
+    if t.get("lr_schedule"):
+        want["min_lr_ratio"] = (float(act.optim.min_lr_ratio), float(t.get("min_lr_ratio", 0.0)))
+    bad = {k: v for k, v in want.items() if v[0] != v[1]}
+    if bad:
+        return False, f"values did not arrive: {bad}"
+    use_ref = need_reference_policy(cfg)
+    if use_ref != bool(t["kl"]):
+        return False, f"need_reference_policy={use_ref} but train.kl={t['kl']}"
+    validate_config(config=cfg, use_reference_policy=use_ref, use_critic=need_critic(cfg))
+    omega_conf_to_dataclass(arr.rollout)
+    omega_conf_to_dataclass(arr.model)          # imports model.external_lib (the confidence loss) if set
+    return True, (f"composed + validate_config ok; ref policy {'on' if use_ref else 'off'}, scheduler "
+                  f"{act.optim.lr_scheduler_type}, loss {act.policy_loss.loss_mode}, logprobs {arr.rollout.logprobs_mode}")
+
+
+def sched_check(r: dict, cfg) -> tuple[bool | None, str]:
+    import torch
+    from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+    t = r["train"]
+    total = int(t.get("total_training_steps") or 0)
+    warmup, sched, min_ratio = int(t.get("warmup_steps", -1)), t.get("lr_schedule") or "constant", float(t.get("min_lr_ratio", 0.0))
+    if total <= 0:
+        return None, "no total_training_steps — horizon = epochs x steps, not checked"
+    opt = cfg.actor_rollout_ref.actor.optim
+    if sched == "cosine" and (float(opt.num_cycles) != 0.5 or not bool(opt.zero_indexed_step)):
+        return False, f"optim.num_cycles={opt.num_cycles} zero_indexed_step={opt.zero_indexed_step} — lr_factor assumes 0.5/True"
+    sgd = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    s = (get_cosine_schedule_with_warmup(sgd, num_warmup_steps=max(warmup, 0), num_training_steps=total, min_lr_ratio=min_ratio)
+         if sched == "cosine" else get_constant_schedule_with_warmup(sgd, num_warmup_steps=max(warmup, 0)))
+    got = []
+    for _ in range(total):
+        got.append(sgd.param_groups[0]["lr"])   # the lr the trainer's step k uses
+        sgd.step()
+        s.step()
+    exp = [lr_factor(k, warmup, total, min_ratio, sched) for k in range(1, total + 1)]
+    dev = max(abs(a - b) for a, b in zip(got, exp))
+    shown = [k for k in (1, warmup, warmup + 1, 24, 32, total) if 1 <= k <= total]
+    table = " ".join(f"{k}:{got[k - 1]:.4f}" for k in dict.fromkeys(shown))
+    if warmup >= total:
+        return None, f"horizon {total} <= warmup {warmup}: the run ends inside the warmup ({table}); verl == lr_factor: {dev < 1e-9}"
+    return dev < 1e-9, f"{sched} warmup {warmup} -> {total} steps, min {min_ratio}: lr factor per step {table} (max dev {dev:.1e})"
+
+
+def logprobs_check(r: dict) -> tuple[bool | None, str]:
+    import typing
+    mode = r["rollout"].get("logprobs_mode")
+    if not mode:
+        return None, "logprobs_mode not set (verl default processed_logprobs)"
+    from vllm.config.model import LogprobsMode
+    modes = typing.get_args(LogprobsMode)
+    return mode in modes, f"{mode} in vLLM LogprobsMode {modes}; calculate_log_probs={r['rollout'].get('calculate_log_probs', False)}"
+
+
+def loss_check(r: dict) -> tuple[bool | None, str]:
+    cw = conf_weight(r)
+    import training_pipeline.grpo_conf_loss as cl
+    problems = cl.verl_check(tau=cw["tau"] if cw["enabled"] else 0.7, factor=cw["factor"])
+    if cw["enabled"]:
+        return not problems, (f"{CONF_LOSS_MODE} tau={cw['tau']} factor={cw['factor']}: registered, == vanilla on weighted "
+                              f"advantages" if not problems else f"{problems}")
+    return None, f"confidence weighting off (vanilla loss); module check {'ok' if not problems else problems}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("profile")
     ap.add_argument("--run", default=None)
     ap.add_argument("--roundtrip-limit", type=int, default=200)
+    ap.add_argument("--roundtrip-all", action="store_true", help="round-trip every row of --roundtrip-file")
     ap.add_argument("--roundtrip-file", type=Path,
                     default=REPO / "data/generated/eval/db_traces_heldout_eval_after_qwen3-4b_ep3_k8.jsonl")
     a = ap.parse_args()
@@ -72,7 +203,7 @@ def main() -> int:
     r = load_profile(a.profile, run=a.run)
     rp = run_paths(r)
     flags = render_flags(r)
-    fl = {f.lstrip("+").split("=", 1)[0]: f.split("=", 1)[1] for f in flags}
+    fl = flag_map(flags)
 
     # --- config / memory ---------------------------------------------------------------------------
     m = memory_budget(r)
@@ -85,6 +216,12 @@ def main() -> int:
     fp = fingerprint_model(init) if init.is_dir() else None
     gate("init", init.is_dir() and fp == r["paths"]["init_fingerprint"],
          f"{init} fingerprint={fp} expected={r['paths']['init_fingerprint']}")
+    exp_w = r["paths"].get("init_weights_fingerprint")
+    if exp_w:
+        guarded("weights", lambda: (lambda w: (w == exp_w, f"safetensors sha256_16={w} expected={exp_w}"))(
+            weights_fingerprint(init) if init.is_dir() else None))
+    else:
+        gate("weights", None, "paths.init_weights_fingerprint not set — skipped")
 
     # --- pool ----------------------------------------------------------------------------------------
     import pandas as pd
@@ -129,28 +266,23 @@ def main() -> int:
          f"env {len(env_tools)} / registry {len(reg_tools)} / parquet {len(pq_tools)} tools identical")
 
     # --- flags ---------------------------------------------------------------------------------------
-    mt = "actor_rollout_ref.rollout.multi_turn."
-    checks = {
-        "dataloader_num_workers=0": fl.get("data.dataloader_num_workers") == "0",
-        "assistant_turns>=15": int(fl.get(mt + "max_assistant_turns", 0)) >= 15,
-        "user_turns>=15": int(fl.get(mt + "max_user_turns", 0)) >= 15,
-        "parallel_calls>=10": int(fl.get(mt + "max_parallel_calls", 0)) >= 10,
-        "val_kwargs sampled": fl.get("actor_rollout_ref.rollout.val_kwargs.do_sample") == "True"
-                              and int(fl.get("actor_rollout_ref.rollout.val_kwargs.n", 0)) >= 1,
-        "custom dataset": fl.get("data.custom_cls.name") == "CorridorDataset",
-        "run dir wired": fl.get("data.grpo_run_dir") == rp["run_dir"],
-        "no rep-pen override": not any("repetition_penalty" in f for f in flags),
-        "tool_agent loop": fl.get("actor_rollout_ref.rollout.agent.default_agent_loop") == "tool_agent",
-        "load_format=auto": fl.get("actor_rollout_ref.rollout.load_format") == "auto",
-        # an unbatched validation keeps every episode's tau2 env alive at once -> host OOM
-        "val batched (<=64 tasks)": 0 < int(fl.get("data.val_batch_size", 0) or 0) <= 64,
-        # updates per step = train_batch_size / ppo_mini_batch_size must be a whole number
-        "mini-batch divides batch": (lambda tb, mb: tb > 0 and mb > 0 and tb % mb == 0)(
-            int(fl.get("data.train_batch_size", 0) or 0), int(fl.get("actor_rollout_ref.actor.ppo_mini_batch_size", 0) or 0)),
-        "warmup set": int(fl.get("actor_rollout_ref.actor.optim.lr_warmup_steps", -1)) >= 0,
-    }
-    bad = [k for k, v in checks.items() if not v]
-    gate("flags", not bad, "all decision values present" if not bad else f"violations: {bad}")
+    try:
+        bad = [k for k, v in flag_checks(r, flags).items() if not v]
+        gate("flags", not bad, f"all decision values present ({len(flags)} flags)" if not bad else f"violations: {bad}")
+    except Exception as e:
+        gate("flags", False, f"{type(e).__name__}: {e}")
+
+    # --- verl's own view of the flags: hydra compose, validate_config, scheduler, log-probs, loss ------
+    cfg = None
+    try:
+        cfg = compose_verl(flags)
+    except Exception as e:
+        gate("hydra", False, f"compose failed: {type(e).__name__}: {str(e)[:300]}")
+    if cfg is not None:
+        guarded("hydra", lambda: hydra_check(r, cfg))
+        guarded("sched", lambda: sched_check(r, cfg))
+    guarded("logprobs", lambda: logprobs_check(r))
+    guarded("loss", lambda: loss_check(r))
 
     # --- imports -------------------------------------------------------------------------------------
     try:
@@ -162,22 +294,15 @@ def main() -> int:
         gate("imports", False, f"{type(e).__name__}: {e}")
 
     # --- round-trip ----------------------------------------------------------------------------------
-    if a.roundtrip_limit > 0 and a.roundtrip_file.exists():
-        from evaluation.grpo_reward import hermes_to_messages, render_verl_response
-        from evaluation.trajectory_reward import score_trajectory
-        tasks = {t["id"]: t for t in json.loads((REPO / "data/raw/db_sandbox/tasks.json").read_text())}
-        keys = json.loads((REPO / "data/raw/db_sandbox/answer_keys.json").read_text())
-        n = same = 0
-        with open(a.roundtrip_file) as f:
-            for line in f:
-                if n >= a.roundtrip_limit:
-                    break
-                rec = json.loads(line)
-                n += 1
-                res = score_trajectory(tasks[rec["task_id"]], hermes_to_messages(render_verl_response(rec["messages"])),
-                                       keys.get(rec["task_id"]))
-                same += res["score"] == rec["score"]["score"] and res["components"] == rec["score"]["components"]
-        gate("roundtrip", same == n, f"{same}/{n} identical scores ({a.roundtrip_file.name})")
+    if (a.roundtrip_limit > 0 or a.roundtrip_all) and a.roundtrip_file.exists():
+        def _rt():
+            from evaluation.grpo_reward import roundtrip_file
+            rt = roundtrip_file(a.roundtrip_file, None if a.roundtrip_all else a.roundtrip_limit, include_fails=True, verbose=3)
+            return rt["ok"] == rt["n"] and rt["failed_rows"] > 0, (
+                f"{rt['ok']}/{rt['n']} identical incl. {rt['failed_rows']} failed rows, keys constant "
+                f"({a.roundtrip_file.name}, {rt['seconds']}s)" + (f" problems {rt['problems']} e.g. {rt['examples']}"
+                                                                   if rt["problems"] else ""))
+        guarded("roundtrip", _rt)
     else:
         gate("roundtrip", None, "skipped")
 
@@ -198,16 +323,22 @@ def main() -> int:
         changed = sum(1 for d in diff if d[:1] in "+-" and not d.startswith(("+++", "---")))
         gate("prompt", None, f"verl prompt {len(tok(verl_prompt).input_ids)} tok vs eval prompt "
                              f"{len(tok(eval_prompt).input_ids)} tok; {changed} differing lines (known divergence)")
-        # hard gate: every rendered prompt (train + val) must fit data.max_prompt_length with margin
+    except Exception as e:
+        gate("prompt", None, f"parity check skipped: {type(e).__name__}: {e}")
+
+    # hard gate: every rendered prompt (train + val) must fit data.max_prompt_length with margin
+    def _prompt_len():
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(str(init))
+        schemas = [t.openai_schema for t in get_environment(solo_mode=True).get_tools()]
         limit = int(fl["data.max_prompt_length"])
         longest = 0
         for df in (train, val):
             for pr in df["prompt"]:
                 longest = max(longest, len(tok(tok.apply_chat_template(list(pr), tools=schemas, tokenize=False,
                                                                       add_generation_prompt=True)).input_ids))
-        gate("prompt_len", longest + 64 <= limit, f"longest rendered prompt {longest} tok vs max_prompt_length {limit}")
-    except Exception as e:
-        gate("prompt", None, f"parity check skipped: {type(e).__name__}: {e}")
+        return longest + 64 <= limit, f"longest rendered prompt {longest} tok vs max_prompt_length {limit}"
+    guarded("prompt_len", _prompt_len)
 
     # --- run state -----------------------------------------------------------------------------------
     ckpt = Path(rp["ckpt_dir"])
