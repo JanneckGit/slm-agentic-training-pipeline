@@ -226,9 +226,12 @@ bash ops/traj_sft_pipeline.sh   # precondition+model-gate -> traj_sft -> merge x
 **Stage 2 — GRPO (verl)** — every knob lives in `config/grpo_db_bahn.yaml`. A profile is a configuration
 variant (`default`, `smoke`, `smoke_static`); the run name is given on the command line and names the run's
 folders, and each run keeps the configuration it was started with in `runs/<run>/resolved_config.json`.
-The preflight runs inside the container and blocks on pool, init fingerprint, tool registry, flags,
-reward-parser round-trip, prompt length and run state. Ledger, sampler state and dumps land in
-`data/final/grpo/runs/<run>/`, verl checkpoints in `data/final/grpo/verl_ckpt/<run>/`:
+The preflight runs inside the container and blocks on pool, init config + weights fingerprint, tool registry,
+flags, verl's own view of them (Hydra compose + `validate_config`, the lr scheduler stepped like the trainer,
+the vLLM log-prob mode, the policy loss), the reward round-trip (first 200 traces + every failed one, through
+the whole `compute_score` seam), prompt length and run state. Ledger, sampler state and dumps land in
+`data/final/grpo/runs/<run>/` (plus `starts.jsonl`: the code state of every start), verl checkpoints in
+`data/final/grpo/verl_ckpt/<run>/`:
 
 ```bash
 # corridor: 8 rollouts per rl_train task with the SFT model -> the templates it does not solve consistently
@@ -239,11 +242,27 @@ GRPO_IMAGE=agentic-grpo:verl docker compose -f docker/docker-compose.yml --profi
   training_pipeline/build_grpo_pool.py --corridor /app/data/generated/eval/rl_corridor_<label>_k8.json \
   --traces /app/data/generated/eval/db_traces_rl_train_<label>_k8.jsonl --pool-id <pool-id>   # then set paths.pool_dir
 
-bash ops/grpo_run.sh smoke                         # 2-step smoke: preflight -> verl -> 24-task validation
+bash ops/grpo_run.sh smoke [<run>]                 # 2-step smoke: preflight -> verl -> 24-task validation
 bash ops/grpo_run.sh default <run>                 # the run (tmux); rerun the same command to resume
-python3 training_pipeline/grpo_metrics.py <run> --select   # ledger stats, exact pass^8, stop rule, `selected` (--mlflow: inside the grpo container)
+python3 training_pipeline/grpo_metrics.py <run>    # ledger stats, exact pass^8, divergence alarm, failures by template class,
+                                                   #   reward error flags, stop rule (--mlflow: inside the grpo container)
+python3 training_pipeline/grpo_metrics.py <run> --select   # best validated checkpoint before a divergence onset -> `selected`
+python3 training_pipeline/grpo_metrics.py <run> --pick-step <N> --note "<why>"   # manual choice (override block;
+                                                   #   --select then refuses to overwrite it without --force)
 bash ops/grpo_export.sh <run> selected             # verl checkpoint -> LoRA adapter -> merged model
 bash ops/eval_heldout.sh /app/data/final/checkpoints/db_bahn_grpo_merged_qwen3-4b/<run>/step_<N> after_<run>
+python3 evaluation/k8_class_compare.py --base <A_k8.jsonl> --cand <B_k8.jsonl>   # paired K=8 comparison by template class
+bash ops/grpo_post_eval.sh <run> <step> [<step> ...]   # in tmux: waits for the run, then export + K=8 eval + comparison per candidate; selection stays manual
+```
+
+The optional confidence-weighted loss (`train.conf_weight`, `training_pipeline/grpo_conf_loss.py`) is switched on
+only by its diagnosis — a teacher-forced pass of the init model over its own failed heldout traces with a decision
+rule fixed beforehand:
+
+```bash
+GRPO_IMAGE=agentic-grpo:verl docker compose -f docker/docker-compose.yml --profile grpo run --rm -T grpo \
+  evaluation/conf_diagnosis.py measure --model <merged model dir> --traces <heldout_k8.jsonl> --label <label> --out <json>
+python3 evaluation/conf_diagnosis.py decide --ep3 <json> [--s24 <json>] [--corridor <json>]
 ```
 
 **In-domain eval, standalone** — any model (base, merged checkpoint, experiment), **K=8 rollouts per
@@ -344,14 +363,16 @@ What `ops/grpo_run.sh default <run>` launches (`config/grpo_db_bahn.yaml`, profi
 |------|-------|------|
 | Vehicle | **verl 0.8.0** (frozen image `agentic-grpo:verl`) | in-process vLLM rollout + tool-agent loop against the real tau2 env |
 | Init | merged SFT ep3 + **fresh LoRA r=16 / α=32** | the RL adapter is merged into ep3 afterwards (`ops/grpo_export.sh`) |
-| Algorithm | **Dr.GRPO** (advantage = reward − group mean), no KL (switch), lr 2e-5 with 4 warmup steps, then constant | **two updates per step**: mini-batch 8 of the 16 prompts, the PPO clip (0.2) covers the slightly off-policy second half |
+| Algorithm | **Dr.GRPO** (advantage = reward − group mean) + **KL anchor** (low_var_kl, coef 0.01; reference = the actor with the LoRA switched off = ep3), lr 2e-5, 4 warmup steps, **cosine** to 0.1 × lr at the fixed horizon of **40 steps** | **two updates per step**: mini-batch 8 of the 16 prompts, the PPO clip (0.2) covers the slightly off-policy second half |
+| Loss weighting | optional confidence weighting (`train.conf_weight`): in rollouts with negative advantage, tokens sampled with p > τ get a reduced gradient | off by default; on only after `conf_diagnosis.py decide`; a registered verl loss (`grpo_conf_loss.py`), no verl patch |
 | Step / epoch | **16 prompts × 8 rollouts**; epoch = 128 draws = 8 steps | checkpoint + validation every epoch |
 | Pool | all tasks of every template with ≥1 corridor task (1–7 of 8 successes) | `build_grpo_pool.py`; corridor tasks are the core, their 8/8 siblings hedge the measurement noise |
 | Sampling | ledger-driven weights p̂(1−p̂) with p̂ = 0.7·own rate + 0.3·template rate, low-variance resampling, aging for failed tasks; `static` switch | `CorridorDataset` (`grpo_dataset.py`) reads the ledger `grpo_reward.py` appends to |
 | Rollout | thinking on, temp 1.0 / top_p 0.95 / top_k 20; prompt 6144 + response 8192; 15 assistant + 15 user turns; up to 10 parallel calls | same verifier and tool truncation as SFT/eval |
 | Reward | binary `trajectory_reward.py` via `grpo_reward.py` (episode text → messages → replay on a fresh DB) | parser round-trip is a preflight gate |
 | Validation | full heldout, **K=8**, temp 0.6, every epoch + step 0 | exact pass^8 from the dumps (`grpo_metrics.py`) |
-| Stop / select | informative-group share < 20 % · 3 validations without a new heldout best · 15-epoch cap → best exact pass^8 (`--select`) | applied by the watcher via `grpo_metrics.py`; nothing selected if step 0 is not beaten |
+| Stop / select | the run ends at the horizon; advisory stop rule (informative-group share < 20 % · 3 validations without a new heldout best); **divergence alarm** (entropy > 2 × its epoch-0 mean or response clip ratio > 5 %, two steps in a row) → checkpoints from its onset on are excluded → best exact pass^8 (`--select`), or a manual `--pick-step` after the external K=8 eval | `grpo_metrics.py`; nothing selected if step 0 is not beaten; a manual override is protected |
+| Diagnostics | rollout-vs-actor log-prob mismatch (vLLM `raw_logprobs`), reward error flags (`adapter_error`, `verifier_error`) in every dump, lr check against the closed form, failures by template class | `training/rollout_probs_diff_*` in MLflow; the reward always returns the same keys, so a scoring failure is a flagged 0.0, never a crashed run |
 | Memory | rollout share 0.30, validation in batches of 16 tasks (128 live episodes), dataloader workers 0, micro-batch 1 | rollout vLLM, FSDP actor and one tau2 env per live episode share the 128 GB unified memory |
 
 ## Repo layout
@@ -387,13 +408,18 @@ training_pipeline/               Stage 1 SFT · Stage 2 GRPO layer around verl
 ├── grpo_dataset.py              CorridorDataset: verl dataset that draws by ledger weights
 ├── grpo_config.py               grpo_db_bahn.yaml profile -> verl flags, memory budget, paths
 ├── grpo_preflight.py            container-side gates before every run
-├── grpo_metrics.py              ledger + validation dumps -> informative share, exact pass^8, stop rule, selection
+├── grpo_metrics.py              ledger + dumps + MLflow -> informative share, exact pass^8, divergence alarm,
+│                                template classes, error flags, stop rule, selection (--select / --pick-step)
+├── grpo_conf_loss.py            optional confidence-weighted policy loss (registered verl loss mode)
 ├── grpo_db_bahn_tools.py        the tau2 tools as verl BaseTools
 └── grpo_tool_config.yaml        verl tool registry
 
 evaluation/
 ├── trajectory_reward.py         the verifier = the Stage-2 reward
-├── grpo_reward.py               verl seam: episode text -> messages (+ ledger line per rollout, round-trip self-test)
+├── grpo_reward.py               verl seam: episode text -> messages, constant reward keys + error flags
+│                                (+ ledger line per rollout, round-trip self-test)
+├── conf_diagnosis.py            confidence at the wrong digit: measure (GPU) + pre-registered decide rule
+├── k8_class_compare.py          paired K=8 comparison of two models by template class
 ├── eval_report.py               per-template pass^k + mean table, optional baseline delta
 ├── corridor_from_traces.py      k-sample rollout JSONL -> per-task success rates (the corridor file)
 ├── benchmarks/bfcl/             BFCL v4 harness glue
