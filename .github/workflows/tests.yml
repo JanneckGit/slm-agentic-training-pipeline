@@ -5,7 +5,8 @@
 #   regenerated from the tracked GTFS snapshot on a cache miss: seed_worldstate takes 0.4 s, gen_tasks
 #   ~40 min on GB10 (it deep-copies the DB per task) — hence the cache keyed on generator + GTFS and the
 #   generous timeout for a first run. The regeneration is byte-reproducible (seed 42, README).
-# collator-test: the loss-mask golden test with CPU torch + the training image's transformers pin.
+# collator-test: the loss-mask golden test + the GRPO confidence weights, CPU torch + the training image's
+#   transformers pin.
 name: tests
 
 on:
@@ -79,5 +80,5 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-tokenizer-qwen3-4b
-      - name: pytest (collator)
-        run: python -m pytest -q tests/test_collator_multiturn.py
+      - name: pytest (collator + confidence weights)
+        run: python -m pytest -q tests/test_collator_multiturn.py tests/test_grpo_conf_loss.py

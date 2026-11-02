@@ -1,8 +1,9 @@
-# docker/docker-compose.cpu.yml — override for GPU-FREE runs of the training service (the test runner).
-# Stack it on the main file:
+# docker/docker-compose.cpu.yml — override for GPU-FREE runs of the training and grpo services (the test
+# runner, CPU checks of the GRPO stack). Stack it on the main file:
 #   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cpu.yml run --rm -T training …
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cpu.yml --profile grpo run --rm -T grpo …
 #
-# `deploy` on the training service holds nothing but the GPU reservation -> !reset removes it. Docker's
+# `deploy` on these services holds nothing but the GPU reservation -> !reset removes it. Docker's
 # default runtime on this box is runc, so no device request = no GPU, whatever the NGC image's
 # NVIDIA_VISIBLE_DEVICES=all says. The two env vars are the belt-and-braces layer: even if a runtime ever
 # attached the device, torch could not see it. The shared GPU is never touched by a test run
@@ -10,6 +11,11 @@
 # Training / eval / SDG keep using the main file alone — with the GPU.
 services:
   training:
+    deploy: !reset {}
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=void
+      - CUDA_VISIBLE_DEVICES=
+  grpo:
     deploy: !reset {}
     environment:
       - NVIDIA_VISIBLE_DEVICES=void
