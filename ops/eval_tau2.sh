@@ -21,7 +21,17 @@
 #                                  (Defaults aus benchmark_config: agent=hermes, sim=qwen3_xml)
 #   TAU2_BASELINE=<root>           Δ-Spalte im Report gegen einen Vergleichslauf
 #   VLLM_GPU_UTIL / VLLM_USER_GPU_UTIL   GPU-Budgets (Defaults aus dem Manifest; Summe <= ~0.85!)
+#   VLLM_IMAGE / VLLM_USER_IMAGE   vLLM-Image fuer Agent / User-Sim (Default: v0.21.0 per Digest im
+#                                  Compose). tau2 ist NUR auf v0.21 vergleichbar: v0.30 erzwingt gueltige
+#                                  Tool-Calls. Der Sim hat eine eigene Variable, weil er zum Messgeraet gehoert.
+#   ALLOW_VLLM_CHANGE=1            Resume trotz anderer vLLM-Version/anderem Image (sonst Abbruch)
 #   SKIP_MLFLOW=1                  kein MLflow-Log (bei Smokes automatisch)
+#
+# $ROOT/serve_info.json haelt je Instanz fest, was WIRKLICH serviert wurde: vLLM-Version, Image,
+# effektive GPU-Util (inkl. Env-Override) und "verfuegbar" nach dem Start; je Start ein Eintrag.
+# Ein Label = eine vLLM-Version: ein Resume auf anderem Image bricht ab (evaluation/serve_info.py).
+# MLflow loggt NUR einen sauberen Lauf (run_rc = report_rc = 0). Strg+C, Crash oder infra-Fehler ->
+# kein MLflow-Eintrag; der Befehl zum Nachtragen von Hand steht dann im Log.
 #
 # WICHTIG (Gegenteil der BFCL-Regel!): tau2 nutzt die Chat-API mit nativer tools-API
 # und strippt <think> NIRGENDS -> beide vLLM-Instanzen laufen MIT
@@ -114,6 +124,10 @@ VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-$A_UTIL}" VLLM_MAX_MODEL_LEN
   VLLM_EXTRA_ARGS="--max-num-seqs $A_SEQS --served-model-name $ALIAS $AGENT_PARSER_ARGS" \
   $COMPOSE --profile vllm up -d vllm >>"$LOG" 2>&1
 wait_health 8000 text2sql_vllm_teacher || { echo "== Agent-vLLM kam nicht hoch"; exit 1; }
+# Version/Image/Util festhalten — VOR dem Sim-Start, damit ein Versionswechsel beim Resume sofort abbricht
+"$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role agent --port 8000 \
+  --container text2sql_vllm_teacher --gpu-util "${VLLM_GPU_UTIL:-$A_UTIL}" --gate 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -ne 0 ] && { echo "== serve_info agent fehlgeschlagen — abort" | tee -a "$LOG"; exit 1; }
 
 echo "== Serve User-Sim :8001 ($U_MODEL, util=${VLLM_USER_GPU_UTIL:-$U_UTIL})" | tee -a "$LOG"
 VLLM_USER_MODEL="$U_MODEL" VLLM_USER_GPU_UTIL="${VLLM_USER_GPU_UTIL:-$U_UTIL}" \
@@ -121,6 +135,9 @@ VLLM_USER_MODEL="$U_MODEL" VLLM_USER_GPU_UTIL="${VLLM_USER_GPU_UTIL:-$U_UTIL}" \
   VLLM_USER_EXTRA_ARGS="--max-num-seqs $U_SEQS $U_EXTRA $USER_PARSER_ARGS" \
   $COMPOSE --profile vllm-user up -d vllm-user >>"$LOG" 2>&1
 wait_health 8001 text2sql_vllm_user    || { echo "== User-vLLM kam nicht hoch"; exit 1; }
+"$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role user_sim --port 8001 \
+  --container text2sql_vllm_user --gpu-util "${VLLM_USER_GPU_UTIL:-$U_UTIL}" --gate 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" -ne 0 ] && { echo "== serve_info user_sim fehlgeschlagen — abort" | tee -a "$LOG"; exit 1; }
 
 # Identity-Gates: es muss der ALIAS bzw. das Sim-Modell antworten, nicht ein Fallback.
 curl -sf localhost:8000/v1/models | grep -qF "\"$ALIAS\"" || {
@@ -177,10 +194,16 @@ report_rc=${PIPESTATUS[0]}
 
 case "$LABEL" in smoke*) SKIP_MLFLOW=${SKIP_MLFLOW:-1};; esac
 [ -n "${TAU2_NUM_TASKS:-}${TAU2_TASK_IDS:-}" ] && SKIP_MLFLOW=${SKIP_MLFLOW:-1}
-if [ "${SKIP_MLFLOW:-0}" != "1" ]; then
-  MLFLOW_TRACKING_URI="file://$REPO/mlruns" MLFLOW_ALLOW_FILE_STORE=true \
-    "$TAU2PY" "$BENCH/log_mlflow.py" --run "$ROOT" \
-      --experiment "${MLFLOW_EXPERIMENT:-tau2_eval}" 2>&1 | tee -a "$LOG" | tail -2
+MLFLOW_CMD=(env MLFLOW_TRACKING_URI="file://$REPO/mlruns" MLFLOW_ALLOW_FILE_STORE=true
+            "$TAU2PY" "$BENCH/log_mlflow.py" --run "$ROOT" --experiment "${MLFLOW_EXPERIMENT:-tau2_eval}")
+if [ "${SKIP_MLFLOW:-0}" = "1" ]; then
+  :
+elif [ "$gen_rc" -ne 0 ] || [ "$report_rc" -ne 0 ]; then
+  # Halber/fehlerhafter Lauf (Strg+C = rc 130, Crash, infra-Fehler, Think-Leak) gehoert nicht nach MLflow.
+  echo "== MLflow NICHT geloggt (run_rc=$gen_rc report_rc=$report_rc) — nach Pruefung von Hand: ${MLFLOW_CMD[*]}" \
+    | tee -a "$LOG"
+else
+  "${MLFLOW_CMD[@]}" 2>&1 | tee -a "$LOG" | tail -2
 fi
 
 echo "== done: $ROOT | report_rc=$report_rc run_rc=$gen_rc" | tee -a "$LOG"

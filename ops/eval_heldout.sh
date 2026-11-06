@@ -30,6 +30,8 @@
 #               erlaubt nur, wenn die Sidecar <OUT>.meta.json (Modell, Label, Split, K, Sampling, Serve-Flags, Timeouts)
 #               exakt zu diesem Aufruf passt — sonst Abbruch VOR dem Serve. Eine halb geschriebene letzte Zeile wird verworfen.
 #   WRITE_META_ONLY (0)  1 = nur die Sidecar fuer eine vorhandene (Legacy-)Ausgabe schreiben, kein Serve, kein Rollout.
+#   VLLM_IMAGE  vLLM-Image (Default v0.21.0 per Digest im Compose); was wirklich serviert wurde (Version, Image,
+#               Util, "verfuegbar") steht je Start in der Sidecar <OUT>.serve.json (evaluation/serve_info.py).
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -132,7 +134,7 @@ PY
   N_HAVE=$(wc -l < "$OUT"); RESUME_SUF="_resume"
   echo "   resume  : $N_HAVE vorhanden, $((EXPECTED_ROWS - N_HAVE)) fehlen (Soll $EXPECTED_ROWS) — Sidecar passt"
 else
-  rm -f "$OUT" "$META"
+  rm -f "$OUT" "$META" "${OUT}.serve.json"
   meta_json > "$META"
 fi
 trap teardown EXIT
@@ -164,6 +166,10 @@ if [ "$SERVED" != "$MODEL" ]; then
 fi
 docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
   | tail -1 | sed 's/^/   vLLM: /'
+# Was WIRKLICH serviert wurde (vLLM-Version/Image/Util) -> Sidecar ${OUT}.serve.json. Ohne Gate: rollout.py
+# macht Prompt-and-Parse (kein tools-Parameter), die vLLM-Version wirkt hier nicht (anders als bei tau2).
+"$TAU2PY" evaluation/serve_info.py record --file "${OUT}.serve.json" --role server --port 8000 \
+  --container text2sql_vllm_teacher --gpu-util "${VLLM_GPU_UTIL:-0.85}" 2>&1 | sed 's/^/   /'
 
 # Ausgabe: frisch angelegt oder per RESUME fortgesetzt (siehe oben).
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /

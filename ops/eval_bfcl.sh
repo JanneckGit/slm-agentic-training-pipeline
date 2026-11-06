@@ -63,6 +63,9 @@
 #                               (Smoke-/Probe-Modus, zieht automatisch --partial-eval nach und
 #                               setzt SKIP_MLFLOW=1, damit Smokes mlruns nicht verschmutzen).
 #   MLFLOW_EXPERIMENT (bfcl_eval)   SKIP_MLFLOW (0; 1 bei BFCL_RUN_IDS)   BFCLPY (.venv-bfcl/bin/python)
+#   VLLM_IMAGE                  vLLM-Image (Default v0.21.0 per Digest im Compose)
+# MLflow loggt NUR einen sauberen Lauf (generate/evaluate/Report rc = 0). $ROOT/serve_info.json haelt
+# vLLM-Version, Image und Util je Start fest (evaluation/serve_info.py).
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -156,6 +159,10 @@ if [ "$SERVED" != "$ALIAS" ]; then
 fi
 docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
   | tail -1 | sed 's/^/   vLLM: /' | tee -a "$LOG"
+# Was WIRKLICH serviert wurde (vLLM-Version/Image/Util) -> $ROOT/serve_info.json. Ohne Gate: BFCL laeuft ueber
+# /v1/completions mit eigenem Prompt, die vLLM-Version wirkt hier nicht (anders als bei tau2).
+"$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role server --port 8000 \
+  --container text2sql_vllm_teacher --gpu-util "${VLLM_GPU_UTIL:-0.85}" 2>&1 | tee -a "$LOG"
 
 # ---------------------------------------------------------------------------------------------
 # 3) Generieren + Auswerten — via run_bfcl.py, das den im Manifest festgehaltenen Registry-
@@ -192,6 +199,7 @@ done
 
 echo "-- evaluate" | tee -a "$LOG"
 "$BFCLPY" "${BFCL_SHIM[@]}" evaluate "${EVAL_ARGS[@]}" 2>&1 | tee -a "$LOG" | tail -5
+eval_rc=${PIPESTATUS[0]}
 
 # ---------------------------------------------------------------------------------------------
 # 4) Report + MLflow. Der Report liefert Exit 1, wenn Items mit input_token_count 0 auftauchen —
@@ -204,10 +212,17 @@ report_rc=${PIPESTATUS[0]}
 # Smokes (ID-Modus) landen nicht in MLflow: ein 4-Item-Lauf neben echten 5.017-Item-Zeilen im
 # selben Experiment waere Verschmutzung. Explizites SKIP_MLFLOW=0 uebersteuert.
 [ -n "${BFCL_RUN_IDS:-}" ] && SKIP_MLFLOW=${SKIP_MLFLOW:-1}
-if [ "${SKIP_MLFLOW:-0}" != "1" ]; then
-  MLFLOW_TRACKING_URI="file://$REPO/mlruns" MLFLOW_ALLOW_FILE_STORE=true \
-    "$TAU2PY" evaluation/benchmarks/bfcl/log_mlflow.py --run "$ROOT" \
-      --experiment "${MLFLOW_EXPERIMENT:-bfcl_eval}" 2>&1 | tee -a "$LOG" | tail -2
+# Nur ein SAUBERER Lauf landet in MLflow: Strg+C (bfcl endet mit "Aborted!" / Exit 1), ein Crash oder ein
+# fehlgeschlagenes evaluate/Report liefern rc != 0 -> kein halber Lauf in MLflow. Nachtragen von Hand moeglich.
+MLFLOW_CMD=(env MLFLOW_TRACKING_URI="file://$REPO/mlruns" MLFLOW_ALLOW_FILE_STORE=true
+            "$TAU2PY" evaluation/benchmarks/bfcl/log_mlflow.py --run "$ROOT" --experiment "${MLFLOW_EXPERIMENT:-bfcl_eval}")
+if [ "${SKIP_MLFLOW:-0}" = "1" ]; then
+  :
+elif [ "$gen_rc" -ne 0 ] || [ "$eval_rc" -ne 0 ] || [ "$report_rc" -ne 0 ]; then
+  echo "== MLflow NICHT geloggt (generate_rc=$gen_rc evaluate_rc=$eval_rc report_rc=$report_rc) — nach Pruefung von Hand: ${MLFLOW_CMD[*]}" \
+    | tee -a "$LOG"
+else
+  "${MLFLOW_CMD[@]}" 2>&1 | tee -a "$LOG" | tail -2
 fi
 
 echo "==== BFCL $LABEL DONE $(date '+%F %T') -> $ROOT ====" | tee -a "$LOG"

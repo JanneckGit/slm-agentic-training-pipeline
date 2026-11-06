@@ -76,8 +76,20 @@ def main() -> int:
         rc = (m["domains"].get("banking_knowledge") or {}).get("retrieval_config")
         if rc:
             params["banking_retrieval_config"] = rc
+        # Was WIRKLICH serviert wurde (eval_tau2.sh -> evaluation/serve_info.py); fehlt bei Laeufen vor 2026-11-06.
+        serve_path = a.run / "serve_info.json"
+        if serve_path.exists():
+            si = json.loads(serve_path.read_text())
+            last = {e.get("role"): e for e in si.get("events", [])}
+            for role in ("agent", "user_sim"):
+                ident = si.get(role) or {}
+                params[f"vllm_version_{role}"] = ident.get("vllm_version")
+                params[f"vllm_image_{role}"] = (ident.get("image_id") or "").split(":", 1)[-1][:12] or None
+                params[f"gpu_util_{role}_served"] = (last.get(role) or {}).get("gpu_util")
         mlflow.log_params(params)
         mlflow.log_artifact(str(manifest_path))
+        if serve_path.exists():
+            mlflow.log_artifact(str(serve_path))
         report_txt = a.run / "logs" / "run.log"
         if report_txt.exists():
             mlflow.log_artifact(str(report_txt))
