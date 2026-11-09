@@ -12,6 +12,9 @@ The eval scripts call this right after a server reports healthy:
     serve_info.py record --file <run>/serve_info.json --role agent --port 8000 \
         --container text2sql_vllm_teacher --gpu-util 0.22 [--gate]
 
+Without --container (a server started from a venv, no Docker) the image fields stay empty and the identity
+rests on the /version answer alone.
+
 The JSON file holds:
   * one identity per role (`agent`, `user_sim`, `server`, ...): {vllm_version, image_id, image_ref},
     fixed at the first start;
@@ -140,13 +143,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--file", type=Path, required=True)
     r.add_argument("--role", required=True)
     r.add_argument("--port", type=int, required=True)
-    r.add_argument("--container", required=True)
+    r.add_argument("--container", default=None, help="container to read the image from; omit for a venv server")
     r.add_argument("--gpu-util", type=float)
     r.add_argument("--gate", action="store_true")
     a = ap.parse_args(argv)
 
     version = fetch_version(a.port)
-    image_id, image_ref = docker_image(a.container)
+    image_id, image_ref = docker_image(a.container) if a.container else (None, None)
     if version is None and image_id is None:
         print(f"== vLLM {a.role}: nichts messbar (kein /version auf :{a.port}, kein Container "
               f"{a.container}) — nichts geschrieben", file=sys.stderr)

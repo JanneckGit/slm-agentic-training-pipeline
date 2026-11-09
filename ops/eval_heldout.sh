@@ -32,12 +32,37 @@
 #   WRITE_META_ONLY (0)  1 = nur die Sidecar fuer eine vorhandene (Legacy-)Ausgabe schreiben, kein Serve, kein Rollout.
 #   VLLM_IMAGE  vLLM-Image (Default v0.21.0 per Digest im Compose); was wirklich serviert wurde (Version, Image,
 #               Util, "verfuegbar") steht je Start in der Sidecar <OUT>.serve.json (evaluation/serve_info.py).
+#   CHAT_TEMPLATE_KWARGS  zusaetzliche Template-Schalter als JSON-Objekt (z. B. '{"preserve_thinking": true}'), ueber
+#               enable_thinking gemergt; steht nur dann in der Sidecar-Identitaet (alte Sidecars bleiben resume-faehig).
+#   MLFLOW (1)  0 = kein MLflow-Log (z. B. auf einem Fremdrechner; spaeter per evaluation/log_heldout_mlflow.py nachtragen).
 # Das vollstaendige vLLM-Server-Log landet beim Teardown (auch bei Abbruch) als <OUT>.vllm-<UTC>.log.gz daneben.
+#
+# SERVE — wer den Server stellt (Default compose = Verhalten wie bisher):
+#   compose  vLLM-Container per docker compose (GB10).
+#   venv     `$VLLM_BIN serve` aus einer venv, gleiche Flags wie der Compose-Befehl, nur 127.0.0.1:$SERVE_PORT (Default 8000;
+#            Rechner ohne Docker, z. B. die H100). Ist der Port belegt, bricht das Skript ab — es beendet nie fremde Prozesse.
+#   none     kein Start, kein Teardown: ein laufender Endpunkt unter API_BASE (Default http://localhost:8000/v1) wird
+#            benutzt; Modellpruefung = "Modell ist in /v1/models gelistet". Baustein fuer spaetere API-Laeufe.
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 COMPOSE="docker compose -f docker/docker-compose.yml"
 TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
+SERVE=${SERVE:-compose}
+case "$SERVE" in compose|venv|none) ;; *) echo "SERVE muss compose, venv oder none sein, ist '$SERVE'"; exit 2;; esac
+API_BASE=${API_BASE:-http://localhost:8000/v1}
+SERVE_PORT=${SERVE_PORT:-8000}
+[ "$SERVE" = compose ] && [ "$SERVE_PORT" != 8000 ] && { echo "SERVE=compose: der Port ist im Compose fest 8000"; exit 2; }
+VLLM_BIN=${VLLM_BIN:-vllm}
+MLFLOW=${MLFLOW:-1}
+CHAT_TEMPLATE_KWARGS=${CHAT_TEMPLATE_KWARGS:-}
+if [ "$SERVE" = venv ] && ! command -v "$VLLM_BIN" >/dev/null 2>&1; then
+  echo "SERVE=venv: VLLM_BIN '$VLLM_BIN' nicht gefunden"; exit 2
+fi
+if [ -n "$CHAT_TEMPLATE_KWARGS" ] && ! python3 -c 'import json,sys; assert isinstance(json.loads(sys.argv[1]), dict)' \
+     "$CHAT_TEMPLATE_KWARGS" 2>/dev/null; then
+  echo "CHAT_TEMPLATE_KWARGS ist kein JSON-Objekt: $CHAT_TEMPLATE_KWARGS"; exit 2
+fi
 
 MODEL=${1:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
 LABEL=${2:?usage: eval_heldout.sh <MODEL> <LABEL> [OUTFILE]}
@@ -78,7 +103,8 @@ EXPECTED_ROWS=$(( $(python3 -c 'import json,sys;print(len(json.load(open("data/r
 meta_json() {
   MODEL="$MODEL" LABEL="$LABEL" SPLIT="$SPLIT" K="$K" TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" TOP_K="$TOP_K" MIN_P="$MIN_P" \
   PRESENCE_PENALTY="$PRESENCE_PENALTY" MAXLEN="${VLLM_MAX_MODEL_LEN:-20480}" GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" VLLM_EXTRA="$VLLM_EXTRA" \
-  RTO="${ROLLOUT_TIMEOUT_S:-1800}" EVAL_CONC="$EVAL_CONC" python3 - <<'PY'
+  RTO="${ROLLOUT_TIMEOUT_S:-1800}" EVAL_CONC="$EVAL_CONC" CTK="$CHAT_TEMPLATE_KWARGS" SERVE="$SERVE" API_BASE="$API_BASE" \
+  python3 - <<'PY'
 import datetime, json, os, socket
 e = os.environ
 ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int(e["K"]),
@@ -86,7 +112,12 @@ ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int
          "presence_penalty": float(e["PRESENCE_PENALTY"]), "enable_thinking": True, "max_turns": 15, "max_tokens_per_turn": 3072,
          "max_regen": 0, "max_model_len": int(e["MAXLEN"]), "gpu_util": float(e["GPU_UTIL"]), "vllm_extra": " ".join(e["VLLM_EXTRA"].split()),
          "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
-info = {"eval_conc": int(e["EVAL_CONC"]), "created": datetime.datetime.now().isoformat(timespec="seconds"), "host": socket.gethostname()}
+if e["CTK"]:   # nur wenn gesetzt -> Sidecars ohne Zusatzschalter bleiben identisch (Resume alter Laeufe)
+    ident["chat_template_kwargs"] = json.loads(e["CTK"])
+info = {"eval_conc": int(e["EVAL_CONC"]), "created": datetime.datetime.now().isoformat(timespec="seconds"), "host": socket.gethostname(),
+        "serve": e["SERVE"]}
+if e["SERVE"] == "none":
+    info["api_base"] = e["API_BASE"]
 print(json.dumps({"identity": ident, "info": info}, indent=1, ensure_ascii=False))
 PY
 }
@@ -103,19 +134,63 @@ export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Trai
 # Container gestartet hat (Merker), je Start eine Datei ${OUT}.vllm-<UTC>.log.gz neben der Ausgabe; danach
 # Merker zurueck. Bei kill -KILL laeuft kein trap -> von Hand.
 VLLM_UP=0
-teardown() {
-  if [ "$VLLM_UP" = 1 ]; then
-    local f; f="${OUT}.vllm-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+# SERVE=venv: der Server laeuft per setsid in einer eigenen Prozessgruppe; sein Log liegt bis zum Teardown unkomprimiert
+# neben der Ausgabe und wird dann wie bei compose zu ${OUT}.vllm-<UTC>.log.gz.
+VLLM_PID=""; VLLM_PGID=""
+SERVE_LOG="${OUT}.vllm-serve.log"
+SERVE_WAIT_S=${SERVE_WAIT_S:-1800}
+save_serve_log() {   # <quelle: compose|venv>
+  local f; f="${OUT}.vllm-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+  if [ "$1" = compose ]; then
     if docker logs text2sql_vllm_teacher 2>&1 | gzip > "$f"; then echo "== vLLM-Log gesichert: $f"
     else rm -f "$f"; echo "== vLLM-Log NICHT gesichert (Container weg?)"; fi
-    VLLM_UP=0
+  else
+    if [ -f "$SERVE_LOG" ] && gzip -c "$SERVE_LOG" > "$f"; then rm -f "$SERVE_LOG"; echo "== vLLM-Log gesichert: $f"
+    else rm -f "$f"; echo "== vLLM-Log NICHT gesichert ($SERVE_LOG fehlt)"; fi
   fi
-  $COMPOSE --profile vllm down vllm >/dev/null 2>&1
 }
+ROLLOUT_PIDF="${OUT}.rollout.pid"
+stop_rollout() {   # ein noch laufender Rollout endet VOR dem Server (siehe Aufruf unten)
+  local p kids
+  [ -f "$ROLLOUT_PIDF" ] || return 0
+  p=$(cat "$ROLLOUT_PIDF" 2>/dev/null)
+  # nur DIESEN Lauf treffen: die PID muss noch unser timeout mit genau dieser Ausgabedatei sein (alte Datei, PID neu vergeben)
+  if [ -n "$p" ] && ps -o args= -p "$p" 2>/dev/null | grep -qF -- "--output $OUT"; then
+    echo "== Rollout (PID $p) wird vor dem Server gestoppt"
+    kids=$(pgrep -P "$p" 2>/dev/null)
+    kill -TERM "$p" 2>/dev/null   # timeout reicht das an rollout.py weiter
+    for _ in $(seq 30); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+    # shellcheck disable=SC2086
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" $kids 2>/dev/null
+  fi
+  rm -f "$ROLLOUT_PIDF"
+}
+teardown() {
+  stop_rollout
+  case "$SERVE" in
+    compose)
+      if [ "$VLLM_UP" = 1 ]; then save_serve_log compose; VLLM_UP=0; fi
+      $COMPOSE --profile vllm down vllm >/dev/null 2>&1
+      ;;
+    venv)
+      if [ -n "$VLLM_PID" ] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        kill -TERM -- "-${VLLM_PGID:-$VLLM_PID}" 2>/dev/null || kill -TERM "$VLLM_PID" 2>/dev/null
+        for _ in $(seq 60); do kill -0 "$VLLM_PID" 2>/dev/null || break; sleep 1; done
+        if kill -0 "$VLLM_PID" 2>/dev/null; then
+          kill -KILL -- "-${VLLM_PGID:-$VLLM_PID}" 2>/dev/null || kill -KILL "$VLLM_PID" 2>/dev/null
+        fi
+      fi
+      VLLM_PID=""
+      if [ "$VLLM_UP" = 1 ]; then save_serve_log venv; VLLM_UP=0; fi
+      ;;
+    none) : ;;   # fremder Endpunkt: nichts zu stoppen
+  esac
+}
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$SERVE_PORT") 2>/dev/null; }
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
-echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY"
-echo "   serving : conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'"
+echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY${CHAT_TEMPLATE_KWARGS:+ template=$CHAT_TEMPLATE_KWARGS}"
+echo "   serving : $SERVE conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'$([ "$SERVE" = none ] && echo " api=$API_BASE")"
 echo "   limits  : eval_timeout=${EVAL_TIMEOUT}s rollout_timeout=${ROLLOUT_TIMEOUT_S:-1800}s -> $OUT"
 
 if [ "$WRITE_META_ONLY" = 1 ]; then
@@ -147,58 +222,111 @@ PY
   N_HAVE=$(wc -l < "$OUT"); RESUME_SUF="_resume"
   echo "   resume  : $N_HAVE vorhanden, $((EXPECTED_ROWS - N_HAVE)) fehlen (Soll $EXPECTED_ROWS) — Sidecar passt"
 else
-  rm -f "$OUT" "$META" "${OUT}.serve.json" "${OUT}".vllm-*.log.gz
+  rm -f "$OUT" "$META" "${OUT}.serve.json" "${OUT}".vllm-*.log.gz "$SERVE_LOG"
   meta_json > "$META"
 fi
 trap teardown EXIT
-teardown; sleep 3
+if [ "$SERVE" = compose ]; then
+  teardown; sleep 3
+elif [ "$SERVE" = venv ] && port_busy; then
+  # nie fremde Prozesse beenden: ein liegengebliebener Server wird von Hand gestoppt
+  echo "== SERVE=venv: Port $SERVE_PORT ist schon belegt — abort (alten Server per PID stoppen)."; exit 1
+fi
 
-# NUR Standard-Transformer hier (Base 4B / merged Student) -> kein --gdn-prefill-backend,
-# der gehoert zum hybriden Teacher in ops/gen_traces.sh.
-VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" \
-  VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
-  VLLM_EXTRA_ARGS="--max-num-seqs $EVAL_CONC $VLLM_EXTRA" \
-  $COMPOSE --profile vllm up -d vllm >>logs/eval_heldout.log 2>&1
-VLLM_UP=1
+if [ "$SERVE" = compose ]; then
+  # NUR Standard-Transformer hier (Base 4B / merged Student) -> kein --gdn-prefill-backend,
+  # der gehoert zum hybriden Teacher in ops/gen_traces.sh.
+  VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" \
+    VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
+    VLLM_EXTRA_ARGS="--max-num-seqs $EVAL_CONC $VLLM_EXTRA" \
+    $COMPOSE --profile vllm up -d vllm >>logs/eval_heldout.log 2>&1
+  VLLM_UP=1
+elif [ "$SERVE" = venv ]; then
+  # dieselben Flags und Env wie der vllm-Service in docker/docker-compose.yml, nur lokal gebunden
+  # shellcheck disable=SC2086  # VLLM_EXTRA ist bewusst wortgetrennt
+  VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_USE_FLASHINFER_SAMPLER=0 \
+    setsid "$VLLM_BIN" serve "$MODEL" --dtype bfloat16 \
+    --max-model-len "${VLLM_MAX_MODEL_LEN:-20480}" --gpu-memory-utilization "${VLLM_GPU_UTIL:-0.85}" \
+    --served-model-name "$MODEL" --max-num-seqs "$EVAL_CONC" $VLLM_EXTRA \
+    --host 127.0.0.1 --port "$SERVE_PORT" >"$SERVE_LOG" 2>&1 < /dev/null &
+  VLLM_PID=$!
+  VLLM_PGID=$(ps -o pgid= -p "$VLLM_PID" 2>/dev/null | tr -d ' ')
+  [ "$VLLM_PGID" = "$VLLM_PID" ] || VLLM_PGID=""   # nur eine EIGENE Gruppe als Ganzes beenden
+  VLLM_UP=1
+  echo "   vLLM-PID: $VLLM_PID (Log $SERVE_LOG)"
+fi
 
-for _ in $(seq 180); do
-  curl -sf localhost:8000/health >/dev/null 2>&1 && break
-  docker ps --format '{{.Names}}' | grep -q text2sql_vllm_teacher || break
-  sleep 10
-done
-if ! curl -sf localhost:8000/health >/dev/null 2>&1; then
-  echo "== SERVE FAILED — abort"; docker logs text2sql_vllm_teacher --tail 40 2>&1 | tail -40; exit 1
+if [ "$SERVE" != none ]; then
+  for _ in $(seq $((SERVE_WAIT_S / 10))); do
+    curl -sf "localhost:$SERVE_PORT/health" >/dev/null 2>&1 && break
+    if [ "$SERVE" = compose ]; then
+      docker ps --format '{{.Names}}' | grep -q text2sql_vllm_teacher || break
+    else
+      kill -0 "$VLLM_PID" 2>/dev/null || break
+    fi
+    sleep 10
+  done
+  if ! curl -sf "localhost:$SERVE_PORT/health" >/dev/null 2>&1; then
+    echo "== SERVE FAILED — abort"
+    if [ "$SERVE" = compose ]; then docker logs text2sql_vllm_teacher --tail 40 2>&1 | tail -40
+    else tail -40 "$SERVE_LOG" 2>/dev/null; fi
+    exit 1
+  fi
 fi
 
 # VLLM_MODEL reist nur als Inline-Env zu `compose up`; kommt es nicht an, greift der Compose-Fallback
 # (woertlich Qwen/Qwen3-4B). Der Server liefe dann klaglos mit dem FALSCHEN Modell, rollout.py bekaeme
 # 404 je Request und schriebe eine vollstaendige Datei aus lauter Nullen bei Exit 0.
-SERVED=$(curl -s localhost:8000/v1/models | "$TAU2PY" -c \
+# SERVE=none: ein fremder Endpunkt listet ggf. mehrere Modelle -> dort genuegt "ist gelistet".
+[ "$SERVE" = none ] || API_BASE="http://localhost:$SERVE_PORT/v1"
+SERVED=$(curl -s "$API_BASE/models" | "$TAU2PY" -c \
   'import json,sys; print(",".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null)
-if [ "$SERVED" != "$MODEL" ]; then
+if [ "$SERVE" = none ]; then
+  case ",$SERVED," in *",$MODEL,"*) ;; *)
+    echo "== MODEL NOT LISTED: '$MODEL' nicht in $API_BASE/models ('$SERVED') — abort."; exit 1;; esac
+elif [ "$SERVED" != "$MODEL" ]; then
   echo "== WRONG MODEL SERVED: angefordert '$MODEL', serviert '$SERVED' — abort."; exit 1
 fi
-docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
-  | tail -1 | sed 's/^/   vLLM: /'
+if [ "$SERVE" = compose ]; then
+  docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
+    | tail -1 | sed 's/^/   vLLM: /'
+elif [ "$SERVE" = venv ]; then
+  grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' "$SERVE_LOG" 2>/dev/null \
+    | tail -1 | sed 's/^/   vLLM: /'
+fi
 # Was WIRKLICH serviert wurde (vLLM-Version/Image/Util) -> Sidecar ${OUT}.serve.json. Ohne Gate: rollout.py
 # macht Prompt-and-Parse (kein tools-Parameter), die vLLM-Version wirkt hier nicht (anders als bei tau2).
-"$TAU2PY" evaluation/serve_info.py record --file "${OUT}.serve.json" --role server --port 8000 \
-  --container text2sql_vllm_teacher --gpu-util "${VLLM_GPU_UTIL:-0.85}" 2>&1 | sed 's/^/   /'
+# SERVE=venv: kein Container -> image_id bleibt leer, die Version kommt aus /version. SERVE=none: nichts messbar.
+if [ "$SERVE" != none ]; then
+  CONTAINER_ARGS=(); [ "$SERVE" = compose ] && CONTAINER_ARGS=(--container text2sql_vllm_teacher)
+  "$TAU2PY" evaluation/serve_info.py record --file "${OUT}.serve.json" --role server --port "$SERVE_PORT" \
+    "${CONTAINER_ARGS[@]}" --gpu-util "${VLLM_GPU_UTIL:-0.85}" 2>&1 | sed 's/^/   /'
+fi
+MLFLOW_ARGS=()
+[ "$MLFLOW" = 1 ] && MLFLOW_ARGS=(--mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}"
+                                  --mlflow-run-name "${LABEL}${KSUF}${RESUME_SUF}")
+CTK_ARGS=()
+[ -n "$CHAT_TEMPLATE_KWARGS" ] && CTK_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
 
 # Ausgabe: frisch angelegt oder per RESUME fortgesetzt (siehe oben).
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /
 # presence 1.5), nicht das Studenten-Rezept. Fehlt ein Flag, wird still falsch evaluiert.
 # --max-regen 0 = genau ein Versuch (siehe rollout.py solve_task).
-timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
+# Die Subshell schreibt ihre PID und wird per exec zum timeout-Prozess: der Teardown stoppt damit ZUERST den
+# Rollout (timeout reicht SIGTERM an rollout.py weiter) und erst dann den Server — sonst liefe rollout.py nach
+# einem Abbruch gegen den toten Server weiter und schriebe Fehlerzeilen, die ein Resume als erledigt zaehlt.
+( echo "$BASHPID" > "$ROLLOUT_PIDF"
+  exec timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
-  --split "$SPLIT" --k "$K" --api-base http://localhost:8000/v1 --model "$MODEL" --teacher-name "$LABEL" \
+  --split "$SPLIT" --k "$K" --api-base "$API_BASE" --model "$MODEL" --teacher-name "$LABEL" \
   --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
-  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" \
+  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" "${CTK_ARGS[@]}" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" --request-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
-  --mlflow --mlflow-experiment "${MLFLOW_EXPERIMENT:-db_bahn_traj_eval}" --mlflow-run-name "${LABEL}${KSUF}${RESUME_SUF}" \
-  --output "$OUT" 2>&1 | tee -a logs/eval_heldout.log | tail -12
+  "${MLFLOW_ARGS[@]}" \
+  --output "$OUT" ) 2>&1 | tee -a logs/eval_heldout.log | tail -12
 rc=${PIPESTATUS[0]}
+rm -f "$ROLLOUT_PIDF"
 [ "$rc" -ne 0 ] && echo "== ROLLOUT FAILED (exit $rc; 124 = EVAL_TIMEOUT) =="
 
 echo

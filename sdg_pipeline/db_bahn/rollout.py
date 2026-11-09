@@ -107,7 +107,9 @@ def make_teacher_call(cfg: dict, timeout: float = 600.0):
             payload["stop"] = ["</tool_call>", "</tools>", "</TOOLCALL>"]
             payload["include_stop_str_in_output"] = True
         if not cfg.get("omit_thinking_kwarg"):  # mistral-tokenizer models reject template kwargs
-            payload["chat_template_kwargs"] = {"enable_thinking": cfg["enable_thinking"]}
+            # extra template switches per model family (e.g. preserve_thinking), merged over the thinking flag
+            payload["chat_template_kwargs"] = {"enable_thinking": cfg["enable_thinking"],
+                                               **(cfg.get("chat_template_kwargs") or {})}
         r = client.post(url, json=payload, headers=headers)
         if r.status_code >= 400:  # include the body — vLLM puts the actual reason there
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
@@ -560,6 +562,9 @@ def main():
                          "makes parallel multi-call turns impossible; A/B fallback only)")
     ap.add_argument("--omit-thinking-kwarg", action="store_true",
                     help="don't send chat_template_kwargs (mistral tokenizer mode)")
+    ap.add_argument("--chat-template-kwargs", default=None, metavar="JSON",
+                    help="extra chat-template switches as a JSON object, merged over enable_thinking "
+                         "(e.g. '{\"preserve_thinking\": true}'); recorded in gen_params only when set")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=10)
     ap.add_argument("--max-regen", type=int, default=2, help="re-sample a failed rollout up to N times "
@@ -586,6 +591,16 @@ def main():
     ap.add_argument("--mlflow-tracking-uri", default=None,
                     help="default: $MLFLOW_TRACKING_URI, else the repo-local mlruns/ dir")
     args = ap.parse_args()
+    extra_kwargs = None
+    if args.chat_template_kwargs:
+        try:
+            extra_kwargs = json.loads(args.chat_template_kwargs)
+        except json.JSONDecodeError as e:
+            ap.error(f"--chat-template-kwargs is not valid JSON: {e}")
+        if not isinstance(extra_kwargs, dict):
+            ap.error("--chat-template-kwargs must be a JSON object")
+        if args.omit_thinking_kwarg:
+            ap.error("--chat-template-kwargs and --omit-thinking-kwarg exclude each other")
 
     config = load_config(args.config) if Path(args.config).exists() else {}
     tasks = {t["id"]: t for t in json.load(open(DATA_DIR / "tasks.json"))}
@@ -657,6 +672,8 @@ def main():
         if args.legacy_stop:
             teacher_cfg["legacy_stop"] = True
         teacher_cfg["omit_thinking_kwarg"] = args.omit_thinking_kwarg
+        if extra_kwargs:
+            teacher_cfg["chat_template_kwargs"] = extra_kwargs
     lock = threading.Lock()
     stats = {"n": 0, "verified": 0, "replan": 0, "turns": 0.0,
              "branched": 0, "emergent_rec": 0, "scripted_rec": 0,
@@ -695,9 +712,12 @@ def main():
                "truncated": bool(res.get("truncated")), "degen": res.get("degen") or {},
                "roleplay_tail_chars": res.get("roleplay_tail_chars", 0),
                "gen_params": None if teacher_cfg is None else
-               {k: teacher_cfg.get(k) for k in ("temperature", "top_p", "top_k", "min_p",
-                                                "presence_penalty", "enable_thinking",
-                                                "legacy_stop", "max_tokens")},
+               {**{k: teacher_cfg.get(k) for k in ("temperature", "top_p", "top_k", "min_p",
+                                                   "presence_penalty", "enable_thinking",
+                                                   "legacy_stop", "max_tokens")},
+                # only when set -> records of runs without extra switches stay byte-identical
+                **({"chat_template_kwargs": teacher_cfg["chat_template_kwargs"]}
+                   if teacher_cfg.get("chat_template_kwargs") else {})},
                "score": sc, "finish_reason": res["finish_reason"],
                "wall_s": res["wall_s"], "messages": res["messages"]}
         with lock:
