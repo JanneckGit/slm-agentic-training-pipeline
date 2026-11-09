@@ -30,6 +30,8 @@
 # $ROOT/serve_info.json haelt je Instanz fest, was WIRKLICH serviert wurde: vLLM-Version, Image,
 # effektive GPU-Util (inkl. Env-Override) und "verfuegbar" nach dem Start; je Start ein Eintrag.
 # Ein Label = eine vLLM-Version: ein Resume auf anderem Image bricht ab (evaluation/serve_info.py).
+# Die vollstaendigen vLLM-Server-Logs landen beim Teardown (auch bei Abbruch/Crash) gzipped in
+# $ROOT/logs/vllm_{agent,user}_<UTC>.log.gz — je Start/Resume eine Datei.
 # MLflow loggt NUR einen sauberen Lauf (run_rc = report_rc = 0). Strg+C, Crash oder infra-Fehler ->
 # kein MLflow-Eintrag; der Befehl zum Nachtragen von Hand steht dann im Log.
 #
@@ -60,7 +62,21 @@ mkdir -p "$ROOT/logs"
 LOG="$ROOT/logs/run.log"
 BENCH="evaluation/benchmarks/tau2"
 
+# vLLM-Server-Logs VOR compose down sichern (down loescht den Container samt Log). Nur Container, die DIESES
+# Skript gestartet hat (Merker A_UP/U_UP), je Start eine Datei mit UTC-Zeitstempel; danach Merker zurueck,
+# damit der zweite teardown (trap EXIT) nicht doppelt sichert. Bei kill -KILL laeuft kein trap -> von Hand.
+A_UP=0; U_UP=0
+save_vllm_log() { # <container> <zieldatei>
+  if docker logs "$1" 2>&1 | gzip > "$2"; then
+    echo "== vLLM-Log gesichert: $2" | tee -a "$LOG"
+  else
+    rm -f "$2"; echo "== vLLM-Log von $1 NICHT gesichert (Container weg?)" | tee -a "$LOG"
+  fi
+}
 teardown() {
+  local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+  [ "$A_UP" = 1 ] && { save_vllm_log text2sql_vllm_teacher "$ROOT/logs/vllm_agent_$ts.log.gz"; A_UP=0; }
+  [ "$U_UP" = 1 ] && { save_vllm_log text2sql_vllm_user "$ROOT/logs/vllm_user_$ts.log.gz"; U_UP=0; }
   $COMPOSE --profile vllm down vllm >/dev/null 2>&1
   $COMPOSE --profile vllm-user down vllm-user >/dev/null 2>&1
 }
@@ -123,6 +139,7 @@ echo "== Serve Agent :8000 ($MODEL als '$ALIAS', util=${VLLM_GPU_UTIL:-$A_UTIL})
 VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-$A_UTIL}" VLLM_MAX_MODEL_LEN="$A_MML" \
   VLLM_EXTRA_ARGS="--max-num-seqs $A_SEQS --served-model-name $ALIAS $AGENT_PARSER_ARGS" \
   $COMPOSE --profile vllm up -d vllm >>"$LOG" 2>&1
+A_UP=1
 wait_health 8000 text2sql_vllm_teacher || { echo "== Agent-vLLM kam nicht hoch"; exit 1; }
 # Version/Image/Util festhalten — VOR dem Sim-Start, damit ein Versionswechsel beim Resume sofort abbricht
 "$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role agent --port 8000 \
@@ -134,6 +151,7 @@ VLLM_USER_MODEL="$U_MODEL" VLLM_USER_GPU_UTIL="${VLLM_USER_GPU_UTIL:-$U_UTIL}" \
   VLLM_USER_MAX_MODEL_LEN="$U_MML" \
   VLLM_USER_EXTRA_ARGS="--max-num-seqs $U_SEQS $U_EXTRA $USER_PARSER_ARGS" \
   $COMPOSE --profile vllm-user up -d vllm-user >>"$LOG" 2>&1
+U_UP=1
 wait_health 8001 text2sql_vllm_user    || { echo "== User-vLLM kam nicht hoch"; exit 1; }
 "$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role user_sim --port 8001 \
   --container text2sql_vllm_user --gpu-util "${VLLM_USER_GPU_UTIL:-$U_UTIL}" --gate 2>&1 | tee -a "$LOG"

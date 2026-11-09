@@ -32,6 +32,7 @@
 #   WRITE_META_ONLY (0)  1 = nur die Sidecar fuer eine vorhandene (Legacy-)Ausgabe schreiben, kein Serve, kein Rollout.
 #   VLLM_IMAGE  vLLM-Image (Default v0.21.0 per Digest im Compose); was wirklich serviert wurde (Version, Image,
 #               Util, "verfuegbar") steht je Start in der Sidecar <OUT>.serve.json (evaluation/serve_info.py).
+# Das vollstaendige vLLM-Server-Log landet beim Teardown (auch bei Abbruch) als <OUT>.vllm-<UTC>.log.gz daneben.
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -98,7 +99,19 @@ export MLFLOW_TRACKING_URI="file://$REPO/mlruns"   # derselbe Store wie der Trai
 #  - rollout.py RESUMT in eine vorhandene Datei (append + skip bekannter (task_id, sample_idx)); damit sich nie
 #    zwei Modelle unter einem Label vermischen, wird die Datei entweder frisch angelegt (Default) oder nur mit
 #    passender Sidecar fortgesetzt (RESUME=1) — geprueft VOR dem Serve.
-teardown() { $COMPOSE --profile vllm down vllm >/dev/null 2>&1; }
+# vLLM-Server-Log VOR compose down sichern (down loescht den Container samt Log): nur wenn DIESES Skript den
+# Container gestartet hat (Merker), je Start eine Datei ${OUT}.vllm-<UTC>.log.gz neben der Ausgabe; danach
+# Merker zurueck. Bei kill -KILL laeuft kein trap -> von Hand.
+VLLM_UP=0
+teardown() {
+  if [ "$VLLM_UP" = 1 ]; then
+    local f; f="${OUT}.vllm-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+    if docker logs text2sql_vllm_teacher 2>&1 | gzip > "$f"; then echo "== vLLM-Log gesichert: $f"
+    else rm -f "$f"; echo "== vLLM-Log NICHT gesichert (Container weg?)"; fi
+    VLLM_UP=0
+  fi
+  $COMPOSE --profile vllm down vllm >/dev/null 2>&1
+}
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
 echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY"
@@ -134,7 +147,7 @@ PY
   N_HAVE=$(wc -l < "$OUT"); RESUME_SUF="_resume"
   echo "   resume  : $N_HAVE vorhanden, $((EXPECTED_ROWS - N_HAVE)) fehlen (Soll $EXPECTED_ROWS) — Sidecar passt"
 else
-  rm -f "$OUT" "$META" "${OUT}.serve.json"
+  rm -f "$OUT" "$META" "${OUT}.serve.json" "${OUT}".vllm-*.log.gz
   meta_json > "$META"
 fi
 trap teardown EXIT
@@ -146,6 +159,7 @@ VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" \
   VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20480}" \
   VLLM_EXTRA_ARGS="--max-num-seqs $EVAL_CONC $VLLM_EXTRA" \
   $COMPOSE --profile vllm up -d vllm >>logs/eval_heldout.log 2>&1
+VLLM_UP=1
 
 for _ in $(seq 180); do
   curl -sf localhost:8000/health >/dev/null 2>&1 && break

@@ -65,7 +65,8 @@
 #   MLFLOW_EXPERIMENT (bfcl_eval)   SKIP_MLFLOW (0; 1 bei BFCL_RUN_IDS)   BFCLPY (.venv-bfcl/bin/python)
 #   VLLM_IMAGE                  vLLM-Image (Default v0.21.0 per Digest im Compose)
 # MLflow loggt NUR einen sauberen Lauf (generate/evaluate/Report rc = 0). $ROOT/serve_info.json haelt
-# vLLM-Version, Image und Util je Start fest (evaluation/serve_info.py).
+# vLLM-Version, Image und Util je Start fest (evaluation/serve_info.py). Das vollstaendige vLLM-Server-Log
+# landet beim Teardown (auch bei Abbruch) als $ROOT/logs/vllm_server_<UTC>.log.gz.
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -91,7 +92,19 @@ mkdir -p "$HF_HOME"
 mkdir -p "$ROOT/logs" logs
 LOG="$ROOT/logs/run.log"
 
-teardown() { $COMPOSE --profile vllm down vllm >/dev/null 2>&1; }
+# vLLM-Server-Log VOR compose down sichern (down loescht den Container samt Log): nur wenn DIESES Skript den
+# Container gestartet hat (Merker), je Start eine Datei $ROOT/logs/vllm_server_<UTC>.log.gz; danach Merker
+# zurueck, damit der trap EXIT nicht doppelt sichert. Bei kill -KILL laeuft kein trap -> von Hand.
+VLLM_UP=0
+teardown() {
+  if [ "$VLLM_UP" = 1 ]; then
+    local f; f="$ROOT/logs/vllm_server_$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+    if docker logs text2sql_vllm_teacher 2>&1 | gzip > "$f"; then echo "== vLLM-Log gesichert: $f" | tee -a "$LOG"
+    else rm -f "$f"; echo "== vLLM-Log NICHT gesichert (Container weg?)" | tee -a "$LOG"; fi
+    VLLM_UP=0
+  fi
+  $COMPOSE --profile vllm down vllm >/dev/null 2>&1
+}
 trap teardown EXIT
 
 echo "==== BFCL $LABEL ($MODEL) — $(date '+%F %T') ====" | tee -a "$LOG"
@@ -140,6 +153,7 @@ echo "-- serve: ctx=$MAX_LEN seqs=$MAX_SEQS alias=$ALIAS" | tee -a "$LOG"
 VLLM_MODEL="$MODEL" VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" VLLM_MAX_MODEL_LEN="$MAX_LEN" \
   VLLM_EXTRA_ARGS="--max-num-seqs $MAX_SEQS --served-model-name $ALIAS" \
   $COMPOSE --profile vllm up -d vllm >>"$LOG" 2>&1
+VLLM_UP=1
 
 for _ in $(seq 180); do
   curl -sf localhost:8000/health >/dev/null 2>&1 && break
