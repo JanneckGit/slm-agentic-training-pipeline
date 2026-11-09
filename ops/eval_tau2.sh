@@ -22,8 +22,14 @@
 #   TAU2_BASELINE=<root>           Δ-Spalte im Report gegen einen Vergleichslauf
 #   VLLM_GPU_UTIL / VLLM_USER_GPU_UTIL   GPU-Budgets (Defaults aus dem Manifest; Summe <= ~0.85!)
 #   VLLM_IMAGE / VLLM_USER_IMAGE   vLLM-Image fuer Agent / User-Sim (Default: v0.21.0 per Digest im
-#                                  Compose). tau2 ist NUR auf v0.21 vergleichbar: v0.30 erzwingt gueltige
-#                                  Tool-Calls. Der Sim hat eine eigene Variable, weil er zum Messgeraet gehoert.
+#                                  Compose; der Pin haelt das Messgeraet fest). v0.30 erzwingt gueltige
+#                                  Tool-Calls bei tool_choice=auto NUR, wenn ein Tool "strict": true traegt —
+#                                  tau2 setzt das nie. Der Sim hat eine eigene Variable, weil er zum Messgeraet gehoert.
+#   TAU2_STRICT_TOOLS=1            Konfiguration "τ² + strict": Agent-Tools mit "strict": true (Shim
+#                                  run_tau2.py), braucht ein Agent-Image >= v0.30 (Wache nach dem Start;
+#                                  v0.21-hermes hat keine Tool-Grammatik). Eigene Messreihe, 'strict' muss im
+#                                  Label stehen; der Report failt, wenn trotzdem ein Tool ausserhalb der Liste
+#                                  gerufen wurde. Validiert nur fuer telecom (andere Schemas ungeprueft).
 #   ALLOW_VLLM_CHANGE=1            Resume trotz anderer vLLM-Version/anderem Image (sonst Abbruch)
 #   SKIP_MLFLOW=1                  kein MLflow-Log (bei Smokes automatisch)
 #
@@ -90,6 +96,7 @@ PF_ARGS=(--model "$MODEL" --label "$LABEL" --root "$ROOT" --domains "$DOMAINS")
 [ -n "${TAU2_MC:-}" ]        && PF_ARGS+=(--max-concurrency "$TAU2_MC")
 [ -n "${TAU2_TOTAL_CAP:-}" ] && PF_ARGS+=(--total-cap "$TAU2_TOTAL_CAP")
 [ -n "${TAU2_MAX_STEPS:-}" ] && PF_ARGS+=(--max-steps "$TAU2_MAX_STEPS")
+[ "${TAU2_STRICT_TOOLS:-0}" = "1" ] && PF_ARGS+=(--strict-tools)
 "$T2BPY" "$BENCH/preflight.py" "${PF_ARGS[@]}" 2>&1 | tee -a "$LOG"
 [ "${PIPESTATUS[0]}" -ne 0 ] && { echo "== PREFLIGHT FAILED — abort."; exit 1; }
 
@@ -110,6 +117,7 @@ read -r A_MML A_SEQS A_UTIL U_MML U_SEQS U_UTIL TRIALS SEED MC MAXSTEPS MAXERR <
 # Parser sind PRO INSTANZ verschieden: Qwen3-4B/8B = hermes-JSON, Qwen3.6 = qwen3_xml (Smoke-Befund)
 A_TCP=$(mread "m['agent']['tool_call_parser']"); A_RP=$(mread "m['agent']['reasoning_parser']")
 U_TCP=$(mread "m['user_sim']['tool_call_parser']"); U_RP=$(mread "m['user_sim']['reasoning_parser']")
+STRICT=$(mread "str(m['agent'].get('strict_tools', False)).lower()")
 AGENT_PARSER_ARGS=${TAU2_AGENT_PARSER_ARGS:-"--enable-auto-tool-choice --tool-call-parser $A_TCP --reasoning-parser $A_RP"}
 USER_PARSER_ARGS=${TAU2_USER_PARSER_ARGS:-"--enable-auto-tool-choice --tool-call-parser $U_TCP --reasoning-parser $U_RP"}
 
@@ -145,6 +153,23 @@ wait_health 8000 text2sql_vllm_teacher || { echo "== Agent-vLLM kam nicht hoch";
 "$TAU2PY" evaluation/serve_info.py record --file "$ROOT/serve_info.json" --role agent --port 8000 \
   --container text2sql_vllm_teacher --gpu-util "${VLLM_GPU_UTIL:-$A_UTIL}" --gate 2>&1 | tee -a "$LOG"
 [ "${PIPESTATUS[0]}" -ne 0 ] && { echo "== serve_info agent fehlgeschlagen — abort" | tee -a "$LOG"; exit 1; }
+# strict_tools wirkt nur ab vLLM 0.30 (v0.21-hermes hat keine Tool-Grammatik): falsches Image hier stoppen,
+# nicht erst am Report nach zwei Tagen.
+if [ "$STRICT" = "true" ]; then
+  "$TAU2PY" - <<'PY' 2>&1 | tee -a "$LOG"
+import sys
+sys.path.insert(0, "evaluation")
+from serve_info import fetch_version
+v = fetch_version(8000) or "?"
+try:
+    ok = tuple(int(x) for x in v.split(".")[:2]) >= (0, 30)
+except ValueError:
+    ok = False
+print(f"== strict_tools: Agent-vLLM {v} -> {'ok' if ok else 'ZU ALT/unbekannt (braucht >= 0.30)'}")
+sys.exit(0 if ok else 1)
+PY
+  [ "${PIPESTATUS[0]}" -ne 0 ] && { echo "== strict_tools braucht vLLM >= 0.30 als Agent (VLLM_IMAGE) — abort" | tee -a "$LOG"; exit 1; }
+fi
 
 echo "== Serve User-Sim :8001 ($U_MODEL, util=${VLLM_USER_GPU_UTIL:-$U_UTIL})" | tee -a "$LOG"
 VLLM_USER_MODEL="$U_MODEL" VLLM_USER_GPU_UTIL="${VLLM_USER_GPU_UTIL:-$U_UTIL}" \

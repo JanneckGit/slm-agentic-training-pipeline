@@ -2,9 +2,10 @@
 """Serve info: records which vLLM an eval run actually talked to (version, image, GPU budget, free memory).
 
 Why: docker/docker-compose.yml pulled an unpinned `vllm/vllm-openai:latest` until 2026-11-06. That tag
-moved from v0.21.0 to v0.30.0 on 2026-09-23 without anyone noticing. v0.30 forces valid tool calls by
-default (VLLM_ENFORCE_STRICT_TOOL_CALLING), so tau2 numbers from the two versions are not comparable.
-No run had recorded the version, and the GPU-util overrides only showed up in run.log.
+moved from v0.21.0 to v0.30.0 on 2026-09-23 without anyone noticing. A measuring instrument must not
+change version silently (v0.30 also brings new parsers and tool-call grammars; with tool_choice=auto they
+only apply when a tool carries "strict": true). No run had recorded the version, and the GPU-util
+overrides only showed up in run.log.
 
 The eval scripts call this right after a server reports healthy:
 

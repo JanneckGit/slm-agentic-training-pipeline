@@ -154,9 +154,10 @@ services:
   vllm:
     # Pinned to v0.21.0 by DIGEST (the local tag `0.21.0` is a hand-made retag; Docker Hub calls it
     # `v0.21.0`). Until 2026-11-06 this was an unpinned `:latest`, which became v0.30.0 on 2026-09-23.
-    # tau2 is only comparable on v0.21: v0.30 forces valid tool calls by default
-    # (VLLM_ENFORCE_STRICT_TOOL_CALLING), see docs/tau2-benchmark.md. Another version only on purpose
-    # via VLLM_IMAGE; the eval scripts record the served version (evaluation/serve_info.py).
+    # The pin keeps the measuring instrument fixed. v0.30 enforces valid tool calls under tool_choice=auto
+    # only when a tool carries "strict": true (tau2 never sets it; opt-in via TAU2_STRICT_TOOLS=1 in
+    # ops/eval_tau2.sh, see docs/tau2-benchmark.md). Another version only on purpose via VLLM_IMAGE; the
+    # eval scripts record the served version (evaluation/serve_info.py).
     image: ${VLLM_IMAGE:-vllm/vllm-openai@sha256:a230095847e93bd4df9888b33dab956fa9504537b828a23657d2b26fed57b5c9}
     container_name: text2sql_vllm_teacher
     profiles: ["vllm"]   # Only starts with: docker compose --profile vllm up

@@ -8,6 +8,7 @@ statt sie nachzubauen). Liest nur das Label-Verzeichnis, schreibt report_metrics
 
 Exit != 0 bei: geplanter-aber-fehlender Domaene, infra-Fehlern, Think-Leaks
 (<think> im content = reasoning-parser fehlte beim Serving → Lauf ungueltig),
+Agent-Tool-Calls ausserhalb der Liste in einem strict_tools-Lauf (Grammatik griff nicht),
 oder --gt-check unter --min-reward (Oracle-Eichung gescheitert).
 
 Modi:
@@ -25,6 +26,36 @@ from pathlib import Path
 GERMAN_MARKERS = (" der ", " die ", " und ", " nicht ", " ich ", "ß", " für ", " Ihre ")
 CTX = "context_window_exceeded"
 INFRA = "infrastructure_error"
+# tau2/environment/toolkit.py: ValueError(f"Tool '{name}' not found.") -> ToolMessage "Error: …"
+UNKNOWN_TOOL = re.compile(r"^Error: Tool '[^']*' not found\.")
+
+
+def tool_hygiene(messages) -> dict:
+    """Tool-Verhalten des AGENTEN in einer Episode (Nachrichten als Objekte oder dicts).
+
+    agent_tool_calls    Tool-Calls in Assistant-Nachrichten
+    unknown_tool_calls  davon mit Namen ausserhalb der Agent-Liste (tau2-Fehlertext, nur requestor=assistant;
+                        Fehler der User-Sim-Tools zaehlen nicht)
+    repeat_tool_calls   Calls mit gleichem Namen + gleichen Argumenten wie ein frueherer in derselben Episode
+    """
+    def get(m, k):
+        return m.get(k) if isinstance(m, dict) else getattr(m, k, None)
+
+    calls = unknown = repeats = 0
+    seen = set()
+    for m in messages or []:
+        role = get(m, "role")
+        if role == "assistant":
+            for tc in get(m, "tool_calls") or []:
+                calls += 1
+                key = (get(tc, "name"), json.dumps(get(tc, "arguments"), sort_keys=True, default=str))
+                if key in seen:
+                    repeats += 1
+                seen.add(key)
+        elif role == "tool" and get(m, "requestor") == "assistant" and str(get(m, "error")) == "True":
+            if UNKNOWN_TOOL.match(str(get(m, "content") or "")):
+                unknown += 1
+    return {"agent_tool_calls": calls, "unknown_tool_calls": unknown, "repeat_tool_calls": repeats}
 
 
 def load_results(path: Path):
@@ -64,6 +95,7 @@ def domain_stats(path: Path) -> dict:
         "avg_agent_turns": None,
         "avg_duration_s": None,
         "components": {},
+        "tools": {"agent_tool_calls": 0, "unknown_tool_calls": 0, "repeat_tool_calls": 0},
     }
     for k in range(1, (max_k or 0) + 1):
         col = f"pass^{k}"
@@ -87,6 +119,8 @@ def domain_stats(path: Path) -> dict:
                 stats["think_leaks"] += 1
                 break
         turns.append(n_agent)
+        for k, v in tool_hygiene(sim.messages).items():
+            stats["tools"][k] += v
         # Sprach-Heuristik ueber die Agent-Antworten dieser Episode
         text = " ".join((getattr(m, "content", None) or "")
                         for m in (sim.messages or [])
@@ -190,6 +224,7 @@ def main() -> int:
     manifest = json.loads((a.run / "run_manifest.json").read_text())
     planned = list(manifest["domains"])
     trials = manifest["run"]["num_trials"]
+    strict = bool((manifest.get("agent") or {}).get("strict_tools", False))
 
     base = {}
     if a.baseline:
@@ -200,7 +235,8 @@ def main() -> int:
                 base[dom] = domain_stats(f)
 
     print(f"\n== tau2-bench {manifest['label']} | model={manifest['model']} | "
-          f"user-sim={manifest['user_sim']['model']} | trials={trials}\n")
+          f"user-sim={manifest['user_sim']['model']} | trials={trials}"
+          f"{' | strict_tools' if strict else ''}\n")
     hdr = (f"{'Domain':<18} {'tasks':>5} {'sims':>5} "
            + " ".join(f"pass^{k}" for k in range(1, trials + 1))
            + ("  Δp^1" if base else "")
@@ -232,6 +268,14 @@ def main() -> int:
                           for k, v in sorted(s["components"].items()))
         if comps:
             print(f"{'':<18} └─ {comps}")
+        t, n = s["tools"], max(s["simulations"], 1)
+        print(f"{'':<18} └─ tools: ⌀ {t['agent_tool_calls'] / n:.1f} Agent-Calls/Ep | ausserhalb der Liste "
+              f"{t['unknown_tool_calls']} (⌀ {t['unknown_tool_calls'] / n:.2f}/Ep) | Wiederholungen "
+              f"⌀ {t['repeat_tool_calls'] / n:.2f}/Ep")
+        if strict and t["unknown_tool_calls"]:
+            print(f"{'':<18} ❌ strict_tools an, aber {t['unknown_tool_calls']} Agent-Calls ausserhalb der "
+                  "Liste — die Grammatik hat nicht gegriffen, Messung UNGUELTIG")
+            rc = 1
         infra = s["terminations"].get(INFRA, 0)
         ctx = s["terminations"].get(CTX, 0)
         if infra:

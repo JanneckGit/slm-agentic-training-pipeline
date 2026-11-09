@@ -143,6 +143,24 @@ def git_head(path: Path) -> str | None:
         return None
 
 
+def strict_tools_check(prev: dict | None, strict: bool, label: str) -> tuple[str, str]:
+    """Gate fuer die Konfiguration 'τ² + strict' (Agent-Tools mit "strict": true, nur vLLM >= 0.30).
+
+    Ein Label = eine Tool-Konfiguration: ein Resume mit anderer Einstellung als das Alt-Manifest
+    (fehlendes Feld = False) ist ein FAIL. Ein strict-Lauf muss 'strict' im Label tragen, damit er
+    nie unter einem normalen Namen in Vergleichen landet. Rueckgabe: ('ok'|'fail', Meldung)."""
+    if prev is not None:
+        prev_strict = bool((prev.get("agent") or {}).get("strict_tools", False))
+        if prev_strict != strict:
+            return "fail", (f"Label-Verzeichnis lief mit strict_tools={prev_strict}, jetzt {strict} — "
+                            "ein Label = eine Tool-Konfiguration (TAU2_STRICT_TOOLS wie beim Start setzen "
+                            "oder neues Label)")
+    if strict and "strict" not in label:
+        return "fail", f"strict_tools an, aber '{label}' traegt kein 'strict' im Namen — Label anpassen"
+    return "ok", ("an — Agent-Tools mit \"strict\": true (eigene Messkonfiguration, braucht vLLM >= 0.30)"
+                  if strict else "aus (Standard)")
+
+
 def derive_alias(model: str) -> str:
     """Serving-Alias (--served-model-name): kurz, eindeutig, litellm-tauglich."""
     parts = [p for p in model.rstrip("/").split("/") if p]
@@ -221,6 +239,8 @@ def main() -> int:
                     help="Autosize-Gesamtdeckel uebersteuern (Cap-Leiter-Tests)")
     ap.add_argument("--max-steps", type=int, default=None,
                     help="max_steps uebersteuern (Sweep-Protokoll; Benchmark-Default: Config)")
+    ap.add_argument("--strict-tools", action="store_true",
+                    help="Agent-Tools mit \"strict\": true (Konfiguration 'τ² + strict', nur vLLM >= 0.30)")
     a = ap.parse_args()
 
     checks = Checks()
@@ -383,6 +403,8 @@ def main() -> int:
                                "Gewichtsvergleich ab diesem Start)")
     else:
         checks.ok("label-dir", "kein Modell-Konflikt im Label-Verzeichnis")
+    level, msg = strict_tools_check(prev, a.strict_tools, a.label)
+    getattr(checks, level)("strict-tools", msg)
 
     # --- Label-Grammatik (WARN) ---
     alias = derive_alias(a.model)
@@ -455,6 +477,7 @@ def main() -> int:
             "gpu_util": agent_util,
             "tool_call_parser": cfg["agent"]["tool_call_parser"],
             "reasoning_parser": cfg["agent"]["reasoning_parser"],
+            "strict_tools": bool(a.strict_tools),
             "port": AGENT_PORT,
         },
         "user_sim": {

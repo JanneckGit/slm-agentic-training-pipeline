@@ -45,6 +45,9 @@ def main() -> int:
                 if cv.get("rate") is not None:
                     mlflow.log_metric(f"{comp}_rate_{dom}", cv["rate"])
             mlflow.log_metric(f"think_leaks_{dom}", s.get("think_leaks", 0))
+            if s.get("tools") and s.get("simulations"):
+                for key, v in s["tools"].items():  # je Episode (agent/unknown/repeat_tool_calls)
+                    mlflow.log_metric(f"{key}_{dom}", v / s["simulations"])
             p1 = (s.get("pass_hat") or {}).get("1")
             if p1 is not None and s.get("tasks"):
                 n_pass1 += p1 * s["tasks"]
@@ -64,6 +67,7 @@ def main() -> int:
             "user_sim_llm_args": json.dumps({k: v for k, v in m["user_sim"]["llm_args"].items()
                                              if not k.startswith("api_")}),
             "nl_judge": m["nl_judge"]["model_litellm"],
+            "strict_tools": bool(m["agent"].get("strict_tools", False)),
             "num_trials": m["run"]["num_trials"],
             "seed": m["run"]["seed"],
             "max_concurrency": m["run"]["max_concurrency"],

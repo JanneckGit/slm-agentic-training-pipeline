@@ -18,6 +18,15 @@ Warum ein Shim noetig ist (Reihenfolge ist tragend):
 
 Die Patch-Spec kommt IMMER aus dem Manifest (eine Quelle der Wahrheit, vom Preflight
 gegated) — nie aus eigenen Flags.
+
+Optional (Manifest agent.strict_tools, Env-Knopf TAU2_STRICT_TOOLS=1 in ops/eval_tau2.sh):
+die Tool-Schemas des AGENTEN tragen "strict": true. vLLM >= 0.30 legt bei tool_choice="auto"
+nur dann eine Grammatik auf die Tool-Calls (structural_tag_registry: kein strict-Tool -> keine
+Grammatik); tau2 selbst setzt strict nie. Gepatcht wird nur die Modul-Bindung
+tau2.agent.llm_agent.generate (LLMAgent + LLMGTAgent); der User-Sim bindet generate in
+tau2.user.user_simulator selbst und bleibt unberuehrt. litellm-Falle: der Provider
+`hosted_vllm/` loescht strict still (_remove_strict_from_schema) — der Agent laeuft ueber
+`openai/<alias>`, dort bleibt es stehen (tests/test_tau2_strict.py prueft beides).
 """
 
 import argparse
@@ -57,6 +66,42 @@ def apply_patches(manifest: dict) -> None:
         pass
 
 
+class StrictTool:
+    """Read-only-Proxy um ein tau2-Tool: openai_schema traegt "strict": true, sonst alles vom Original."""
+
+    def __init__(self, tool):
+        self._tool = tool
+
+    def __getattr__(self, name):
+        return getattr(self._tool, name)
+
+    @property
+    def openai_schema(self) -> dict:
+        s = self._tool.openai_schema
+        return {**s, "function": {**s["function"], "strict": True}}
+
+
+def apply_strict_tools(manifest: dict) -> bool:
+    """Agent-Tools mit "strict": true schicken, wenn das Manifest es verlangt. True = gepatcht."""
+    if not (manifest.get("agent") or {}).get("strict_tools"):
+        return False
+    import tau2.agent.llm_agent as la
+    inner = la.generate
+    if getattr(inner, "_strict_tools", False):  # idempotent
+        return True
+
+    def generate(*args, **kwargs):
+        if len(args) > 2:  # generate(model, messages, tools, ...) positional
+            args = (*args[:2], [StrictTool(t) for t in args[2]] if args[2] else args[2], *args[3:])
+        elif kwargs.get("tools"):
+            kwargs["tools"] = [StrictTool(t) for t in kwargs["tools"]]
+        return inner(*args, **kwargs)
+
+    generate._strict_tools = True
+    la.generate = generate
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", type=Path, required=True)
@@ -77,6 +122,8 @@ def main() -> int:
 
     manifest = json.loads(a.manifest.read_text())
     apply_patches(manifest)
+    if apply_strict_tools(manifest):
+        print("run_tau2: strict_tools — Agent-Tool-Schemas tragen \"strict\": true", file=sys.stderr)
 
     rest = a.tau2_args[1:] if a.tau2_args[:1] == ["--"] else a.tau2_args
     from tau2.cli import main as cli_main
