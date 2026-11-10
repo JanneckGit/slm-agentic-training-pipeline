@@ -115,14 +115,17 @@ def test_posthoc_provenance_from_sidecars(tmp_path):
     write(out, recs)
     (tmp_path / (out.name + ".meta.json")).write_text(json.dumps({
         "identity": {"model": "org/m", "label": "lbl", "split": "heldout_eval", "k": 8, "max_turns": 15,
+                     "temperature": 1.0, "top_k": -1, "vllm_extra": "",
                      "chat_template_kwargs": {"preserve_thinking": True}},
-        "info": {"host": "h100", "serve": "venv"}}))
+        "info": {"host": "h100", "serve": "venv", "eval_conc": 12}}))
     (tmp_path / (out.name + ".serve.json")).write_text(json.dumps({"server": {"vllm_version": "0.33.0"}}))
     params, label, k = posthoc.provenance(str(out), posthoc.load(str(out)))
     assert (label, k) == ("lbl", 8)
     assert params["model"] == "org/m" and params["n_tasks"] == 3
     assert params["host"] == "h100" and params["serve"] == "venv" and params["vllm_version"] == "0.33.0"
     assert json.loads(params["chat_template_kwargs"]) == {"preserve_thinking": True}
+    assert params["temperature"] == 1.0 and params["top_k"] == -1 and params["eval_conc"] == 12
+    assert "vllm_extra" not in params and "top_p" not in params   # leer bzw. fehlend -> nicht geloggt
 
 
 # ---- rollout.py: Template-Schalter kommen beim Server an ---------------------------------------------------
