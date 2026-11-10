@@ -35,6 +35,11 @@
 #   CHAT_TEMPLATE_KWARGS  zusaetzliche Template-Schalter als JSON-Objekt (z. B. '{"preserve_thinking": true}'), ueber
 #               enable_thinking gemergt; steht nur dann in der Sidecar-Identitaet (alte Sidecars bleiben resume-faehig).
 #   MLFLOW (1)  0 = kein MLflow-Log (z. B. auf einem Fremdrechner; spaeter per evaluation/log_heldout_mlflow.py nachtragen).
+#   TOOL_MODE (prompt)  prompt = Tool-Schemas + <tool_call>-Format im System-Prompt, rollout.py parst den Text (K=8-Serie).
+#               native = `tools` an den Server, dessen Parser zerlegen Calls + Denken (rollout.py --native-tools) — fuer
+#               Modelle mit fremdem Heimformat (gpt-oss, Gemma 4, Muse). Braucht in VLLM_EXTRA
+#               --enable-auto-tool-choice --tool-call-parser X --reasoning-parser Y. Steht nur bei native in der
+#               Sidecar-Identitaet (alte Sidecars bleiben resume-faehig).
 # Das vollstaendige vLLM-Server-Log landet beim Teardown (auch bei Abbruch) als <OUT>.vllm-<UTC>.log.gz daneben.
 #
 # SERVE — wer den Server stellt (Default compose = Verhalten wie bisher):
@@ -56,6 +61,8 @@ SERVE_PORT=${SERVE_PORT:-8000}
 VLLM_BIN=${VLLM_BIN:-vllm}
 MLFLOW=${MLFLOW:-1}
 CHAT_TEMPLATE_KWARGS=${CHAT_TEMPLATE_KWARGS:-}
+TOOL_MODE=${TOOL_MODE:-prompt}
+case "$TOOL_MODE" in prompt|native) ;; *) echo "TOOL_MODE muss prompt oder native sein, ist '$TOOL_MODE'"; exit 2;; esac
 if [ "$SERVE" = venv ] && ! command -v "$VLLM_BIN" >/dev/null 2>&1; then
   echo "SERVE=venv: VLLM_BIN '$VLLM_BIN' nicht gefunden"; exit 2
 fi
@@ -92,8 +99,9 @@ TOP_K=${TOP_K:-20}
 MIN_P=${MIN_P:-0}
 PRESENCE_PENALTY=${PRESENCE_PENALTY:-0.0}
 # zusaetzliche vLLM-Flags, z. B. --language-model-only bei multimodalen Modellen (Qwen3.5): laedt
-# den Vision-Encoder nicht mit und gibt KV-Pool frei. NICHT --reasoning-parser setzen — der schoebe
-# das Think in ein eigenes Feld, waehrend rollout.py es INLINE aus dem Content parst.
+# den Vision-Encoder nicht mit und gibt KV-Pool frei. Im Prompt-Modus KEIN --reasoning-parser (die K=8-Serie lief
+# ohne; rollout.py parst das Think INLINE aus dem Content). Im nativen Modus (TOOL_MODE=native) ist er Pflicht:
+# rollout.py liest das eigene Denkfeld und speichert es wieder inline.
 VLLM_EXTRA=${VLLM_EXTRA:-}
 RESUME=${RESUME:-0}; WRITE_META_ONLY=${WRITE_META_ONLY:-0}; RESUME_SUF=""
 META="${OUT}.meta.json"
@@ -104,6 +112,7 @@ meta_json() {
   MODEL="$MODEL" LABEL="$LABEL" SPLIT="$SPLIT" K="$K" TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" TOP_K="$TOP_K" MIN_P="$MIN_P" \
   PRESENCE_PENALTY="$PRESENCE_PENALTY" MAXLEN="${VLLM_MAX_MODEL_LEN:-20480}" GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" VLLM_EXTRA="$VLLM_EXTRA" \
   RTO="${ROLLOUT_TIMEOUT_S:-1800}" EVAL_CONC="$EVAL_CONC" CTK="$CHAT_TEMPLATE_KWARGS" SERVE="$SERVE" API_BASE="$API_BASE" \
+  TOOL_MODE="$TOOL_MODE" \
   python3 - <<'PY'
 import datetime, json, os, socket
 e = os.environ
@@ -114,6 +123,8 @@ ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int
          "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
 if e["CTK"]:   # nur wenn gesetzt -> Sidecars ohne Zusatzschalter bleiben identisch (Resume alter Laeufe)
     ident["chat_template_kwargs"] = json.loads(e["CTK"])
+if e["TOOL_MODE"] == "native":   # dito: nur der neue Modus steht drin
+    ident["tool_mode"] = "native"
 info = {"eval_conc": int(e["EVAL_CONC"]), "created": datetime.datetime.now().isoformat(timespec="seconds"), "host": socket.gethostname(),
         "serve": e["SERVE"]}
 if e["SERVE"] == "none":
@@ -190,6 +201,7 @@ port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$SERVE_PORT") 2>/dev/null; }
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
 echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY${CHAT_TEMPLATE_KWARGS:+ template=$CHAT_TEMPLATE_KWARGS}"
+echo "   tools   : $TOOL_MODE"
 echo "   serving : $SERVE conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'$([ "$SERVE" = none ] && echo " api=$API_BASE")"
 echo "   limits  : eval_timeout=${EVAL_TIMEOUT}s rollout_timeout=${ROLLOUT_TIMEOUT_S:-1800}s -> $OUT"
 
@@ -307,6 +319,8 @@ MLFLOW_ARGS=()
                                   --mlflow-run-name "${LABEL}${KSUF}${RESUME_SUF}")
 CTK_ARGS=()
 [ -n "$CHAT_TEMPLATE_KWARGS" ] && CTK_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
+TOOL_ARGS=()
+[ "$TOOL_MODE" = native ] && TOOL_ARGS=(--native-tools)
 
 # Ausgabe: frisch angelegt oder per RESUME fortgesetzt (siehe oben).
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /
@@ -320,7 +334,7 @@ CTK_ARGS=()
   sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
   --split "$SPLIT" --k "$K" --api-base "$API_BASE" --model "$MODEL" --teacher-name "$LABEL" \
   --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
-  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" "${CTK_ARGS[@]}" \
+  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" "${CTK_ARGS[@]}" "${TOOL_ARGS[@]}" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" --request-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
   "${MLFLOW_ARGS[@]}" \

@@ -172,6 +172,9 @@ services:
       - HF_HOME=/data/hf_cache
       - HF_TOKEN=${HF_TOKEN}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      # gpt-oss (Harmony) loads its tiktoken vocab at the first request; the download fails inside the container
+      # -> pre-placed files (o200k_base / cl100k_base .tiktoken) in the mounted HF cache. Other models ignore it.
+      - TIKTOKEN_ENCODINGS_BASE=${TIKTOKEN_ENCODINGS_BASE:-/data/hf_cache/tiktoken_encodings}
       # RLVR-GRPO pilot: allow runtime LoRA load/unload (3a hot-swap weight-sync spike)
       - VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
       # GB10 sm_121 FlashInfer top-k/top-p sampler race (vLLM #43885): PyTorch-native sampler so

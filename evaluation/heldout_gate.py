@@ -11,7 +11,10 @@ chain stops before it spends GPU days on a broken setup.
                               params, context overflow, rollout exception). A config error hits EVERY rollout, a
                               single transient timeout must not cost a whole model
         truncated   <= 10 %   rollouts that hit the 3,072-token cap of a turn (think runs past the budget)
-        think       >= 90 %   assistant turns that carry a <think> block (thinking is really on)
+        think       >= 90 %   rollouts with >= 1 <think> block (thinking is really on). Per rollout, not per turn:
+                              Harmony models (gpt-oss) think before every tool call but often write the final
+                              answer without an analysis block (GB10 smoke 10.11.: 78 % of turns, 100 % of rollouts).
+                              The per-turn share is still printed as info.
         tool calls  >= 90 %   rollouts with >= 1 parsed tool call (the call format is understood)
 
   calib --input <run on the new host> --reference <same model + protocol, known host>
@@ -65,20 +68,24 @@ def is_error(rec: dict) -> bool:
 
 def smoke_stats(recs: list[dict]) -> dict:
     n = len(recs)
-    turns = think = with_tool = 0
+    turns = think_turns = with_think = with_tool = 0
     for r in recs:
-        has_tool = False
+        has_tool = has_think = False
         for m in r.get("messages") or []:
             if m.get("role") != "assistant":
                 continue
             turns += 1
-            think += (m.get("content") or "").lstrip().startswith("<think>")
+            t = (m.get("content") or "").lstrip().startswith("<think>")
+            think_turns += t
+            has_think = has_think or t
             has_tool = has_tool or bool(m.get("tool_calls"))
+        with_think += has_think
         with_tool += has_tool
     return {"n": n,
             "errors": sum(is_error(r) for r in recs),
             "truncated": sum(bool(r.get("truncated")) for r in recs) / max(1, n),
-            "think": think / max(1, turns),
+            "think": with_think / max(1, n),
+            "think_turns": think_turns / max(1, turns),
             "tool": with_tool / max(1, n),
             "yield": sum(accepted(r) for r in recs) / max(1, n),
             "finish": Counter(str(r.get("finish_reason") or "")[:40] for r in recs)}
@@ -93,11 +100,12 @@ def smoke(args) -> int:
     max_err = max(1, int(SMOKE_MAX_ERR * s["n"]))
     checks = [("Fehler (teacher_error/error)", s["errors"] <= max_err, f"{s['errors']}", f"<= {max_err}"),
               ("truncated", s["truncated"] <= SMOKE_MAX_TRUNC, f"{s['truncated']:.1%}", f"<= {SMOKE_MAX_TRUNC:.0%}"),
-              ("Think je Assistant-Zug", s["think"] >= SMOKE_MIN_THINK, f"{s['think']:.1%}", f">= {SMOKE_MIN_THINK:.0%}"),
+              ("Rollouts mit Denken", s["think"] >= SMOKE_MIN_THINK, f"{s['think']:.1%}", f">= {SMOKE_MIN_THINK:.0%}"),
               ("Rollouts mit Tool-Call", s["tool"] >= SMOKE_MIN_TOOL, f"{s['tool']:.1%}", f">= {SMOKE_MIN_TOOL:.0%}")]
     print(f"SMOKE {args.input}: {s['n']} Rollouts, Yield {s['yield']:.1%} (nur Info, kein Kriterium)")
     for name, ok, val, rule in checks:
         print(f"  {'OK ' if ok else 'XX '} {name:<28} {val:>7}   (Soll {rule})")
+    print(f"  info: Denken je Assistant-Zug {s['think_turns']:.1%}")
     print("  finish: " + ", ".join(f"{k} {v}" for k, v in s["finish"].most_common(6)))
     ok = all(c[1] for c in checks)
     print(f"SMOKE {'BESTANDEN' if ok else 'DURCHGEFALLEN'}")

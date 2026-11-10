@@ -15,6 +15,12 @@ its native trained syntax, but we parse `<tool_call>{...}</tool_call>` blocks ou
 server-parsed `tool_calls` field if present) — no dependency on vLLM's tool parser. `<think>` blocks are
 stripped from the running context (loop hygiene, base lesson); `<plan>` stays (Variante C supervision).
 
+NATIVE tool mode (--native-tools, for models whose home format is NOT <think>/<tool_call>, e.g. gpt-oss/Harmony,
+Gemma 4, Muse Glimmer): the server gets `tools` (+ tool_choice auto, no `strict` -> no grammar, as in prompt mode)
+and splits calls + reasoning with its own parsers (vLLM --enable-auto-tool-choice --tool-call-parser X
+--reasoning-parser Y); the system prompt drops our tools block + <tool_call> example (the template renders the
+tools in the model's format). Records stay identical in shape: reasoning is stored inline as <think>…</think>.
+
 Runs in the tau2 venv (needs the domain + verifier):
     PYTHONPATH=. <tau2-venv>/bin/python sdg_pipeline/db_bahn/rollout.py \
         --config config/pipeline_config.yaml --split bakeoff_dev --k 3
@@ -67,6 +73,19 @@ SYSTEM_TEMPLATE = "{policy}\n\n" + TOOLS_BLOCK_TMPL + """
 - Wenn die Aufgabe gelöst ist: KEIN Tool-Aufruf mehr, sondern eine kurze deutsche Schlussantwort mit den
   belegten Fakten (nur Werte, die ein Werkzeug geliefert hat)."""
 
+# NATIVE tool mode: same prompt minus our tools block and the <tool_call> format rule (the chat template
+# renders the `tools` param in the model's own format). Derived from SYSTEM_TEMPLATE so the rest can't drift.
+_PROMPT_FORMAT_RULE = SYSTEM_TEMPLATE[SYSTEM_TEMPLATE.index("- Rufe Werkzeuge"):
+                                      SYSTEM_TEMPLATE.index("</tool_call>") + len("</tool_call>")]
+SYSTEM_TEMPLATE_NATIVE = (SYSTEM_TEMPLATE
+                          .replace("\n\n" + TOOLS_BLOCK_TMPL, "", 1)
+                          .replace(_PROMPT_FORMAT_RULE,
+                                   "- Rufe Werkzeuge über die Funktionsaufruf-Schnittstelle auf (ein Aufruf je Werkzeug);\n"
+                                   "  UNABHÄNGIGE Abfragen bündelst du als MEHRERE Aufrufe im selben Zug.", 1))
+# home-format tool markup that survived WITHOUT a parsed call (native mode) = a format error, not an answer
+TOOL_MARKUP_RE = re.compile(r"<\|tool_call>|<atem:|to=functions\.|<tool_call>|<function=")
+THINK_TAG_RE = re.compile(r"<(?:seed:)?think>|</(?:seed:)?think>|\[THINK\]|\[/THINK\]")
+
 
 def resolve_teacher(config: dict, api_base=None, model=None) -> dict:
     t = (config.get("teacher") or {}).get("vllm_local", {})
@@ -86,20 +105,41 @@ def resolve_teacher(config: dict, api_base=None, model=None) -> dict:
             "legacy_stop": bool(traj.get("legacy_stop", False))}
 
 
+def to_wire(messages: list[dict]) -> list[dict]:
+    """NATIVE mode: move the inline <think> of assistant turns into the reasoning field, so the template renders
+    it in the model's own channel. Both names: vLLM (0.21–0.33) reads `reasoning` and hands the template
+    `reasoning` + `reasoning_content`; Harmony reads only `reasoning`, the Muse template only `reasoning_content`.
+    The records keep the canonical inline form — this copy only goes over the wire."""
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant":
+            think, rest = extract_think(m.get("content") or "")
+            if think:
+                m = {**m, "content": rest, "reasoning": think, "reasoning_content": think}
+        out.append(m)
+    return out
+
+
 def make_teacher_call(cfg: dict, timeout: float = 600.0):
     import httpx
     client = httpx.Client(timeout=timeout)
     url = cfg["api_base"].rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    native = bool(cfg.get("native_tools"))
 
     def call(messages: list[dict], tools: list[dict]) -> tuple[str, list[dict], str]:
-        # PROMPT-AND-PARSE: tool schemas live in the system prompt; the `tools` param is NOT sent
+        # PROMPT-AND-PARSE (default): tool schemas live in the system prompt; the `tools` param is NOT sent
         # (vLLM 400s on tools without --enable-auto-tool-choice — exactly the server dependency we avoid).
-        payload = {"model": cfg["model"], "messages": messages,
+        # NATIVE (--native-tools): `tools` + tool_choice auto, the server's parsers split calls and reasoning;
+        # no `strict` on the tools -> vLLM applies no grammar (same freedom as prompt mode).
+        payload = {"model": cfg["model"], "messages": to_wire(messages) if native else messages,
                    "temperature": cfg["temperature"], "max_tokens": cfg["max_tokens"],
                    # top_k/min_p are vLLM protocol extensions (accepted at the top level)
                    "top_p": cfg["top_p"], "top_k": cfg["top_k"], "min_p": cfg["min_p"],
                    "presence_penalty": cfg["presence_penalty"]}
+        if native:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if cfg.get("legacy_stop"):
             # pre-wave-3 behavior: halt right after the FIRST tool-call block. This also made
             # multi-call turns (parallel batching) impossible; the role-played-tool-RESPONSE
@@ -113,9 +153,16 @@ def make_teacher_call(cfg: dict, timeout: float = 600.0):
         r = client.post(url, json=payload, headers=headers)
         if r.status_code >= 400:  # include the body — vLLM puts the actual reason there
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        msg = r.json()["choices"][0]["message"]
-        return msg.get("content") or "", msg.get("tool_calls") or [], \
-            r.json()["choices"][0].get("finish_reason", "")
+        choice = r.json()["choices"][0]
+        msg = choice["message"]
+        content = msg.get("content") or ""
+        # a server-side reasoning parser returns the thinking in its own field (vLLM >= 0.30 `reasoning`, older
+        # `reasoning_content`) -> rewrap it inline so extract_think sees it like any other model's <think>.
+        # Without a reasoning parser (all prompt-mode runs) the field is absent and nothing changes.
+        reasoning = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+        if reasoning and not THINK_TAG_RE.search(content):
+            content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+        return content, msg.get("tool_calls") or [], choice.get("finish_reason", "")
 
     return call
 
@@ -261,12 +308,14 @@ def make_oracle(task: dict, key: dict, broken: bool = False):
 
 # --- the multi-turn rollout ------------------------------------------------------------------
 def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_timeout_s: float,
-                resume_messages: list | None = None) -> dict:
+                resume_messages: list | None = None, native: bool = False) -> dict:
     """One multi-turn rollout, scored by the verifier.
 
     resume_messages (A1 branch-on-failure): if given, the env state is reconstructed by replaying the
     prefix's assistant tool calls (mirrors trajectory_reward's replay), messages start from a copy of the
     prefix, and the teacher continues the tail. Default (None) = today's from-scratch behavior, untouched.
+    native (--native-tools): system prompt without our tools block / format rule; a turn without a parsed
+    call but with leftover tool markup ends as finish 'tool_format_error' (the score stays the verifier's).
     """
     from tau2.data_model.tasks import EnvFunctionCall
 
@@ -277,7 +326,8 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
     tools = openai_tools(env)
     if resume_messages is None:
         tools_block = "\n".join(json.dumps(t, ensure_ascii=False) for t in tools)
-        sys_prompt = SYSTEM_TEMPLATE.format(policy=env.get_policy(), tools_block=tools_block)
+        sys_prompt = (SYSTEM_TEMPLATE_NATIVE if native else SYSTEM_TEMPLATE).format(
+            policy=env.get_policy(), tools_block=tools_block)
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": task["ticket"]}]
     else:
@@ -319,7 +369,7 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             finish = "timeout"
             break
         try:
-            content, native, fr = teacher_call(messages, tools)
+            content, server_calls, fr = teacher_call(messages, tools)
         except Exception as e:  # HTTP 4xx/5xx, context overflow, transient server error — end this
             finish = f"teacher_error:{type(e).__name__}: {str(e)[:120]}"  # rollout gracefully (score 0,
             break                                                        # keep partial trace, don't abort)
@@ -328,7 +378,7 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
         # teacher — matching both the Qwen template's single-query behavior and what the student
         # will see in training and at inference.
         think, visible = extract_think(content)
-        clean, calls, tail_chars = parse_tool_calls(visible, native)
+        clean, calls, tail_chars = parse_tool_calls(visible, server_calls)
         tail_total += tail_chars
         assistant = {"role": "assistant",
                      "content": (f"<think>\n{think}\n</think>\n\n" if think else "") + clean}
@@ -340,7 +390,10 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             truncated = True
             break
         if not calls:
-            finish = "final_answer" if clean.strip() else f"empty({fr})"
+            if native and TOOL_MARKUP_RE.search(visible):  # the server's parser missed a home-format call
+                finish = "tool_format_error"
+            else:
+                finish = "final_answer" if clean.strip() else f"empty({fr})"
             break
         for tc in calls:
             fn = tc["function"]
@@ -488,7 +541,8 @@ def _try_recovery(base: dict, task: dict, key: dict, make_call, args) -> tuple:
         if prefix is None:
             continue
         cand = run_rollout(task, key, make_call(temp_bump=bump), args.max_turns,
-                           args.rollout_timeout_s, resume_messages=prefix)
+                           args.rollout_timeout_s, resume_messages=prefix,
+                           native=getattr(args, "native_tools", False))
         n += 1
         if accepted(cand):
             return cand, mode, n
@@ -506,7 +560,8 @@ def solve_task(task: dict, key: dict, make_call, args, teacher_cfg) -> dict:
     is_oracle = args.dry_run or args.dry_run_broken
     branch_on = getattr(args, "branch_on_fail", False)
 
-    best = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
+    native = getattr(args, "native_tools", False)
+    best = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s, native=native)
     n_branch = 0
     mode = "direct" if accepted(best) else None
 
@@ -525,7 +580,7 @@ def solve_task(task: dict, key: dict, make_call, args, teacher_cfg) -> dict:
                     mode = m
                     break
             # recovery didn't verify (or no reusable prefix / budget spent) → fresh full sample
-            fresh = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s)
+            fresh = run_rollout(task, key, make_call(), args.max_turns, args.rollout_timeout_s, native=native)
             if accepted(fresh):
                 best, mode = fresh, "restart"
                 break
@@ -565,6 +620,10 @@ def main():
     ap.add_argument("--chat-template-kwargs", default=None, metavar="JSON",
                     help="extra chat-template switches as a JSON object, merged over enable_thinking "
                          "(e.g. '{\"preserve_thinking\": true}'); recorded in gen_params only when set")
+    ap.add_argument("--native-tools", action="store_true",
+                    help="NATIVE tool mode: send `tools` (tool_choice auto), the server parses calls + reasoning "
+                         "(needs vLLM --enable-auto-tool-choice --tool-call-parser X --reasoning-parser Y); "
+                         "system prompt without our tools block; recorded as gen_params.tool_mode=native")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=10)
     ap.add_argument("--max-regen", type=int, default=2, help="re-sample a failed rollout up to N times "
@@ -674,6 +733,8 @@ def main():
         teacher_cfg["omit_thinking_kwarg"] = args.omit_thinking_kwarg
         if extra_kwargs:
             teacher_cfg["chat_template_kwargs"] = extra_kwargs
+        if args.native_tools:
+            teacher_cfg["native_tools"] = True
     lock = threading.Lock()
     stats = {"n": 0, "verified": 0, "replan": 0, "turns": 0.0,
              "branched": 0, "emergent_rec": 0, "scripted_rec": 0,
@@ -717,7 +778,8 @@ def main():
                                                    "legacy_stop", "max_tokens")},
                 # only when set -> records of runs without extra switches stay byte-identical
                 **({"chat_template_kwargs": teacher_cfg["chat_template_kwargs"]}
-                   if teacher_cfg.get("chat_template_kwargs") else {})},
+                   if teacher_cfg.get("chat_template_kwargs") else {}),
+                **({"tool_mode": "native"} if teacher_cfg.get("native_tools") else {})},
                "score": sc, "finish_reason": res["finish_reason"],
                "wall_s": res["wall_s"], "messages": res["messages"]}
         with lock:
@@ -782,7 +844,8 @@ def main():
                 mlflow.start_run(run_name=args.mlflow_run_name or teacher_label)
                 mlflow.log_params({"split": args.split, "teacher": teacher_label, "model": args.model,
                                    "k": args.k, "n_tasks": len(split_ids),
-                                   "branch_on_fail": args.branch_on_fail, "max_turns": args.max_turns})
+                                   "branch_on_fail": args.branch_on_fail, "max_turns": args.max_turns,
+                                   **({"tool_mode": "native"} if args.native_tools else {})})
                 mlflow.log_metrics({
                     "verified_yield": stats["verified"] / n, "replan_rate": stats["replan"] / n,
                     "avg_turns": stats["turns"] / n, "n_rollouts": stats["n"],

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ops/h100_open_models.sh — DB-Heldout (K=8) fuer offene Modelle auf einem Rechner OHNE Docker (Runde 1).
+# ops/h100_open_models.sh — DB-Heldout (K=8) fuer offene Modelle auf einem Rechner OHNE Docker (Runde 1 + 2).
 #
 # Je Modell:  Download (das naechste laedt im Hintergrund vor)
 #          -> Smoke: bakeoff_dev, K=1, plus Gate (evaluation/heldout_gate.py smoke: Fehler, truncated, Think, Tool-Calls)
@@ -45,10 +45,14 @@ export no_proxy="localhost,127.0.0.1${no_proxy:+,$no_proxy}"; export NO_PROXY=$n
 # huggingface_hub >= 2 legt Xet-Dateien in einen cacheweiten Speicher (hub/blobs/<xx>/<hash>), models--*/blobs
 # sind dann nur Symlinks -> delete_weights (rm -rf models--*) gaebe keinen Platz frei. Klassisches Layout erzwingen.
 export HF_HUB_DISABLE_SHARED_BLOBS=1
+# gpt-oss (Harmony) laedt sein tiktoken-Vokabular beim ersten Request aus dem Netz; das scheitert je nach Umgebung
+# (GB10-Container: immer) -> Dateien vorab ablegen (siehe Vorab-Checks), vLLM erbt die Variable.
+export TIKTOKEN_ENCODINGS_BASE=${TIKTOKEN_ENCODINGS_BASE:-$C/tiktoken}
 mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" \
          "$TORCHINDUCTOR_CACHE_DIR" "$CUDA_CACHE_PATH" "$FLASHINFER_WORKSPACE_BASE" "$OUTDIR" logs data/generated/eval
 
-# label|hf-repo|vllm-extra|gpu-util|temp|top_p|top_k|min_p|presence|chat-template-kwargs (JSON)|Download-GB
+# label|hf-repo|vllm-extra|gpu-util|temp|top_p|top_k|min_p|presence|chat-template-kwargs (JSON)|Download-GB|tool-mode
+# tool-mode leer = prompt (Text-Format <tool_call>, Runde 1); native = Server-Parser (Runde 2, siehe eval_heldout.sh).
 # Protokoll fest (eval_heldout.sh): 15 Zuege, 3.072 Token/Zug, Kontext 20.480, Single-Shot, Thinking an.
 # Sampling + Template-Schalter je Modell laut Model-Card; top_k -1 = aus (Card nennt keins).
 MODELS=(
@@ -58,8 +62,16 @@ MODELS=(
   "open_kolibri-1|Aleph-Alpha/Kolibri-1|--kv-cache-dtype fp8|0.95|1.0|0.97|128|0|0.0||80"
   'open_nanbeige4.3-33b|Nanbeige/Nanbeige4.3-33B||0.90|1.0|0.95|-1|0|0.0|{"preserve_thinking": true}|67'
   "open_granite-4.2-30b|ibm-granite/granite-4.2-30b||0.90|1.0|0.95|-1|0|0.0||60"
+  # Runde 2: fremdes Heimformat (Harmony, ATEM, Gemma-Kanaele) -> nativer Tool-Modus; Protokoll sonst gleich.
+  # Denkstufe = Template-Default (gpt-oss medium, Muse high, Gemma Thinking an); keine Grammatik (kein strict).
+  # Zuerst die Kontrolle: Qwen3-4B nativ (hermes + qwen3) gegen den Eichlauf oben -> misst, ob der Modus allein verschiebt.
+  "base_qwen3-4b_h100_native|Qwen/Qwen3-4B|--enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3|0.85|0.6|0.95|20|0|0.0||9|native"
+  "open_gpt-oss-120b|openai/gpt-oss-120b|--enable-auto-tool-choice --tool-call-parser openai --reasoning-parser openai_gptoss|0.90|1.0|1.0|-1|0|0.0||66|native"
+  "open_muse-glimmer-30b|meta-models/Muse-Glimmer-30B|--language-model-only --enable-auto-tool-choice --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer|0.90|1.0|0.95|64|0|0.0||61|native"
+  "open_gemma-4-31b|google/gemma-4-31B-it|--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4|0.90|1.0|0.95|64|0|0.0||63|native"
 )
 CALIB_LABEL=base_qwen3-4b_h100
+CONTROL_LABEL=${CALIB_LABEL}_native   # Runde 2: nativer Modus gegen den Eichlauf (nur protokolliert, kein Abbruch)
 
 CLOG=logs/h100_chain.log
 log() { echo "== [h100] $(date '+%F %T') $*" | tee -a "$CLOG"; }
@@ -68,10 +80,11 @@ split_n() { python3 -c 'import json,sys;print(len(json.load(open("data/raw/db_sa
 free_gb() { df --output=avail -BG "$H100_ROOT" | tail -1 | tr -dc '0-9'; }
 cache_dir() { echo "$HF_HOME/hub/models--${1//\//--}"; }
 
-download() {   # <repo> -> 0 ok; drei Versuche (Proxy)
-  local t
+download() {   # <repo> -> 0 ok; drei Versuche (Proxy). original/ + metal/ = Zweitkopien der Gewichte (gpt-oss: je 65 GB),
+  local t        # die vLLM nie liest
   for t in 1 2 3; do
-    HF_HUB_DISABLE_PROGRESS_BARS=1 "$HF_CLI" download "$1" >>logs/h100_download.log 2>&1 && return 0
+    HF_HUB_DISABLE_PROGRESS_BARS=1 "$HF_CLI" download "$1" --exclude 'original/*' --exclude 'metal/*' \
+      >>logs/h100_download.log 2>&1 && return 0
     echo "download $1 Versuch $t fehlgeschlagen" >>logs/h100_download.log; sleep 60
   done
   return 1
@@ -97,6 +110,13 @@ max_conc() {   # <smoke-out> -> "Maximum concurrency"-Wert aus dem gesicherten S
 
 # ---- Vorab-Checks -----------------------------------------------------------------------------------------
 for f in "$VLLM_BIN" "$TAU2PY" "$HF_CLI"; do [ -x "$f" ] || { log "ABBRUCH: $f fehlt"; exit 1; }; done
+mkdir -p "$TIKTOKEN_ENCODINGS_BASE"
+for f in o200k_base cl100k_base; do   # nur gpt-oss braucht sie; fehlen sie, faellt nur dessen Smoke durch
+  t="$TIKTOKEN_ENCODINGS_BASE/$f.tiktoken"
+  [ -s "$t" ] && continue
+  curl -sSf --retry 3 --max-time 120 -o "$t.part" "https://openaipublic.blob.core.windows.net/encodings/$f.tiktoken" \
+    && mv "$t.part" "$t" || log "WARNUNG: $f.tiktoken nicht ladbar — gpt-oss wird im Smoke scheitern"
+done
 for f in db.json tasks.json split_tasks.json answer_keys.json; do
   [ -f "data/raw/db_sandbox/$f" ] || { log "ABBRUCH: data/raw/db_sandbox/$f fehlt (Eingabe-Paket entpackt?)"; exit 1; }
 done
@@ -112,7 +132,7 @@ N_SMOKE=$(split_n bakeoff_dev); N_K8=$(( $(split_n heldout_eval) * 8 ))
 BG_PID=""; BG_REPO=""
 
 for i in "${!MODELS[@]}"; do
-  IFS='|' read -r LABEL REPO_ID EXTRA UTIL TEMP TOPP TOPK MINP PRES CTK GB <<<"${MODELS[$i]}"
+  IFS='|' read -r LABEL REPO_ID EXTRA UTIL TEMP TOPP TOPK MINP PRES CTK GB TOOLM <<<"${MODELS[$i]}"
   [ -n "$ONLY" ] && [ "$ONLY" != "$LABEL" ] && continue
   K8_OUT=data/generated/eval/db_traces_heldout_eval_${LABEL}_k8.jsonl
   SMOKE_OUT=data/generated/eval/db_traces_bakeoff_dev_${LABEL}.jsonl
@@ -133,7 +153,7 @@ for i in "${!MODELS[@]}"; do
   download "$REPO_ID" || { log "$LABEL: Download fehlgeschlagen — uebersprungen (logs/h100_download.log)"; continue; }
   # naechstes Modell im Hintergrund vorladen, wenn Platz ist
   for j in $(seq $((i + 1)) $((${#MODELS[@]} - 1))); do
-    IFS='|' read -r NL NR _ _ _ _ _ _ _ _ NGB <<<"${MODELS[$j]}"
+    IFS='|' read -r NL NR _ _ _ _ _ _ _ _ NGB _ <<<"${MODELS[$j]}"
     [ -n "$ONLY" ] && break
     [ "$(rows "data/generated/eval/db_traces_heldout_eval_${NL}_k8.jsonl")" -ge "$N_K8" ] && continue
     if [ -z "$BG_PID" ] && [ "$(free_gb)" -ge $((NGB + SPACE_RESERVE_GB)) ]; then
@@ -144,7 +164,7 @@ for i in "${!MODELS[@]}"; do
 
   RUN_ENV=(SERVE=venv MLFLOW=0 SERVE_WAIT_S=3600 VLLM_MAX_MODEL_LEN=20480 VLLM_GPU_UTIL="$UTIL" VLLM_EXTRA="$EXTRA"
            TEMPERATURE="$TEMP" TOP_P="$TOPP" TOP_K="$TOPK" MIN_P="$MINP" PRESENCE_PENALTY="$PRES"
-           CHAT_TEMPLATE_KWARGS="$CTK")
+           CHAT_TEMPLATE_KWARGS="$CTK" TOOL_MODE="${TOOLM:-prompt}")
 
   # -- Smoke + Gate (nicht fuer den Eichlauf) --
   CONC=21
@@ -185,6 +205,12 @@ for i in "${!MODELS[@]}"; do
     if ! "$TAU2PY" evaluation/heldout_gate.py calib --input "$K8_OUT" --reference "$REFERENCE" 2>&1 | tee -a "$CLOG"; then
       pack "$LABEL"; log "ABBRUCH: Eichung durchgefallen — erst klaeren, dann neu starten"; exit 1
     fi
+  fi
+  # -- Kontrolle Runde 2: nativ vs. Eichlauf (Textformat), gleiche Maschine; Ergebnis nur ins Log --
+  if [ "$LABEL" = "$CONTROL_LABEL" ]; then
+    "$TAU2PY" evaluation/heldout_gate.py calib --input "$K8_OUT" \
+      --reference "data/generated/eval/db_traces_heldout_eval_${CALIB_LABEL}_k8.jsonl" 2>&1 | tee -a "$CLOG" \
+      || log "$LABEL: Kontrolle ausserhalb +-3 pp — Runde-2-Zahlen mit Vorbehalt (Kette laeuft weiter)"
   fi
   pack "$LABEL"
   delete_weights "$REPO_ID"
