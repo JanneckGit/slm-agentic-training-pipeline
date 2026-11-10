@@ -42,6 +42,9 @@ export HF_HOME=$C/hf XDG_CACHE_HOME=$C/xdg PIP_CACHE_DIR=$C/pip TMPDIR=$C/tmp VL
        TRITON_CACHE_DIR=$C/triton TORCHINDUCTOR_CACHE_DIR=$C/inductor CUDA_CACHE_PATH=$C/nv \
        FLASHINFER_WORKSPACE_BASE=$C/flashinfer
 export no_proxy="localhost,127.0.0.1${no_proxy:+,$no_proxy}"; export NO_PROXY=$no_proxy
+# huggingface_hub >= 2 legt Xet-Dateien in einen cacheweiten Speicher (hub/blobs/<xx>/<hash>), models--*/blobs
+# sind dann nur Symlinks -> delete_weights (rm -rf models--*) gaebe keinen Platz frei. Klassisches Layout erzwingen.
+export HF_HUB_DISABLE_SHARED_BLOBS=1
 mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" \
          "$TORCHINDUCTOR_CACHE_DIR" "$CUDA_CACHE_PATH" "$FLASHINFER_WORKSPACE_BASE" "$OUTDIR" logs data/generated/eval
 
