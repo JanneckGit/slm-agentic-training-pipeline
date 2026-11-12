@@ -141,6 +141,19 @@ def test_posthoc_provenance_from_sidecars(tmp_path):
     assert params["temperature"] == 1.0 and params["top_k"] == -1 and params["eval_conc"] == 12
     assert params["tool_mode"] == "native"
     assert "vllm_extra" not in params and "top_p" not in params   # leer bzw. fehlend -> nicht geloggt
+    assert "rescored" not in params
+
+
+def test_posthoc_provenance_carries_the_last_rescore(tmp_path):
+    out = tmp_path / "db_traces_heldout_eval_lbl_k8.jsonl"
+    write(out, [rec(task="t0", sample=s) for s in range(8)])
+    (tmp_path / (out.name + ".meta.json")).write_text(json.dumps({
+        "identity": {"label": "lbl", "k": 8},
+        "rescored": [{"at": "2026-11-01T10:00:00", "reason": "alt", "verifier_sha256": "aaa", "changed_records": 1},
+                     {"at": "2026-11-12T09:30:00", "reason": "typo-norm", "verifier_sha256": "bbb",
+                      "changed_records": 7}]}))
+    params, _, _ = posthoc.provenance(str(out), posthoc.load(str(out)))
+    assert params["rescored"] == "2026-11-12 typo-norm (verifier bbb, 7 geaendert)"
 
 
 # ---- rollout.py: Template-Schalter kommen beim Server an ---------------------------------------------------

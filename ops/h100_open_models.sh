@@ -9,6 +9,8 @@
 # Eintrag 0 = Eichlauf Qwen3-4B: statt Smoke ein Vergleich mit der GB10-Referenz (heldout_gate.py calib);
 # faellt die Eichung durch, bricht die Kette ab (dann stimmt etwas an Rechner/Setup nicht).
 # Ein Modell, dessen Smoke durchfaellt, wird uebersprungen (Gewichte bleiben liegen); die Kette laeuft weiter.
+# Label <X>_native: nach dem K=8 Vergleich mit <X> (Textformat, gleiche Maschine), falls fertig — nur ins Log.
+# Modell als absoluter Pfad (eigene Checkpoints, per Share gebracht): kein Download, Ordner wird nie geloescht.
 # Resume-fest: fertige Laeufe (Zeilenzahl = Soll) werden uebersprungen, unvollstaendige mit RESUME=1 fortgesetzt.
 # MLflow wird spaeter auf dem Heimrechner nachgetragen (evaluation/log_heldout_mlflow.py).
 #
@@ -69,9 +71,13 @@ MODELS=(
   "open_gpt-oss-120b|openai/gpt-oss-120b|--enable-auto-tool-choice --tool-call-parser openai --reasoning-parser openai_gptoss|0.90|1.0|1.0|-1|0|0.0||66|native"
   "open_muse-glimmer-30b|meta-models/Muse-Glimmer-30B|--language-model-only --enable-auto-tool-choice --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer|0.90|1.0|0.95|64|0|0.0||61|native"
   "open_gemma-4-31b|google/gemma-4-31B-it|--language-model-only --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4|0.90|1.0|0.95|64|0|0.0||63|native"
+  # Formatprobe (12.11.): unser Standardmodell r3 Step 32 (lokaler Ordner vom GB10) im Textformat und nativ auf
+  # derselben Maschine -> zeigt, ob der native Modus auch unser Modell verschiebt (Kontrolle oben: Base +4,5 pp).
+  # Sampling wie in der K=8-Serie (Qwen-Rezept). Reihenfolge: erst Textformat, dann nativ (Vergleich im Log).
+  "after_grpo_db_bahn_r3_step32_h100|/data/slm/models/grpo_db_bahn_r3_step32||0.85|0.6|0.95|20|0|0.0||0"
+  "after_grpo_db_bahn_r3_step32_h100_native|/data/slm/models/grpo_db_bahn_r3_step32|--enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3|0.85|0.6|0.95|20|0|0.0||0|native"
 )
 CALIB_LABEL=base_qwen3-4b_h100
-CONTROL_LABEL=${CALIB_LABEL}_native   # Runde 2: nativer Modus gegen den Eichlauf (nur protokolliert, kein Abbruch)
 
 CLOG=logs/h100_chain.log
 log() { echo "== [h100] $(date '+%F %T') $*" | tee -a "$CLOG"; }
@@ -98,7 +104,9 @@ delete_weights() {   # <repo>
 pack() {   # <label> -> $OUTDIR/h100-results-<label>.tar.gz (+ .sha256)
   local t="$OUTDIR/h100-results-$1.tar.gz"
   # shellcheck disable=SC2046
-  tar czf "$t" $(ls data/generated/eval/*_"$1"[._]* 2>/dev/null) "$CLOG" logs/h100_env.txt 2>/dev/null \
+  # genau dieses Label: <X>.jsonl* (Smoke) und <X>_k8.jsonl* (K=8) — nicht die Dateien von <X>_native
+  tar czf "$t" $(ls data/generated/eval/*_"$1".jsonl* data/generated/eval/*_"$1"_k8.jsonl* 2>/dev/null) \
+    "$CLOG" logs/h100_env.txt 2>/dev/null \
     && (cd "$OUTDIR" && sha256sum "$(basename "$t")" > "$(basename "$t").sha256") \
     && log "Paket: $t ($(du -h "$t" | cut -f1))"
 }
@@ -144,18 +152,24 @@ for i in "${!MODELS[@]}"; do
     log "$LABEL: K=8 schon vollstaendig — uebersprungen"; continue
   fi
   log "==== $LABEL ($REPO_ID) ===="
+  LOCAL=0; [[ "$REPO_ID" == /* ]] && LOCAL=1   # eigener Checkpoint als Ordner: kein Download, nie loeschen
 
   # -- Download (ein laufender Hintergrund-Download fuer DIESES Modell wird abgewartet) --
-  if [ -n "$BG_PID" ] && [ "$BG_REPO" = "$REPO_ID" ]; then wait "$BG_PID"; BG_PID=""; fi
-  if [ ! -d "$(cache_dir "$REPO_ID")" ] && [ "$(free_gb)" -lt $((GB + SPACE_RESERVE_GB)) ]; then
-    log "ABBRUCH: zu wenig Platz fuer $REPO_ID (${GB} GB + ${SPACE_RESERVE_GB} GB Reserve, frei $(free_gb) GB)"; exit 1
+  if [ "$LOCAL" = 1 ]; then
+    [ -f "$REPO_ID/config.json" ] || { log "$LABEL: Modellordner $REPO_ID fehlt (config.json) — uebersprungen"; continue; }
+  else
+    if [ -n "$BG_PID" ] && [ "$BG_REPO" = "$REPO_ID" ]; then wait "$BG_PID"; BG_PID=""; fi
+    if [ ! -d "$(cache_dir "$REPO_ID")" ] && [ "$(free_gb)" -lt $((GB + SPACE_RESERVE_GB)) ]; then
+      log "ABBRUCH: zu wenig Platz fuer $REPO_ID (${GB} GB + ${SPACE_RESERVE_GB} GB Reserve, frei $(free_gb) GB)"; exit 1
+    fi
+    download "$REPO_ID" || { log "$LABEL: Download fehlgeschlagen — uebersprungen (logs/h100_download.log)"; continue; }
   fi
-  download "$REPO_ID" || { log "$LABEL: Download fehlgeschlagen — uebersprungen (logs/h100_download.log)"; continue; }
-  # naechstes Modell im Hintergrund vorladen, wenn Platz ist
+  # naechstes Modell im Hintergrund vorladen, wenn Platz ist (lokale Ordner brauchen keinen Download)
   for j in $(seq $((i + 1)) $((${#MODELS[@]} - 1))); do
     IFS='|' read -r NL NR _ _ _ _ _ _ _ _ NGB _ <<<"${MODELS[$j]}"
     [ -n "$ONLY" ] && break
     [ "$(rows "data/generated/eval/db_traces_heldout_eval_${NL}_k8.jsonl")" -ge "$N_K8" ] && continue
+    [[ "$NR" == /* ]] && break
     if [ -z "$BG_PID" ] && [ "$(free_gb)" -ge $((NGB + SPACE_RESERVE_GB)) ]; then
       download "$NR" & BG_PID=$!; BG_REPO=$NR; log "Hintergrund-Download: $NR (PID $BG_PID)"
     fi
@@ -206,14 +220,18 @@ for i in "${!MODELS[@]}"; do
       pack "$LABEL"; log "ABBRUCH: Eichung durchgefallen — erst klaeren, dann neu starten"; exit 1
     fi
   fi
-  # -- Kontrolle Runde 2: nativ vs. Eichlauf (Textformat), gleiche Maschine; Ergebnis nur ins Log --
-  if [ "$LABEL" = "$CONTROL_LABEL" ]; then
-    "$TAU2PY" evaluation/heldout_gate.py calib --input "$K8_OUT" \
-      --reference "data/generated/eval/db_traces_heldout_eval_${CALIB_LABEL}_k8.jsonl" 2>&1 | tee -a "$CLOG" \
-      || log "$LABEL: Kontrolle ausserhalb +-3 pp — Runde-2-Zahlen mit Vorbehalt (Kette laeuft weiter)"
+  # -- Formatvergleich: <X>_native gegen <X> (Textformat, gleiche Maschine), falls fertig; Ergebnis nur ins Log --
+  if [[ "$LABEL" == *_native ]]; then
+    PAIR=data/generated/eval/db_traces_heldout_eval_${LABEL%_native}_k8.jsonl
+    if [ "$(rows "$PAIR")" -ge "$N_K8" ]; then
+      "$TAU2PY" evaluation/heldout_gate.py calib --input "$K8_OUT" --reference "$PAIR" 2>&1 | tee -a "$CLOG" \
+        || log "$LABEL: nativ weicht mehr als +-3 pp vom Textformat ab (${LABEL%_native}) — nur protokolliert"
+    else
+      log "$LABEL: Textformat-Lauf ${LABEL%_native} nicht vollstaendig — kein Formatvergleich"
+    fi
   fi
   pack "$LABEL"
-  delete_weights "$REPO_ID"
+  [ "$LOCAL" = 1 ] || delete_weights "$REPO_ID"
 done
 
 [ -n "$BG_PID" ] && wait "$BG_PID"

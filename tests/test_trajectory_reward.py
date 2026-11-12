@@ -6,7 +6,7 @@ traces -> 1.0; wrong write, hallucination, ignored rejection, skipped retry -> 0
 generated db_bahn pool (see conftest) in the tau2 venv: `bash ops/run_tests.sh` or
 `.venv-tau2/bin/python -m pytest tests/test_trajectory_reward.py`.
 
-Case numbers follow the original suite (1-21: wave 2 / 3 / 3.5). Shared preparations are module-scoped
+Case numbers follow the original suite (1-21: wave 2 / 3 / 3.5; 22: typography 12.11.2026). Shared preparations are module-scoped
 fixtures; variants mutate JSON copies, never the fixture objects.
 """
 import json
@@ -514,3 +514,25 @@ def test_21_h5_clean_branch_free_wording_passes(dom, tasks, keys, pick):
         {"role": "assistant", "content": "Der Zug liegt unter der Schwelle, ich habe nichts eingeplant."}]
     r = score_trajectory(task, msgs, key)
     assert r["score"] == 1.0, f"H5: free clean-branch wording must pass now: {r}"
+
+
+# ------------------------------------------------------------------ 12.11.2026: typographic variants
+def test_22_typographic_spaces_and_hyphens_are_normalized(info_crew):
+    # gpt-oss writes narrow no-break spaces / non-breaking hyphens ("EC 209", "MA‑123"):
+    # the same characters to a reader -> the communicate substrings must match them
+    task, key, _zug, _zn, msgs = info_crew
+    comm = task["evaluation_criteria"]["communicate_info"]
+    assert any(" " in c or "-" in c for c in comm), "case needs a communicate item with a space or hyphen"
+    typo = copy(msgs)
+    typo[-1]["content"] = typo[-1]["content"].replace(" ", " ").replace("-", "‑")
+    r = score_trajectory(task, typo, key)
+    assert r["score"] == 1.0, f"typographic spaces/hyphens must not fail a correct answer: {r}"
+
+
+def test_22b_invented_id_with_nonbreaking_hyphen_fails_grounding(info_crew):
+    # the other side of the same fix: an id written with U+2011 is no longer invisible to grounding
+    task, key, _zug, _zn, msgs = info_crew
+    bad = copy(msgs)
+    bad[-1]["content"] += " Vertretung wäre MA‑99999."
+    r = score_trajectory(task, bad, key)
+    assert r["score"] == 0.0 and not r["components"]["grounding"], f"invented MA‑99999 must fail: {r}"

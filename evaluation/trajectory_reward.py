@@ -17,6 +17,8 @@ Scoring (all deterministic — the P0-1/P0-2 fixes; do NOT trust tau2's read-onl
       grounding     : every entity-like token in the FINAL answer (ids, times, dates, Zugnummern)
                       appears in the grounding corpus = ticket + tool observations (+ tool-call args)
                       → hallucinated ids/times score 0.
+  Graded assistant text = reasoning stripped + typographic space/hyphen variants mapped to ASCII
+  (`_visible`), so "EC<U+202F>209" counts as "EC 209" for communicate AND is checked by grounding.
 
 score = 1.0 iff every applicable component passes. Aux: turns_used, n_tool_calls, n_tool_errors,
 tool_calls_valid, n_plan_turns, replan_occurred (injected & ≥2 planning turns; for runtime-fault
@@ -24,7 +26,7 @@ tasks: ≥1 rejected tool call & ≥2 planning turns), components dict.
 
 Trajectory format (produced by sdg_pipeline/db_bahn/rollout.py): OpenAI-style messages —
 assistant turns may carry tool_calls=[{id,type,function:{name,arguments:<json str>}}], observations are
-role:"tool" turns. Requires the tau2 venv (imports the db_bahn domain). Scenario suite (21 cases):
+role:"tool" turns. Requires the tau2 venv (imports the db_bahn domain). Scenario suite (cases 1-22):
     tests/test_trajectory_reward.py — `bash ops/run_tests.sh`; running this file delegates to pytest.
 """
 
@@ -72,17 +74,29 @@ def _strip_think(text) -> str:
     return text
 
 
+# Typographic variants of the SAME character, mapped to ASCII before grading (12.11.2026: gpt-oss writes
+# "EC 209" / "MA‑123" — a reader sees "EC 209" / "MA-123", the substring check did not, and
+# the entity patterns skipped such ids). Deliberately narrow: no-break / figure / thin / narrow no-break
+# space and the non-breaking hyphen only. En/em dashes are different characters and stay untouched.
+_TYPO_MAP = str.maketrans({" ": " ", " ": " ", " ": " ", " ": " ", "‑": "-"})
+
+
+def _visible(text) -> str:
+    """The graded part of one assistant turn: reasoning dropped, typographic variants normalized."""
+    return _strip_think(text).translate(_TYPO_MAP)
+
+
 def _assistant_text(messages: list[dict]) -> str:
-    return "\n".join(_strip_think(m.get("content")) for m in messages if m.get("role") == "assistant")
+    return "\n".join(_visible(m.get("content")) for m in messages if m.get("role") == "assistant")
 
 
 def _final_answer(messages: list[dict]) -> str:
-    ans = _strip_think(final_answer(messages))
+    ans = _visible(final_answer(messages))
     if ans.strip():
         return ans
     for m in reversed(messages):  # fallback (verifier-only): last assistant turn even WITH tool_calls
-        if m.get("role") == "assistant" and _strip_think(m.get("content")).strip():
-            return _strip_think(m["content"])
+        if m.get("role") == "assistant" and _visible(m.get("content")).strip():
+            return _visible(m["content"])
     return ""
 
 
@@ -222,7 +236,7 @@ def score_trajectory(task, messages: list[dict], answer_key: dict | None = None,
         # --- communicate substrings ---------------------------------------------------------
         atext = _assistant_text(messages).lower()
         comm = crit.get("communicate_info") or []
-        comp["communicate"] = all((c or "").lower() in atext for c in comm)
+        comp["communicate"] = all((c or "").translate(_TYPO_MAP).lower() in atext for c in comm)
 
         # --- anti-hallucination grounding ---------------------------------------------------
         final = _final_answer(messages)

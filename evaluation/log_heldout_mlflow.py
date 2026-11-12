@@ -107,6 +107,10 @@ def provenance(path: str, recs: list[dict]) -> tuple[dict, str, int]:
             params[key] = ident[key]
     if info.get("eval_conc"):
         params["eval_conc"] = info["eval_conc"]
+    if meta.get("rescored"):   # evaluation/rescore_heldout.py: scores recomputed after a verifier fix
+        last = meta["rescored"][-1]
+        params["rescored"] = (f"{last.get('at', '')[:10]} {last.get('reason', '')} "
+                              f"(verifier {last.get('verifier_sha256', '')}, {last.get('changed_records', 0)} geaendert)")
     return params, label, k
 
 
