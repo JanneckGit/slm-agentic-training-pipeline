@@ -76,6 +76,9 @@ def summary(recs: list[dict]) -> tuple[dict, dict]:
                "truncated_rate": st["truncated"] / n, "degen_rate": st["degen"] / n,
                "roleplay_tail_rate": st["roleplay_tail"] / n}
     yields = {f"yield_{t}": tmpl_ok[t] / max(1, tmpl_n[t]) for t in sorted(tmpl_n)}
+    if any(r.get("api_calls") is not None for r in recs):   # API run: tokens + cost, as rollout.py logs them
+        from api_usage import mlflow_metrics, summarize
+        metrics.update(mlflow_metrics(summarize(recs)))
     return metrics, yields
 
 
@@ -102,7 +105,7 @@ def provenance(path: str, recs: list[dict]) -> tuple[dict, str, int]:
         params["chat_template_kwargs"] = json.dumps(ident["chat_template_kwargs"], sort_keys=True)
     # Sampling + Serve aus der Sidecar-Identitaet: weicht bei Open-Weight-Laeufen je Modell ab (Model-Card)
     for key in ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "max_tokens_per_turn",
-                "max_model_len", "gpu_util", "vllm_extra", "tool_mode"):
+                "max_model_len", "gpu_util", "vllm_extra", "tool_mode", "backend", "effort", "thinking"):
         if ident.get(key) not in (None, ""):
             params[key] = ident[key]
     if info.get("eval_conc"):

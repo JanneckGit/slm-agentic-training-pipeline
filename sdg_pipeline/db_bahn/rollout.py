@@ -21,6 +21,17 @@ and splits calls + reasoning with its own parsers (vLLM --enable-auto-tool-choic
 --reasoning-parser Y); the system prompt drops our tools block + <tool_call> example (the template renders the
 tools in the model's format). Records stay identical in shape: reasoning is stored inline as <think>…</think>.
 
+ANTHROPIC backend (--backend anthropic, Claude API via the official `anthropic` SDK): the same native protocol
+(SYSTEM_TEMPLATE_NATIVE, tools as a request parameter, tool_choice auto) — but NO sampling parameters (the API rejects
+them), adaptive thinking at an explicit --effort, thinking returned as a SUMMARY (display "summarized") and stored
+inline as <think> like every other model's. The signed thinking blocks of a turn must be replayed byte-for-byte (the
+API rejects an edited history), so the per-rollout closure keeps the raw response blocks and the history is
+append-only. Records carry per-call token usage in `api_calls` (cost: evaluation/api_usage.py). Account-level errors
+(key, balance, permissions, unknown model) stop the WHOLE run without writing a record (exit 3) -> RESUME continues;
+so do API_ERROR_STREAK error rollouts in a row (error brake: error rows are held until a good rollout follows, so an
+outage with an unknown error wording leaves no error rows either). With --order round an abort leaves complete rounds
+over all tasks (clean pass^r, eval_report.py --max-sample r).
+
 Runs in the tau2 venv (needs the domain + verifier):
     PYTHONPATH=. <tau2-venv>/bin/python sdg_pipeline/db_bahn/rollout.py \
         --config config/pipeline_config.yaml --split bakeoff_dev --k 3
@@ -33,6 +44,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -164,6 +176,136 @@ def make_teacher_call(cfg: dict, timeout: float = 600.0):
             content = f"<think>\n{reasoning}\n</think>\n\n{content}"
         return content, msg.get("tool_calls") or [], choice.get("finish_reason", "")
 
+    return call
+
+
+# --- Claude API backend (--backend anthropic) -------------------------------------------------
+class FatalApiError(RuntimeError):
+    """Account-level API failure (key, balance, permissions, unknown model): stops the WHOLE run — every further
+    request would fail the same way, and error records would be counted as done by a resume."""
+
+
+API_THINKING = {"type": "adaptive", "display": "summarized"}   # thinking ON (adaptive), summary visible
+API_ERROR_STREAK = 10   # error rollouts in a row (API backend) = systematic outage -> stop without writing them
+_CACHE = {"type": "ephemeral"}                                  # 5-min prompt cache (kept warm by the eval traffic)
+_ANTHROPIC_CLIENTS: dict = {}
+_ANTHROPIC_LOCK = threading.Lock()
+
+
+def api_gen_params(cfg: dict) -> dict:
+    """gen_params of an API record: what was actually sent (no sampling parameters exist on this path)."""
+    return {"backend": cfg["backend"], "model": cfg["model"], "effort": cfg["effort"], "thinking": API_THINKING,
+            "enable_thinking": True, "max_tokens": cfg["max_tokens"], "tool_mode": "native"}
+
+
+def anthropic_tools(tools: list[dict]) -> list[dict]:
+    """OpenAI function schema -> Anthropic tool definition (same names, descriptions, JSON schemas and order)."""
+    return [{"name": t["function"]["name"], "description": t["function"].get("description") or "",
+             "input_schema": t["function"].get("parameters") or {"type": "object", "properties": {}}}
+            for t in tools]
+
+
+def to_anthropic(messages: list[dict], raw_turns: list) -> tuple[list[dict], list[dict]]:
+    """Canonical messages -> (system blocks, Anthropic messages). Assistant turn i is replayed from raw_turns[i] —
+    the exact blocks the API returned (signed thinking included, never rebuilt from the canonical text); the tool
+    results of one turn go into ONE user message (plain content, no is_error — same signal the open models get).
+    The system block carries the fixed cache breakpoint (cache prefix = tools + system, identical in every episode)."""
+    system, out, n_asst = [], [], 0
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system = [{"type": "text", "text": m.get("content") or "", "cache_control": _CACHE}]
+        elif role == "user":
+            out.append({"role": "user", "content": m.get("content") or ""})
+        elif role == "assistant":
+            if n_asst >= len(raw_turns):
+                raise RuntimeError("anthropic: assistant turn without raw response blocks — no faithful replay")
+            out.append({"role": "assistant", "content": raw_turns[n_asst]})
+            n_asst += 1
+        elif role == "tool":
+            block = {"type": "tool_result", "tool_use_id": m.get("tool_call_id"), "content": m.get("content") or ""}
+            if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
+                out[-1]["content"].append(block)
+            else:
+                out.append({"role": "user", "content": [block]})
+    return system, out
+
+
+def _is_fatal_api_error(e) -> bool:
+    """Errors that hit every request of the run alike: bad key, no permission, unknown model, empty balance or
+    spend limit, organization on hold. Everything else (429/5xx after the SDK's retries, timeouts, a single 400)
+    stays a per-rollout teacher_error, as with vLLM."""
+    import anthropic
+    if isinstance(e, (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError,
+                      anthropic.EnforcedSpendLimitReachedError, anthropic.OrganizationOnHoldError)):
+        return True
+    if isinstance(e, anthropic.APIStatusError):
+        text = f"{e.type or ''} {e.error_code or ''} {e.api_message or ''}".lower()
+        return e.status_code == 402 or "billing" in text or "credit balance" in text
+    return False
+
+
+def _anthropic_client(cfg: dict, timeout: float):
+    """One client per (endpoint, timeout, retries) and process — thread-safe, shared by all rollouts. The key comes
+    from ANTHROPIC_API_KEY; the SDK retries 408/409/429/5xx/529 with backoff (honours retry-after)."""
+    k = (cfg.get("api_base"), float(timeout), int(cfg.get("api_max_retries", 8)))
+    with _ANTHROPIC_LOCK:
+        if k not in _ANTHROPIC_CLIENTS:
+            import anthropic
+            _ANTHROPIC_CLIENTS[k] = anthropic.Anthropic(base_url=k[0] or None, timeout=k[1], max_retries=k[2])
+        return _ANTHROPIC_CLIENTS[k]
+
+
+def make_anthropic_call(cfg: dict, timeout: float = 600.0):
+    """teacher_call for the Claude API — one closure per rollout: it keeps the raw response blocks (replayed
+    unchanged, see to_anthropic) and the per-call usage (`call.api_calls`, copied into the record by run_rollout)."""
+    import anthropic
+    client = _anthropic_client(cfg, timeout)
+    raw_turns: list = []
+    api_calls: list[dict] = []
+    tool_defs: list = []
+
+    def call(messages: list[dict], tools: list[dict]) -> tuple[str, list[dict], str]:
+        if not tool_defs:
+            tool_defs.extend(anthropic_tools(tools))
+        system, msgs = to_anthropic(messages, raw_turns)
+        try:
+            resp = client.messages.create(
+                model=cfg["model"], max_tokens=cfg["max_tokens"], system=system, tools=tool_defs,
+                tool_choice={"type": "auto"}, messages=msgs, thinking=API_THINKING,
+                output_config={"effort": cfg["effort"]},
+                cache_control=_CACHE)   # automatic breakpoint on the growing tail (2 of 4 breakpoints used)
+        except anthropic.APIStatusError as e:
+            if _is_fatal_api_error(e):
+                raise FatalApiError(f"{type(e).__name__} (HTTP {e.status_code}): "
+                                    f"{(e.api_message or str(e))[:200]}") from e
+            raise
+        raw_turns.append(resp.content)
+        thinks, texts, calls = [], [], []
+        for b in resp.content:
+            if b.type == "thinking" and (b.thinking or "").strip():
+                thinks.append(b.thinking.strip())
+            elif b.type == "text" and (b.text or "").strip():
+                texts.append(b.text.strip())
+            elif b.type == "tool_use":
+                calls.append({"id": b.id, "type": "function",
+                              "function": {"name": b.name,
+                                           "arguments": json.dumps(b.input or {}, ensure_ascii=False)}})
+        u, sr = resp.usage, resp.stop_reason or ""
+        rec = {"input_tokens": u.input_tokens, "cache_read_input_tokens": u.cache_read_input_tokens or 0,
+               "cache_creation_input_tokens": u.cache_creation_input_tokens or 0,
+               "output_tokens": u.output_tokens, "stop_reason": sr, "model": resp.model}
+        if sr == "refusal":
+            rec["refusal_category"] = getattr(resp.stop_details, "category", None)
+        if getattr(resp, "_request_id", None):
+            rec["request_id"] = resp._request_id
+        api_calls.append(rec)
+        think, text = "\n\n".join(thinks), "\n\n".join(texts)
+        content = f"<think>\n{think}\n</think>\n\n{text}" if think else text
+        fr = "length" if sr in ("max_tokens", "model_context_window_exceeded") else sr
+        return content, calls, fr
+
+    call.api_calls = api_calls
     return call
 
 
@@ -370,6 +512,8 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             break
         try:
             content, server_calls, fr = teacher_call(messages, tools)
+        except FatalApiError:  # account-level (key/balance/model): stop the run, never a record
+            raise
         except Exception as e:  # HTTP 4xx/5xx, context overflow, transient server error — end this
             finish = f"teacher_error:{type(e).__name__}: {str(e)[:120]}"  # rollout gracefully (score 0,
             break                                                        # keep partial trace, don't abort)
@@ -389,6 +533,9 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             finish = "truncated"
             truncated = True
             break
+        if fr == "refusal":  # Claude API safety decline (HTTP 200, stop_reason refusal) — not an answer
+            finish = "refusal"
+            break
         if not calls:
             if native and TOOL_MARKUP_RE.search(visible):  # the server's parser missed a home-format call
                 finish = "tool_format_error"
@@ -405,10 +552,13 @@ def run_rollout(task: dict, key: dict, teacher_call, max_turns: int, rollout_tim
             messages.append({"role": "tool", "tool_call_id": tc["id"],
                              "content": content_s[:MAX_TOOL_CONTENT]})
     score = score_trajectory(task, messages, key)
-    return {"messages": messages, "score": score, "finish_reason": finish,
-            "truncated": truncated, "degen": degen_stats(messages),
-            "roleplay_tail_chars": tail_total,
-            "wall_s": round(time.time() - t0, 2)}
+    res = {"messages": messages, "score": score, "finish_reason": finish,
+           "truncated": truncated, "degen": degen_stats(messages),
+           "roleplay_tail_chars": tail_total,
+           "wall_s": round(time.time() - t0, 2)}
+    if hasattr(teacher_call, "api_calls"):  # API backend: per-call token usage (cost) — absent on every other path
+        res["api_calls"] = list(teacher_call.api_calls)
+    return res
 
 
 # --- A1: branch-on-failure (answer-key-guided prefix reuse) -----------------------------------
@@ -624,6 +774,19 @@ def main():
                     help="NATIVE tool mode: send `tools` (tool_choice auto), the server parses calls + reasoning "
                          "(needs vLLM --enable-auto-tool-choice --tool-call-parser X --reasoning-parser Y); "
                          "system prompt without our tools block; recorded as gen_params.tool_mode=native")
+    ap.add_argument("--backend", choices=("openai", "anthropic"), default="openai",
+                    help="openai = OpenAI-compatible endpoint (vLLM, default); anthropic = Claude API via the "
+                         "`anthropic` SDK (implies --native-tools, no sampling flags, needs --effort + ANTHROPIC_API_KEY; "
+                         "--api-base overrides the SDK endpoint, e.g. a test stub)")
+    ap.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default=None,
+                    help="--backend anthropic: output_config.effort, sent EXPLICITLY (the model default, e.g. "
+                         "Sonnet 5.5 high / Haiku 5.5 medium, so a later default change can't shift a run)")
+    ap.add_argument("--api-max-retries", type=int, default=8,
+                    help="--backend anthropic: SDK retries for 429/5xx/529 (exponential backoff, honours retry-after)")
+    ap.add_argument("--order", choices=("task", "round"), default="task",
+                    help="schedule: task = all k samples of a task in a row (default, historical); round = sample 0 "
+                         "for ALL tasks, then sample 1, ... -> an aborted run (e.g. API balance) leaves r complete "
+                         "rounds over every task (clean pass^r via eval_report --max-sample r); RESUME fills the rest")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--max-turns", type=int, default=10)
     ap.add_argument("--max-regen", type=int, default=2, help="re-sample a failed rollout up to N times "
@@ -660,8 +823,26 @@ def main():
             ap.error("--chat-template-kwargs must be a JSON object")
         if args.omit_thinking_kwarg:
             ap.error("--chat-template-kwargs and --omit-thinking-kwarg exclude each other")
+    if args.backend == "anthropic" and not (args.dry_run or args.dry_run_broken):
+        sampling = [f"--{f.replace('_', '-')}" for f in ("temperature", "top_p", "top_k", "min_p", "presence_penalty")
+                    if getattr(args, f) is not None]
+        if sampling:
+            ap.error(f"--backend anthropic takes no sampling flags (the API rejects them): {' '.join(sampling)}")
+        if args.chat_template_kwargs or args.omit_thinking_kwarg or args.legacy_stop:
+            ap.error("--backend anthropic: --chat-template-kwargs/--omit-thinking-kwarg/--legacy-stop are vLLM-only")
+        if args.enable_thinking is False:
+            ap.error("--backend anthropic: thinking stays on (adaptive)")
+        if not args.effort:
+            ap.error("--backend anthropic needs --effort (send the model default explicitly)")
+        if not args.model:
+            ap.error("--backend anthropic needs --model (e.g. claude-sonnet-5-5)")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            ap.error("--backend anthropic: ANTHROPIC_API_KEY is not set")
+        args.native_tools = True   # the API path IS the native protocol (tools parameter, SYSTEM_TEMPLATE_NATIVE)
+    elif args.effort and args.backend != "anthropic":
+        ap.error("--effort only applies to --backend anthropic")
 
-    config = load_config(args.config) if Path(args.config).exists() else {}
+    config =load_config(args.config) if Path(args.config).exists() else {}
     tasks = {t["id"]: t for t in json.load(open(DATA_DIR / "tasks.json"))}
     keys = json.load(open(DATA_DIR / "answer_keys.json"))
     splits = json.load(open(DATA_DIR / "split_tasks.json"))
@@ -711,13 +892,22 @@ def main():
                 except Exception:
                     pass
 
-    todo = [(tid, s) for tid in split_ids for s in range(args.k) if (tid, s) not in done]
+    # --order round: sample 0 for ALL tasks, then sample 1, ... -> an abort in round r+1 leaves r complete rounds
+    # over every task (clean pass^r); task order (default) keeps the historical schedule byte-identical.
+    pairs = ([(tid, s) for s in range(args.k) for tid in split_ids] if args.order == "round"
+             else [(tid, s) for tid in split_ids for s in range(args.k)])
+    todo = [p for p in pairs if p not in done]
     print(f"split={args.split} tasks={len(split_ids)} k={args.k} todo={len(todo)} "
-          f"(resumed {len(done)}) teacher={teacher_label}")
+          f"(resumed {len(done)}) teacher={teacher_label}" + (" order=round" if args.order == "round" else ""))
 
     teacher_cfg = None if (args.dry_run or args.dry_run_broken) else \
         resolve_teacher(config, args.api_base, args.model)
-    if teacher_cfg:
+    if teacher_cfg and args.backend == "anthropic":
+        # own config: resolve_teacher's Qwen sampling defaults must not leak into an API record
+        teacher_cfg = {"backend": "anthropic", "model": args.model, "api_base": args.api_base,
+                       "max_tokens": args.max_tokens_per_turn or teacher_cfg["max_tokens"], "effort": args.effort,
+                       "native_tools": True, "api_max_retries": args.api_max_retries}
+    elif teacher_cfg:
         if args.max_tokens_per_turn:
             teacher_cfg["max_tokens"] = args.max_tokens_per_turn
         if args.temperature is not None:
@@ -747,16 +937,65 @@ def main():
         if args.dry_run or args.dry_run_broken:
             return lambda temp_bump=0.0: make_oracle(task, key, broken=args.dry_run_broken)
         def factory(temp_bump=0.0):
+            if teacher_cfg.get("backend") == "anthropic":   # no temperature on the API -> nothing to bump
+                return make_anthropic_call(teacher_cfg, timeout=args.request_timeout_s)
             cfg = teacher_cfg if not temp_bump else {**teacher_cfg,
                                                      "temperature": teacher_cfg["temperature"] + temp_bump}
             return make_teacher_call(cfg, timeout=args.request_timeout_s)
         return factory
 
+    stop, fatal = threading.Event(), []   # FatalApiError: stop scheduling, write nothing for the hit rollouts
+    api_recs = []                         # API backend: per-record usage for the MLflow cost metrics
+    written = set()                       # (task_id, sample_idx) written by THIS process (complete-rounds report)
+    # API error brake: error rollouts are HELD until a non-error rollout follows (then written — isolated errors stay
+    # in the data as before). API_ERROR_STREAK errors in a row = systematic failure (empty balance with an unknown
+    # wording, 429 storm after all SDK retries, network down): drop the held rows, stop, exit 3 -> RESUME continues.
+    brake = teacher_cfg is not None and teacher_cfg.get("backend") == "anthropic"
+    pending_err = []
+
+    def emit(rec, res):
+        """Write one record + update the counters (caller holds the lock)."""
+        sc, fault = rec["score"], rec["fault"]
+        out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        out_f.flush()
+        written.add((rec["task_id"], rec["sample_idx"]))
+        if "api_calls" in rec:
+            api_recs.append({"api_calls": rec["api_calls"], "gen_params": rec["gen_params"]})
+        stats["n"] += 1
+        # wave-3 accept semantics: a verified-but-truncated/degenerate trace is NOT a yield
+        verified = accepted(res)
+        stats["verified"] += verified
+        stats["truncated"] += rec["truncated"]
+        stats["degen"] += is_degenerate(res)
+        stats["roleplay_tail"] += rec["roleplay_tail_chars"] > 0
+        stats["replan"] += sc["replan_occurred"]
+        stats["turns"] += sc["turns_used"]
+        stats["branched"] += res.get("n_branch_attempts", 0)
+        tmpl_n[rec["template"]] += 1
+        tmpl_verified[rec["template"]] += verified
+        if verified and sc.get("self_recovery"):  # B0: split emergent vs scripted self-recovery
+            if fault in ("runtime", "state+runtime"):
+                stats["scripted_rec"] += 1
+            else:
+                stats["emergent_rec"] += 1
+        if stats["n"] % 10 == 0 or stats["n"] == len(todo):
+            print(f"  {stats['n']}/{len(todo)}  verified-yield={stats['verified'] / stats['n']:.0%}")
+
     def work(item):
+        if stop.is_set():
+            return
         tid, s = item
         task, key = tasks[tid], keys[tid]
         try:
             res = solve_task(task, key, make_call_for(task, key), args, teacher_cfg)
+        except FatalApiError as e:  # account-level: every further request fails alike -> stop the run cleanly
+            with lock:
+                if not fatal:
+                    fatal.append(str(e))
+                    print(f"  ABBRUCH (API, Account-Ebene): {e}")
+                pending_err.clear()   # held error rows of the same outage are never written
+            stop.set()
+            return
         except Exception as e:  # per-request isolation (trace_capture lesson): never kill the pool
             res = {"messages": [], "finish_reason": f"error:{type(e).__name__}: {str(e)[:200]}",
                    "wall_s": 0.0, "n_branch_attempts": 0, "recovery_mode": "failed",
@@ -773,6 +1012,7 @@ def main():
                "truncated": bool(res.get("truncated")), "degen": res.get("degen") or {},
                "roleplay_tail_chars": res.get("roleplay_tail_chars", 0),
                "gen_params": None if teacher_cfg is None else
+               api_gen_params(teacher_cfg) if teacher_cfg.get("backend") == "anthropic" else
                {**{k: teacher_cfg.get(k) for k in ("temperature", "top_p", "top_k", "min_p",
                                                    "presence_penalty", "enable_thinking",
                                                    "legacy_stop", "max_tokens")},
@@ -781,35 +1021,43 @@ def main():
                    if teacher_cfg.get("chat_template_kwargs") else {}),
                 **({"tool_mode": "native"} if teacher_cfg.get("native_tools") else {})},
                "score": sc, "finish_reason": res["finish_reason"],
-               "wall_s": res["wall_s"], "messages": res["messages"]}
+               "wall_s": res["wall_s"],
+               **({"api_calls": res["api_calls"]} if "api_calls" in res else {}),
+               "messages": res["messages"]}
         with lock:
-            out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out_f.flush()
-            stats["n"] += 1
-            # wave-3 accept semantics: a verified-but-truncated/degenerate trace is NOT a yield
-            verified = accepted(res)
-            stats["verified"] += verified
-            stats["truncated"] += rec["truncated"]
-            stats["degen"] += is_degenerate(res)
-            stats["roleplay_tail"] += rec["roleplay_tail_chars"] > 0
-            stats["replan"] += sc["replan_occurred"]
-            stats["turns"] += sc["turns_used"]
-            stats["branched"] += res.get("n_branch_attempts", 0)
-            tmpl_n[key["template"]] += 1
-            tmpl_verified[key["template"]] += verified
-            if verified and sc.get("self_recovery"):  # B0: split emergent vs scripted self-recovery
-                if fault in ("runtime", "state+runtime"):
-                    stats["scripted_rec"] += 1
-                else:
-                    stats["emergent_rec"] += 1
-            if stats["n"] % 10 == 0 or stats["n"] == len(todo):
-                print(f"  {stats['n']}/{len(todo)}  verified-yield={stats['verified'] / stats['n']:.0%}")
+            if brake and str(rec["finish_reason"]).startswith(("teacher_error", "error")):
+                if stop.is_set():          # the run is aborting: an error row of the outage is never written
+                    return
+                pending_err.append((rec, res))
+                if len(pending_err) >= API_ERROR_STREAK:
+                    if not fatal:
+                        fatal.append(f"{len(pending_err)} Rollouts in Folge mit API-Fehler, zuletzt: "
+                                     f"{str(rec['finish_reason'])[:160]}")
+                        print(f"  ABBRUCH (Fehlerserie): {fatal[0]}")
+                    pending_err.clear()
+                    stop.set()
+                return
+            for held in pending_err:       # a non-error rollout followed -> those were isolated errors: keep them
+                emit(*held)
+            pending_err.clear()
+            emit(rec, res)
 
     try:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             list(pool.map(work, todo))
+        if not fatal:
+            for held in pending_err:       # trailing isolated errors of a run that ended normally
+                emit(*held)
     finally:
         out_f.close()
+    if fatal:
+        have = done | written
+        rounds = next((r for r in range(args.k) if any((t, r) not in have for t in split_ids)), args.k)
+        print(f"\nABBRUCH -> {out_path}: {fatal[0]}\n  {stats['n']} Rollouts geschrieben, {len(todo) - stats['n']} offen "
+              f"(keine Fehlerzeilen geschrieben -> RESUME=1 setzt nach der Ursache fort)\n"
+              f"  vollstaendige Runden: {rounds} von {args.k} (alle Tasks mit sample_idx < {rounds})"
+              + (f" -> eval_report.py --max-sample {rounds}" if 0 < rounds < args.k else ""))
+        sys.exit(3)
 
     n = max(1, stats["n"])
     v = max(1, stats["verified"])
@@ -845,7 +1093,12 @@ def main():
                 mlflow.log_params({"split": args.split, "teacher": teacher_label, "model": args.model,
                                    "k": args.k, "n_tasks": len(split_ids),
                                    "branch_on_fail": args.branch_on_fail, "max_turns": args.max_turns,
-                                   **({"tool_mode": "native"} if args.native_tools else {})})
+                                   **({"tool_mode": "native"} if args.native_tools else {}),
+                                   **({"backend": "anthropic", "effort": args.effort}
+                                      if args.backend == "anthropic" else {})})
+                if api_recs:   # API cost/token metrics (same numbers as evaluation/api_usage.py prints)
+                    from evaluation.api_usage import mlflow_metrics, summarize
+                    mlflow.log_metrics(mlflow_metrics(summarize(api_recs)))
                 mlflow.log_metrics({
                     "verified_yield": stats["verified"] / n, "replan_rate": stats["replan"] / n,
                     "avg_turns": stats["turns"] / n, "n_rollouts": stats["n"],

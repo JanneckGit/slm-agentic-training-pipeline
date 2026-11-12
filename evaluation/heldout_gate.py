@@ -15,7 +15,10 @@ chain stops before it spends GPU days on a broken setup.
                               Harmony models (gpt-oss) think before every tool call but often write the final
                               answer without an analysis block (GB10 smoke 10.11.: 78 % of turns, 100 % of rollouts).
                               The per-turn share is still printed as info.
+                              API runs (gen_params.backend, e.g. anthropic): INFO only, not a criterion — the model
+                              decides per turn whether to think (adaptive) and only a summary comes back.
         tool calls  >= 90 %   rollouts with >= 1 parsed tool call (the call format is understood)
+      Refusals (finish_reason refusal, API safety declines) are printed as info.
 
   calib --input <run on the new host> --reference <same model + protocol, known host>
       Paired bootstrap over the tasks both files cover completely (10k draws, seed 0): difference in mean
@@ -81,7 +84,10 @@ def smoke_stats(recs: list[dict]) -> dict:
             has_tool = has_tool or bool(m.get("tool_calls"))
         with_think += has_think
         with_tool += has_tool
+    backends = Counter((r.get("gen_params") or {}).get("backend") or "vllm" for r in recs)
     return {"n": n,
+            "backend": backends.most_common(1)[0][0] if backends else "vllm",
+            "refusals": sum(str(r.get("finish_reason") or "") == "refusal" for r in recs),
             "errors": sum(is_error(r) for r in recs),
             "truncated": sum(bool(r.get("truncated")) for r in recs) / max(1, n),
             "think": with_think / max(1, n),
@@ -98,14 +104,21 @@ def smoke(args) -> int:
         return 2
     s = smoke_stats(recs)
     max_err = max(1, int(SMOKE_MAX_ERR * s["n"]))
+    api = s["backend"] != "vllm"   # API model: adaptive thinking, summary only -> thinking is info, not a criterion
     checks = [("Fehler (teacher_error/error)", s["errors"] <= max_err, f"{s['errors']}", f"<= {max_err}"),
-              ("truncated", s["truncated"] <= SMOKE_MAX_TRUNC, f"{s['truncated']:.1%}", f"<= {SMOKE_MAX_TRUNC:.0%}"),
-              ("Rollouts mit Denken", s["think"] >= SMOKE_MIN_THINK, f"{s['think']:.1%}", f">= {SMOKE_MIN_THINK:.0%}"),
-              ("Rollouts mit Tool-Call", s["tool"] >= SMOKE_MIN_TOOL, f"{s['tool']:.1%}", f">= {SMOKE_MIN_TOOL:.0%}")]
-    print(f"SMOKE {args.input}: {s['n']} Rollouts, Yield {s['yield']:.1%} (nur Info, kein Kriterium)")
+              ("truncated", s["truncated"] <= SMOKE_MAX_TRUNC, f"{s['truncated']:.1%}", f"<= {SMOKE_MAX_TRUNC:.0%}")]
+    if not api:
+        checks.append(("Rollouts mit Denken", s["think"] >= SMOKE_MIN_THINK, f"{s['think']:.1%}",
+                       f">= {SMOKE_MIN_THINK:.0%}"))
+    checks.append(("Rollouts mit Tool-Call", s["tool"] >= SMOKE_MIN_TOOL, f"{s['tool']:.1%}", f">= {SMOKE_MIN_TOOL:.0%}"))
+    print(f"SMOKE {args.input}: {s['n']} Rollouts, Yield {s['yield']:.1%} (nur Info, kein Kriterium)"
+          + (f" | Backend {s['backend']}" if api else ""))
     for name, ok, val, rule in checks:
         print(f"  {'OK ' if ok else 'XX '} {name:<28} {val:>7}   (Soll {rule})")
+    if api:
+        print(f"  info: Rollouts mit Denken {s['think']:.1%} (API: nur Info, Denken adaptiv + nur Zusammenfassung)")
     print(f"  info: Denken je Assistant-Zug {s['think_turns']:.1%}")
+    print(f"  info: Ablehnungen (refusal) {s['refusals']}")
     print("  finish: " + ", ".join(f"{k} {v}" for k, v in s["finish"].most_common(6)))
     ok = all(c[1] for c in checks)
     print(f"SMOKE {'BESTANDEN' if ok else 'DURCHGEFALLEN'}")

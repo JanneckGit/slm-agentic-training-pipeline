@@ -39,9 +39,10 @@ def accepted(rec: dict) -> bool:
             and d.get("max_think_chars", 0) <= DEGEN_MAX_THINK_CHARS)
 
 
-def load(path: str) -> dict:
+def load(path: str, max_sample: int | None = None) -> dict:
     """-> {template: {n, ok, turns, calls, tasks}} plus file-level counters.
-    `tasks` maps task_id -> list of accepted-flags (one per sample) for the pass^k view."""
+    `tasks` maps task_id -> list of accepted-flags (one per sample) for the pass^k view.
+    max_sample: keep only records with sample_idx < max_sample (an aborted round-order run -> clean pass^r)."""
     per = defaultdict(lambda: {"n": 0, "ok": 0, "turns": 0, "calls": 0, "tasks": defaultdict(list)})
     meta = {"n": 0, "truncated": 0, "degen": 0, "finish": Counter(), "seen": set(), "dups": 0}
     for line in open(path):
@@ -49,6 +50,8 @@ def load(path: str) -> dict:
         if not line:
             continue
         r = json.loads(line)
+        if max_sample is not None and (r.get("sample_idx") or 0) >= max_sample:
+            continue
         key = (r.get("task_id"), r.get("sample_idx"))
         if key in meta["seen"]:
             meta["dups"] += 1
@@ -88,6 +91,18 @@ def _add_passk(per: dict, meta: dict) -> None:
         meta["incomplete"] += e["incomplete"]
 
 
+def passk_at(per: dict, k: int, n: int) -> tuple[float, int] | None:
+    """Unbiased pass^n from k >= n samples per task: mean over complete tasks of C(c, n) / C(k, n), c = accepted
+    samples (the estimator τ²-bench uses). Lets a K=8 run be compared with a K=2 run's direct pass^2.
+    -> (estimate, n_tasks), or None if k < n."""
+    from math import comb
+    if k < n:
+        return None
+    vals = [comb(sum(flags), n) / comb(k, n)
+            for e in per.values() for flags in e["tasks"].values() if len(flags) == k]
+    return (sum(vals) / len(vals) if vals else 0.0), len(vals)
+
+
 def pct(ok: int, n: int) -> str:
     return f"{100 * ok / n:5.1f}% ({ok}/{n})" if n else "–"
 
@@ -97,10 +112,16 @@ def main():
     ap.add_argument("--input", required=True, help="rollout JSONL to report on")
     ap.add_argument("--baseline", default=None,
                     help="second rollout JSONL; adds a per-template delta column (pp)")
+    ap.add_argument("--passk-at", type=int, default=None, metavar="N",
+                    help="also print the unbiased pass^N estimate from k >= N samples per task (e.g. 2: compare "
+                         "a K=8 run with a K=2 API run); off by default -> output unchanged")
+    ap.add_argument("--max-sample", type=int, default=None, metavar="R",
+                    help="only records with sample_idx < R (input AND baseline): an aborted --order round run "
+                         "has R complete rounds over all tasks -> clean pass^R; off by default -> output unchanged")
     args = ap.parse_args()
 
-    cur = load(args.input)
-    base = load(args.baseline) if args.baseline else None
+    cur = load(args.input, args.max_sample)
+    base = load(args.baseline, args.max_sample) if args.baseline else None
     per, meta = cur["per"], cur["meta"]
     k = meta["k"]
     base_k = base["meta"]["k"] if base else 1
@@ -108,7 +129,7 @@ def main():
     show_base_passk = show_passk and base_k > 1
 
     tot_ok = sum(e["ok"] for e in per.values())
-    print(f"\n{args.input}")
+    print(f"\n{args.input}" + (f"   [nur sample_idx < {args.max_sample}]" if args.max_sample is not None else ""))
     if base:
         b = base["meta"]
         b_ok = sum(e["ok"] for e in base["per"].values())
@@ -129,6 +150,14 @@ def main():
         elif base:
             line += f"  [baseline is k={base_k}: no pass^k delta]"
         print(line)
+    if args.passk_at:
+        n_at = args.passk_at
+        for name, run in (("", cur), ("baseline ", base)):
+            if run is None:
+                continue
+            est = passk_at(run["per"], run["meta"]["k"], n_at)
+            print(f"{name}pass^{n_at} (Schaetzer aus k={run['meta']['k']}) " +
+                  (f"{100 * est[0]:5.1f}% ueber {est[1]} Tasks" if est else f"– (k < {n_at})"))
     print(f"       truncated {meta['truncated']}   degenerate {meta['degen']}")
 
     off = {k_: v for k_, v in meta["finish"].items() if k_ != "final_answer"}
@@ -139,6 +168,10 @@ def main():
     if meta["incomplete"]:
         print(f"       WARNING {meta['incomplete']} task(s) with fewer than k={k} samples — "
               f"excluded from pass^{k} (interrupted run?)")
+        r = min(len(f) for e in per.values() for f in e["tasks"].values())
+        if r >= 1:   # an --order round run aborted in round r+1: every task has its first r samples
+            print(f"       hint: every task has >= {r} samples -> --max-sample {r} gives a clean pass^{r} "
+                  f"(if the run used --order round)")
 
     hdr = f"\n{'Template':34s} {'yield':>16s}"
     if base:

@@ -48,14 +48,57 @@
 #            Rechner ohne Docker, z. B. die H100). Ist der Port belegt, bricht das Skript ab — es beendet nie fremde Prozesse.
 #   none     kein Start, kein Teardown: ein laufender Endpunkt unter API_BASE (Default http://localhost:8000/v1) wird
 #            benutzt; Modellpruefung = "Modell ist in /v1/models gelistet". Baustein fuer spaetere API-Laeufe.
+#
+# BACKEND — wer antwortet (Default vllm = alles oben):
+#   vllm       OpenAI-kompatibler Endpunkt (vLLM), Verhalten wie bisher.
+#   anthropic  Claude-API ueber das offizielle SDK (rollout.py --backend anthropic), ohne GPU. Setzt SERVE=none und
+#              TOOL_MODE=native (gleiches natives Protokoll wie Runde 2). KEINE Sampling-Parameter (die API lehnt sie ab:
+#              TEMPERATURE/TOP_P/TOP_K/MIN_P/PRESENCE_PENALTY/CHAT_TEMPLATE_KWARGS/VLLM_EXTRA gesetzt = Abbruch), Denken
+#              adaptiv + nur als Zusammenfassung sichtbar. Pflicht: EFFORT (low|medium|high|xhigh|max) — der Modell-Default,
+#              aber EXPLIZIT (Sonnet 5.5 high, Haiku 5.5 medium). Key: ANTHROPIC_API_KEY, sonst aus ANTHROPIC_ENV
+#              (Default ~/.config/anthropic/api.env, Zeile ANTHROPIC_API_KEY=...; wird nie ausgegeben). Modellpruefung =
+#              models.retrieve (kostenlos). Account-Fehler (Key, Guthaben, Modell) stoppen den Lauf ohne Fehlerzeilen
+#              (rollout.py Exit 3) -> RESUME=1 setzt fort. Nach dem Report: Token + Kosten (evaluation/api_usage.py).
+#     BACKEND=anthropic EFFORT=high SPLIT=bakeoff_dev K=1 EVAL_CONC=8 MLFLOW=0 \
+#       bash ops/eval_heldout.sh claude-sonnet-5-5 api_claude-sonnet-5-5
+#   ANTHROPIC_API_BASE  anderer API-Endpunkt (nur Tests/Stub; leer = SDK-Default).
+#   ORDER (task; bei BACKEND=anthropic round)  round = Runde fuer Runde (Sample 0 fuer ALLE Tasks, dann Sample 1, ...):
+#               bricht ein Lauf ab (Guthaben leer, Fehlerserie), bleiben r vollstaendige Runden ueber alle Tasks ->
+#               sauberes pass^r per `eval_report.py --max-sample r`; RESUME=1 ergaenzt spaeter genau den Rest. Steht in
+#               der Sidecar unter info (nicht identity: aendert nur die Planung, nicht die Daten).
 set -uo pipefail   # KEIN -e: `compose down` scheitert legitim ohne Container, und `timeout` liefert 124
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 COMPOSE="docker compose -f docker/docker-compose.yml"
 TAU2PY=${TAU2PY:-$REPO/.venv-tau2/bin/python}
+BACKEND=${BACKEND:-vllm}
+EFFORT=${EFFORT:-}
+case "$BACKEND" in vllm|anthropic) ;; *) echo "BACKEND muss vllm oder anthropic sein, ist '$BACKEND'"; exit 2;; esac
+if [ "$BACKEND" = anthropic ]; then
+  # VOR den Defaults unten geprueft: nur was der Aufrufer selbst gesetzt hat, zaehlt als Widerspruch
+  [ "${SERVE:-none}" = none ] || { echo "BACKEND=anthropic: SERVE muss none sein (kein Server), ist '$SERVE'"; exit 2; }
+  [ "${TOOL_MODE:-native}" = native ] || { echo "BACKEND=anthropic: TOOL_MODE muss native sein, ist '$TOOL_MODE'"; exit 2; }
+  SERVE=none; TOOL_MODE=native
+  case "$EFFORT" in low|medium|high|xhigh|max) ;; *)
+    echo "BACKEND=anthropic braucht EFFORT (low|medium|high|xhigh|max; Modell-Default explizit), ist '$EFFORT'"; exit 2;; esac
+  for v in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY CHAT_TEMPLATE_KWARGS VLLM_EXTRA; do
+    [ -n "${!v:-}" ] && { echo "BACKEND=anthropic: $v wird nicht unterstuetzt (API ohne Sampling-/vLLM-Parameter)"; exit 2; }
+  done
+  ANTHROPIC_ENV=${ANTHROPIC_ENV:-$HOME/.config/anthropic/api.env}
+  if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$ANTHROPIC_ENV" ]; then set -a; . "$ANTHROPIC_ENV"; set +a; fi
+  [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "BACKEND=anthropic: ANTHROPIC_API_KEY fehlt (weder Env noch $ANTHROPIC_ENV)"; exit 2; }
+  export ANTHROPIC_API_KEY
+  SDK_VERSION=$("$TAU2PY" -c 'import anthropic; print(anthropic.__version__)' 2>/dev/null) \
+    || { echo "BACKEND=anthropic: Paket anthropic fehlt in $TAU2PY"; exit 2; }
+  API_BASE=${ANTHROPIC_API_BASE:-}   # leer = SDK-Default (api.anthropic.com)
+elif [ -n "$EFFORT" ]; then
+  echo "EFFORT gilt nur mit BACKEND=anthropic"; exit 2
+fi
+if [ "$BACKEND" = anthropic ]; then ORDER=${ORDER:-round}; else ORDER=${ORDER:-task}; fi
+case "$ORDER" in task|round) ;; *) echo "ORDER muss task oder round sein, ist '$ORDER'"; exit 2;; esac
 SERVE=${SERVE:-compose}
 case "$SERVE" in compose|venv|none) ;; *) echo "SERVE muss compose, venv oder none sein, ist '$SERVE'"; exit 2;; esac
-API_BASE=${API_BASE:-http://localhost:8000/v1}
+[ "$BACKEND" = anthropic ] || API_BASE=${API_BASE:-http://localhost:8000/v1}
 SERVE_PORT=${SERVE_PORT:-8000}
 [ "$SERVE" = compose ] && [ "$SERVE_PORT" != 8000 ] && { echo "SERVE=compose: der Port ist im Compose fest 8000"; exit 2; }
 VLLM_BIN=${VLLM_BIN:-vllm}
@@ -112,23 +155,33 @@ meta_json() {
   MODEL="$MODEL" LABEL="$LABEL" SPLIT="$SPLIT" K="$K" TEMPERATURE="$TEMPERATURE" TOP_P="$TOP_P" TOP_K="$TOP_K" MIN_P="$MIN_P" \
   PRESENCE_PENALTY="$PRESENCE_PENALTY" MAXLEN="${VLLM_MAX_MODEL_LEN:-20480}" GPU_UTIL="${VLLM_GPU_UTIL:-0.85}" VLLM_EXTRA="$VLLM_EXTRA" \
   RTO="${ROLLOUT_TIMEOUT_S:-1800}" EVAL_CONC="$EVAL_CONC" CTK="$CHAT_TEMPLATE_KWARGS" SERVE="$SERVE" API_BASE="$API_BASE" \
-  TOOL_MODE="$TOOL_MODE" \
+  TOOL_MODE="$TOOL_MODE" BACKEND="$BACKEND" EFFORT="$EFFORT" SDK_VERSION="${SDK_VERSION:-}" ORDER="$ORDER" \
   python3 - <<'PY'
 import datetime, json, os, socket
 e = os.environ
-ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int(e["K"]),
-         "temperature": float(e["TEMPERATURE"]), "top_p": float(e["TOP_P"]), "top_k": int(e["TOP_K"]), "min_p": float(e["MIN_P"]),
-         "presence_penalty": float(e["PRESENCE_PENALTY"]), "enable_thinking": True, "max_turns": 15, "max_tokens_per_turn": 3072,
-         "max_regen": 0, "max_model_len": int(e["MAXLEN"]), "gpu_util": float(e["GPU_UTIL"]), "vllm_extra": " ".join(e["VLLM_EXTRA"].split()),
-         "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
-if e["CTK"]:   # nur wenn gesetzt -> Sidecars ohne Zusatzschalter bleiben identisch (Resume alter Laeufe)
-    ident["chat_template_kwargs"] = json.loads(e["CTK"])
-if e["TOOL_MODE"] == "native":   # dito: nur der neue Modus steht drin
-    ident["tool_mode"] = "native"
+if e["BACKEND"] == "anthropic":   # API: keine Sampling-/vLLM-Felder (gibt es auf diesem Weg nicht), dafuer effort + Denkmodus
+    ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int(e["K"]), "backend": "anthropic",
+             "effort": e["EFFORT"], "thinking": "adaptive/summarized", "enable_thinking": True, "max_turns": 15,
+             "max_tokens_per_turn": 3072, "max_regen": 0, "tool_mode": "native",
+             "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
+else:
+    ident = {"model": e["MODEL"], "label": e["LABEL"], "split": e["SPLIT"], "k": int(e["K"]),
+             "temperature": float(e["TEMPERATURE"]), "top_p": float(e["TOP_P"]), "top_k": int(e["TOP_K"]), "min_p": float(e["MIN_P"]),
+             "presence_penalty": float(e["PRESENCE_PENALTY"]), "enable_thinking": True, "max_turns": 15, "max_tokens_per_turn": 3072,
+             "max_regen": 0, "max_model_len": int(e["MAXLEN"]), "gpu_util": float(e["GPU_UTIL"]), "vllm_extra": " ".join(e["VLLM_EXTRA"].split()),
+             "rollout_timeout_s": float(e["RTO"]), "request_timeout_s": float(e["RTO"])}
+    if e["CTK"]:   # nur wenn gesetzt -> Sidecars ohne Zusatzschalter bleiben identisch (Resume alter Laeufe)
+        ident["chat_template_kwargs"] = json.loads(e["CTK"])
+    if e["TOOL_MODE"] == "native":   # dito: nur der neue Modus steht drin
+        ident["tool_mode"] = "native"
 info = {"eval_conc": int(e["EVAL_CONC"]), "created": datetime.datetime.now().isoformat(timespec="seconds"), "host": socket.gethostname(),
         "serve": e["SERVE"]}
 if e["SERVE"] == "none":
-    info["api_base"] = e["API_BASE"]
+    info["api_base"] = e["API_BASE"] or "SDK-Default (api.anthropic.com)"
+if e["BACKEND"] == "anthropic":
+    info["sdk"] = f"anthropic {e['SDK_VERSION']}"
+if e["ORDER"] == "round":   # nur wenn gesetzt -> vLLM-Sidecars bleiben unveraendert
+    info["order"] = "round"
 print(json.dumps({"identity": ident, "info": info}, indent=1, ensure_ascii=False))
 PY
 }
@@ -200,10 +253,17 @@ teardown() {
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$SERVE_PORT") 2>/dev/null; }
 
 echo "==== EVAL $LABEL ($MODEL) auf $SPLIT — k=$K — $(date '+%F %T') ===="
-echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY${CHAT_TEMPLATE_KWARGS:+ template=$CHAT_TEMPLATE_KWARGS}"
-echo "   tools   : $TOOL_MODE"
-echo "   serving : $SERVE conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'$([ "$SERVE" = none ] && echo " api=$API_BASE")"
+if [ "$BACKEND" = anthropic ]; then
+  echo "   sampling: API-Default (keine Sampling-Parameter) | effort=$EFFORT | Denken adaptiv, Zusammenfassung"
+  echo "   tools   : $TOOL_MODE"
+  echo "   serving : Claude-API (SDK anthropic $SDK_VERSION, ${API_BASE:-api.anthropic.com}) conc=$EVAL_CONC"
+else
+  echo "   sampling: temp=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K min_p=$MIN_P presence=$PRESENCE_PENALTY${CHAT_TEMPLATE_KWARGS:+ template=$CHAT_TEMPLATE_KWARGS}"
+  echo "   tools   : $TOOL_MODE"
+  echo "   serving : $SERVE conc=$EVAL_CONC ctx=${VLLM_MAX_MODEL_LEN:-20480} extra='${VLLM_EXTRA:-–}'$([ "$SERVE" = none ] && echo " api=$API_BASE")"
+fi
 echo "   limits  : eval_timeout=${EVAL_TIMEOUT}s rollout_timeout=${ROLLOUT_TIMEOUT_S:-1800}s -> $OUT"
+[ "$ORDER" = round ] && echo "   order   : round (Runde fuer Runde — Abbruch laesst vollstaendige Runden ueber alle Tasks)"
 
 if [ "$WRITE_META_ONLY" = 1 ]; then
   [ -f "$OUT" ] || { echo "== WRITE_META_ONLY: $OUT fehlt — abort"; exit 1; }
@@ -291,6 +351,18 @@ fi
 # 404 je Request und schriebe eine vollstaendige Datei aus lauter Nullen bei Exit 0.
 # SERVE=none: ein fremder Endpunkt listet ggf. mehrere Modelle -> dort genuegt "ist gelistet".
 [ "$SERVE" = none ] || API_BASE="http://localhost:$SERVE_PORT/v1"
+if [ "$BACKEND" = anthropic ]; then
+  # kostenlos: models.retrieve — scheitert bei falschem Key/Modell, bevor ein einziger Rollout Geld kostet
+  CHECK=$(AB="$API_BASE" "$TAU2PY" -c '
+import os, sys, anthropic
+try:
+    m = anthropic.Anthropic(base_url=os.environ.get("AB") or None, max_retries=3).models.retrieve(sys.argv[1])
+    print(f"{m.id} ({m.display_name})")
+except Exception as e:
+    print(f"{type(e).__name__}: {str(e)[:200]}"); sys.exit(1)' "$MODEL" 2>&1) \
+    || { echo "== MODEL NOT AVAILABLE: '$MODEL' — $CHECK — abort."; exit 1; }
+  echo "   api     : $CHECK"
+else
 SERVED=$(curl -s "$API_BASE/models" | "$TAU2PY" -c \
   'import json,sys; print(",".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null)
 if [ "$SERVE" = none ]; then
@@ -298,6 +370,7 @@ if [ "$SERVE" = none ]; then
     echo "== MODEL NOT LISTED: '$MODEL' nicht in $API_BASE/models ('$SERVED') — abort."; exit 1;; esac
 elif [ "$SERVED" != "$MODEL" ]; then
   echo "== WRONG MODEL SERVED: angefordert '$MODEL', serviert '$SERVED' — abort."; exit 1
+fi
 fi
 if [ "$SERVE" = compose ]; then
   docker logs text2sql_vllm_teacher 2>&1 | grep -oE 'Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' \
@@ -321,6 +394,15 @@ CTK_ARGS=()
 [ -n "$CHAT_TEMPLATE_KWARGS" ] && CTK_ARGS=(--chat-template-kwargs "$CHAT_TEMPLATE_KWARGS")
 TOOL_ARGS=()
 [ "$TOOL_MODE" = native ] && TOOL_ARGS=(--native-tools)
+[ "$ORDER" = round ] && TOOL_ARGS+=(--order round)   # nur wenn gesetzt -> vLLM-Aufruf byte-gleich
+# Generierungs-Flags je Backend: vLLM = Sampling WOERTLICH (siehe unten); API = effort, keine Sampling-Parameter
+if [ "$BACKEND" = anthropic ]; then
+  GEN_ARGS=(--backend anthropic --effort "$EFFORT" --enable-thinking)
+  [ -n "$API_BASE" ] && GEN_ARGS+=(--api-base "$API_BASE")
+else
+  GEN_ARGS=(--api-base "$API_BASE" --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K"
+            --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" "${CTK_ARGS[@]}")
+fi
 
 # Ausgabe: frisch angelegt oder per RESUME fortgesetzt (siehe oben).
 # Sampling-Flags WOERTLICH: der Config-Default traegt das Qwen3.6-TEACHER-Rezept (temp 1.0 /
@@ -332,17 +414,23 @@ TOOL_ARGS=()
 ( echo "$BASHPID" > "$ROLLOUT_PIDF"
   exec timeout "$EVAL_TIMEOUT" env PYTHONPATH="$REPO" LOGURU_LEVEL=ERROR "$TAU2PY" \
   sdg_pipeline/db_bahn/rollout.py --config config/pipeline_config.yaml \
-  --split "$SPLIT" --k "$K" --api-base "$API_BASE" --model "$MODEL" --teacher-name "$LABEL" \
-  --enable-thinking --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" \
-  --min-p "$MIN_P" --presence-penalty "$PRESENCE_PENALTY" "${CTK_ARGS[@]}" "${TOOL_ARGS[@]}" \
+  --split "$SPLIT" --k "$K" --model "$MODEL" --teacher-name "$LABEL" \
+  "${GEN_ARGS[@]}" "${TOOL_ARGS[@]}" \
   --max-turns 15 --max-tokens-per-turn 3072 --max-regen 0 \
   --concurrency "$EVAL_CONC" --rollout-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" --request-timeout-s "${ROLLOUT_TIMEOUT_S:-1800}" \
   "${MLFLOW_ARGS[@]}" \
   --output "$OUT" ) 2>&1 | tee -a logs/eval_heldout.log | tail -12
 rc=${PIPESTATUS[0]}
 rm -f "$ROLLOUT_PIDF"
-[ "$rc" -ne 0 ] && echo "== ROLLOUT FAILED (exit $rc; 124 = EVAL_TIMEOUT) =="
+if [ "$rc" -eq 3 ]; then
+  echo "== API-ABBRUCH (exit 3: Guthaben/Key/Fehlerserie) — Daten sauber (keine Fehlerzeilen), RESUME=1 setzt fort =="
+elif [ "$rc" -ne 0 ]; then
+  echo "== ROLLOUT FAILED (exit $rc; 124 = EVAL_TIMEOUT) =="
+fi
 
 echo
 "$TAU2PY" evaluation/eval_report.py --input "$OUT" | tee -a logs/eval_heldout.log
+if [ "$BACKEND" = anthropic ]; then   # Token + Kosten (Listenpreise) des Laufs
+  "$TAU2PY" evaluation/api_usage.py --input "$OUT" | tee -a logs/eval_heldout.log
+fi
 echo "==== EVAL $LABEL DONE $(date '+%F %T') -> $OUT ===="

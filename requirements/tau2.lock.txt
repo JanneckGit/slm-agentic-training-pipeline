@@ -1,4 +1,4 @@
-# tau2.lock.txt — frozen .venv-tau2 (Python 3.12.3, aarch64, 2026-09-08)
+# tau2.lock.txt — frozen .venv-tau2 (Python 3.12.3, aarch64, 2026-11-12)
 # db_bahn domain runtime + tests: tau2 1.0.0 @ 1901a30 (built from GitHub), pytest. Pure-python deps — portable across x86/aarch64.
 # install:    python3.12 -m venv .venv-tau2 && .venv-tau2/bin/pip install --no-deps -r requirements/tau2.lock.txt
 # regenerate: bash ops/freeze_venvs.sh   (after a deliberate upgrade — never edit by hand)
@@ -8,6 +8,7 @@ aiohttp==3.14.1
 aiosignal==1.4.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
+anthropic==2.8.0
 anyio==4.14.1
 attrs==26.1.0
 cachebox==5.2.3
@@ -33,7 +34,9 @@ google-auth==2.55.2
 h11==0.16.0
 hf-xet==1.5.1
 httpcore==1.0.9
+httpcore2==2.16.0
 httpx==0.28.1
+httpx2==2.16.0
 huggingface_hub==1.22.0
 idna==3.18
 importlib_metadata==9.0.0
@@ -90,6 +93,7 @@ tiktoken==0.13.0
 tokenizers==0.23.1
 toml==0.10.2
 tqdm==4.68.3
+truststore==0.10.5
 typer==0.26.8
 typing-inspection==0.4.2
 typing_extensions==4.16.0
